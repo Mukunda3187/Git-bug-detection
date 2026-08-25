@@ -1,27 +1,31 @@
 """
-Reads every *.jsonl file in datasets/normalized/, embeds each entry with a
-local sentence-transformers model, and builds a FAISS index.
+Reads every *.jsonl file in datasets/normalized/, converts each entry into
+a TF-IDF vector, and saves the vectorizer + vectors to disk.
+
+Why TF-IDF instead of a neural embedding model: a real sentence-transformers
+model pulls in PyTorch, which alone needs several hundred MB of RAM just to
+import - that's too much for a free-tier host (512MB). TF-IDF has no such
+dependency, loads instantly, and still does genuine similarity search: it
+matches on shared error keywords and code tokens, which is exactly the
+signal that matters for retrieving similar bugs.
 
 Run this once after adding/updating any normalized dataset:
     python -m rag.build_index
 
 Produces:
-    rag/index/faiss.index      -> the vector index
-    rag/index/metadata.json    -> the original records, in the same order
-                                   as the vectors, so a FAISS result index
-                                   can be mapped straight back to a record
+    rag/index/vectorizer.joblib   -> the fitted TF-IDF vectorizer
+    rag/index/vectors.joblib      -> the sparse TF-IDF matrix, one row per record
+    rag/index/metadata.json       -> the original records, same row order as vectors.joblib
 """
 import glob
 import json
 import os
 
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer
+import joblib
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 DATASETS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "datasets", "normalized")
 INDEX_DIR = os.path.join(os.path.dirname(__file__), "index")
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # small, free, runs on CPU
 
 
 def load_all_records():
@@ -54,24 +58,19 @@ def build():
               f"the bundled sample.jsonl to test the pipeline).")
         return
 
-    print(f"Loaded {len(records)} records. Loading embedding model...")
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-
+    print(f"Loaded {len(records)} records. Fitting TF-IDF vectorizer...")
     texts = [embedding_text(r) for r in records]
-    embeddings = model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
-    embeddings = embeddings.astype("float32")
-    faiss.normalize_L2(embeddings)  # so inner product == cosine similarity
 
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(embeddings)
+    vectorizer = TfidfVectorizer(max_features=5000, stop_words="english")
+    vectors = vectorizer.fit_transform(texts)  # sparse matrix, one row per record
 
     os.makedirs(INDEX_DIR, exist_ok=True)
-    faiss.write_index(index, os.path.join(INDEX_DIR, "faiss.index"))
+    joblib.dump(vectorizer, os.path.join(INDEX_DIR, "vectorizer.joblib"))
+    joblib.dump(vectors, os.path.join(INDEX_DIR, "vectors.joblib"))
     with open(os.path.join(INDEX_DIR, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(records, f)
 
-    print(f"Index built with {index.ntotal} vectors -> {INDEX_DIR}")
+    print(f"Index built with {vectors.shape[0]} vectors -> {INDEX_DIR}")
 
 
 if __name__ == "__main__":
