@@ -300,12 +300,11 @@
   <header class="top">
     <div class="eyebrow">RAG + LLM Static Analysis</div>
     <h1>GitHub Bug Detection &amp; Recovery</h1>
-    <p>Point it at a public repository. It scans the source, matches suspicious code against a knowledge base of historical bugs and fixes, then asks an LLM to explain what it found — and says so plainly when it isn't sure.</p>
   </header>
 
   <div class="scan-box">
     <input type="text" id="repo-url" placeholder="https://github.com/owner/repository" />
-    <button class="scan-btn" id="scan-btn" onclick="scanRepo()">Scan repository</button>
+    <button class="scan-btn" id="scan-btn" onclick="scanRepo()">Scan repo</button>
   </div>
   <div class="hint">Works on any public GitHub repo. Private repos need auth this build doesn't set up.</div>
 
@@ -315,7 +314,6 @@
   <div id="summary-holder"></div>
   <div id="results-holder"></div>
 
-  <footer>Mini project build — bug type, location, severity, confidence and cause come from static analysis + LLM; historical matches come from BugsInPy / Bugs2Fix / RunBugRun via FAISS retrieval.</footer>
 </div>
 
 <script>
