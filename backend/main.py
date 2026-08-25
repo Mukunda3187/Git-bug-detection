@@ -38,7 +38,8 @@ DETECTORS_BY_EXTENSION = {
     # listing per the abstract, but only Python has a real AST detector
     # in this build. Add more detectors here as detectors/<lang>_detector.py.
 }
-
+MAX_FILES_TO_SCAN = 40          # keeps a single scan fast enough to not hit a gateway timeout
+MAX_LLM_CALLS_PER_SCAN = 15     # LLM calls are the slow part - cap them per scan
 
 @app.get("/api/health")
 def health():
@@ -80,11 +81,13 @@ def scan_repo(req: ScanRequest):
             bugs=[],
         )
 
-    try:
+       try:
         files = find_source_files(repo_path)
+        files_to_scan = files[:MAX_FILES_TO_SCAN]
         bug_reports = []
+        llm_calls_used = 0
 
-        for full_path in files:
+        for full_path in files_to_scan:
             ext = os.path.splitext(full_path)[1]
             detector = DETECTORS_BY_EXTENSION.get(ext)
             if not detector:
@@ -103,6 +106,9 @@ def scan_repo(req: ScanRequest):
                 continue
 
             for finding in findings:
+                if llm_calls_used >= MAX_LLM_CALLS_PER_SCAN:
+                    break
+                llm_calls_used += 1
                 retrieved = retrieve_similar_bugs(
                     query_text=f"{finding.get('error')}\n{finding.get('current_code')}",
                     top_k=3,
@@ -152,7 +158,7 @@ def scan_repo(req: ScanRequest):
         return ScanResult(
             summary=ScanSummary(
                 repo=f"{status.owner}/{status.name}",
-                files_scanned=len(files),
+                files_scanned=len(files_to_scan),
                 bugs_found=len(bug_reports),
                 high_severity=high,
                 medium_severity=medium,
