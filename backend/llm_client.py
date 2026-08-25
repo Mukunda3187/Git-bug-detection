@@ -92,20 +92,25 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
 
-    message = client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": _build_user_message(finding, retrieved)}],
-    )
-
-    raw_text = "".join(block.text for block in message.content if hasattr(block, "text"))
+    try:
+        message = client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": _build_user_message(finding, retrieved)}],
+        )
+        raw_text = "".join(block.text for block in message.content if hasattr(block, "text"))
+    except Exception as e:
+        # LLM call failed for any reason (bad key, rate limit, network) -
+        # never let this crash the whole scan.
+        fallback = _fallback_report(finding)
+        fallback["explanation"] = f"LLM call failed ({e}). Showing the raw static analyzer result instead."
+        return fallback
 
     try:
         cleaned = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         return json.loads(cleaned)
     except (json.JSONDecodeError, ValueError):
-        # LLM didn't return clean JSON - fail safe instead of crashing the whole scan
         fallback = _fallback_report(finding)
         fallback["explanation"] = "The LLM response could not be parsed as JSON, so this finding is shown " \
                                    "using the raw static analyzer result instead."
