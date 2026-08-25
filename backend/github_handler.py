@@ -16,6 +16,13 @@ GITHUB_URL_RE = re.compile(
 )
 
 
+def _auth_headers():
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 def parse_github_url(url: str):
     """Returns (owner, repo) or (None, None) if the URL doesn't look like a GitHub repo URL."""
     if not url:
@@ -41,11 +48,11 @@ def check_repository(url: str) -> RepoStatus:
 
     api_url = f"https://api.github.com/repos/{owner}/{repo}"
     try:
-        resp = requests.get(api_url, timeout=10)
-    except requests.RequestException:
+        resp = requests.get(api_url, headers=_auth_headers(), timeout=10)
+    except requests.RequestException as e:
         return RepoStatus(
             status="unreachable",
-            message="Unable to access this repository. Please try again later or check the repository link.",
+            message=f"Unable to access this repository. Please try again later or check the repository link. (network error: {e})",
         )
 
     if resp.status_code == 404:
@@ -54,10 +61,16 @@ def check_repository(url: str) -> RepoStatus:
             message="Repository not found. Please check the GitHub URL.",
         )
 
+    if resp.status_code == 403:
+        return RepoStatus(
+            status="unreachable",
+            message="Unable to access this repository. Please try again later or check the repository link. (GitHub API rate limit hit - add a GITHUB_TOKEN environment variable)",
+        )
+
     if resp.status_code != 200:
         return RepoStatus(
             status="unreachable",
-            message="Unable to access this repository. Please try again later or check the repository link.",
+            message=f"Unable to access this repository. Please try again later or check the repository link. (GitHub returned status {resp.status_code})",
         )
 
     data = resp.json()
@@ -78,17 +91,16 @@ def check_repository(url: str) -> RepoStatus:
 
 def download_repository(owner: str, repo: str, branch: str) -> str:
     """
-    Downloads the repo as a zip via the GitHub codeload service (no git
-    binary or auth needed for public repos) and extracts it to a temp dir.
-    Returns the path to the extracted repo folder.
+    Downloads the repo as a zip via the GitHub codeload service and
+    extracts it to a temp dir. Returns the path to the extracted repo folder.
     """
     tmp_dir = tempfile.mkdtemp(prefix="repo_scan_")
     zip_url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
     zip_path = os.path.join(tmp_dir, "repo.zip")
 
-    resp = requests.get(zip_url, stream=True, timeout=30)
+    resp = requests.get(zip_url, headers=_auth_headers(), stream=True, timeout=30)
     if resp.status_code != 200:
-        raise RuntimeError("Could not download repository archive.")
+        raise RuntimeError(f"Could not download repository archive (status {resp.status_code}).")
 
     with open(zip_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
@@ -97,7 +109,6 @@ def download_repository(owner: str, repo: str, branch: str) -> str:
     shutil.unpack_archive(zip_path, tmp_dir)
     os.remove(zip_path)
 
-    # The zip extracts into a single folder like "repo-branch/"
     extracted = [d for d in os.listdir(tmp_dir) if os.path.isdir(os.path.join(tmp_dir, d))]
     if not extracted:
         raise RuntimeError("Downloaded archive was empty.")
