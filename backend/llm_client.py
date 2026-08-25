@@ -93,7 +93,7 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
     client = anthropic.Anthropic(api_key=api_key)
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         max_tokens=1000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": _build_user_message(finding, retrieved)}],
