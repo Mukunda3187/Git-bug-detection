@@ -469,11 +469,13 @@ async function scanRepo() {
       body: JSON.stringify({ repo_url: url }),
     });
 
-    if (!resp.ok) {
-      stopProgress("");
-      bannerHolder.innerHTML = `<div class="status-banner error">Unable to access this repository. Please try again later or check the repository link.</div>`;
-      return;
-    }
+   if (!resp.ok) {
+  stopProgress("");
+  let detail = "";
+  try { detail = await resp.text(); } catch (e) {}
+  bannerHolder.innerHTML = `<div class="status-banner error">Server error (HTTP ${resp.status}). ${escapeHtml(detail.slice(0, 300))}</div>`;
+  return;
+}
 
     const data = await resp.json();
     stopProgress("Analysis completed.");
@@ -492,9 +494,9 @@ async function scanRepo() {
       resultsHolder.innerHTML = data.bugs.map(renderBugCard).join("");
     }
   } catch (err) {
-    stopProgress("");
-    bannerHolder.innerHTML = `<div class="status-banner error">Unable to access this repository. Please try again later or check the repository link.</div>`;
-  } finally {
+  stopProgress("");
+  bannerHolder.innerHTML = `<div class="status-banner error">Request failed: ${escapeHtml(String(err))}</div>`;
+} finally {
     btn.disabled = false;
   }
 }
