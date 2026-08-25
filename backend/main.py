@@ -55,8 +55,6 @@ def validate_repo(req: ScanRequest):
 def scan_repo(req: ScanRequest):
     status = check_repository(req.repo_url)
     if status.status != "valid":
-        # Return an empty-but-valid ScanResult shape with the status message
-        # in scan_status so the frontend can show it without a special error path.
         return ScanResult(
             summary=ScanSummary(
                 repo=req.repo_url, files_scanned=0, bugs_found=0,
@@ -81,7 +79,7 @@ def scan_repo(req: ScanRequest):
             bugs=[],
         )
 
-       try:
+    try:
         files = find_source_files(repo_path)
         files_to_scan = files[:MAX_FILES_TO_SCAN]
         bug_reports = []
@@ -102,7 +100,6 @@ def scan_repo(req: ScanRequest):
             try:
                 findings = detector(relative_path, source)
             except Exception:
-                # A single bad file should never take down the whole scan.
                 continue
 
             for finding in findings:
