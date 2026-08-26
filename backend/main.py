@@ -20,6 +20,8 @@ from models import ScanRequest, ScanResult, ScanSummary, BugReport, RetrievedBug
 from github_handler import check_repository, download_repository, cleanup
 from file_scanner import find_source_files, read_file_safely
 from detectors.python_detector import detect as detect_python
+from detectors.js_detector import detect as detect_js
+from detectors.cfamily_detector import detect as detect_cfamily
 from rag.retriever import retrieve_similar_bugs
 from llm_client import analyze_finding
 
@@ -34,9 +36,20 @@ app.add_middleware(
 
 DETECTORS_BY_EXTENSION = {
     ".py": detect_python,
-    # Other extensions (.js, .java, etc.) are scanned for supported-file
-    # listing per the abstract, but only Python has a real AST detector
-    # in this build. Add more detectors here as detectors/<lang>_detector.py.
+    # JS/JSX/TS/TSX: structural (bracket/string) syntax check - catches the
+    # class of error that broke the Render/Vite build - plus a few precise
+    # heuristics (loose equality, var, empty catch, leftover console/debugger).
+    ".js": detect_js,
+    ".jsx": detect_js,
+    ".ts": detect_js,
+    ".tsx": detect_js,
+    # Java/C/C++/C#/Go/PHP: structural syntax check only for now.
+    ".java": detect_cfamily,
+    ".c": detect_cfamily,
+    ".cpp": detect_cfamily,
+    ".cs": detect_cfamily,
+    ".go": detect_cfamily,
+    ".php": detect_cfamily,
 }
 MAX_FILES_TO_SCAN = 40          # keeps a single scan fast enough to not hit a gateway timeout
 MAX_LLM_CALLS_PER_SCAN = 15     # LLM calls are the slow part - cap them per scan
@@ -128,7 +141,9 @@ def scan_repo(req: ScanRequest):
                 )
                 analysis = analyze_finding(finding, retrieved)
 
-                is_unnecessary = finding.get("rule") == "possibly_unused_function"
+                # Keyed on bug_type (every detector sets this), not on one Python-specific
+                # rule name, so this stays correct as more language detectors are added.
+                is_unnecessary = finding.get("bug_type") == "Unnecessary Code"
                 bug_number += 1
 
                 bug_reports.append(BugReport(
