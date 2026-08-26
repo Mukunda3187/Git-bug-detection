@@ -34,6 +34,12 @@ Your job:
    replacement_code with the actual corrected code - never leave it null for a
    replace solution. If you cannot write a concrete fix, use solution_type "add"
    or set insufficient_evidence to true instead of leaving replacement_code empty.
+   CRITICAL: replacement_code must be a direct, drop-in replacement for exactly
+   the current_code shown - the developer must be able to find current_code in
+   their file and swap it for replacement_code verbatim. Keep the same variable
+   names, same structure, same surrounding logic - change ONLY what is actually
+   broken. Do not paraphrase unrelated parts, rename variables, or restructure
+   code that isn't part of the bug.
 4. Pick exactly ONE solution_type that matches what the developer needs to do:
    - "replace": existing code is wrong and should be swapped for corrected code
    - "add": nothing is wrong with existing code, but a check/line is missing and needs adding
