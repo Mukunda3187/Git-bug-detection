@@ -14,6 +14,7 @@ NOT pretend to be the LLM's reasoning, it just formats what the detector
 already found.
 """
 import json
+import math
 import os
 
 import requests
@@ -21,15 +22,73 @@ import requests
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-SYSTEM_PROMPT = """You are a careful code-review assistant helping a bug-detection tool.
-You will be given ONE candidate issue found by a static analyzer in a real source file,
-plus a small number of similar historical bugs retrieved from a knowledge base.
+
+def _parse_rate_limit_info(resp):
+    """
+    Reads Google's 429 error body to figure out how long to wait and whether
+    this is a short per-minute limit or the daily free-tier cap. Returns
+    (retry_seconds_or_None, is_daily_limit).
+    """
+    try:
+        data = resp.json()
+    except (ValueError, json.JSONDecodeError):
+        return None, False
+
+    error = data.get("error", {})
+    details = error.get("details", [])
+    retry_seconds = None
+    is_daily = False
+
+    for d in details:
+        type_str = d.get("@type", "")
+        if type_str.endswith("RetryInfo"):
+            delay = d.get("retryDelay", "")
+            try:
+                retry_seconds = float(str(delay).rstrip("s"))
+            except ValueError:
+                pass
+        if type_str.endswith("QuotaFailure"):
+            for v in d.get("violations", []):
+                combined = f"{v.get('quotaId', '')} {v.get('quotaMetric', '')}"
+                if "PerDay" in combined or "per_day" in combined:
+                    is_daily = True
+
+    return retry_seconds, is_daily
+
+
+def _build_rate_limit_message(retry_seconds, is_daily):
+    """Turns the parsed rate-limit details into one plain-English sentence."""
+    if is_daily:
+        if retry_seconds:
+            minutes = max(1, math.ceil(retry_seconds / 60))
+            return f"The free AI usage limit for today has been reached. Try again in about {minutes} minute(s), or after Google's daily reset (midnight Pacific Time, US)."
+        return "The free AI usage limit for today has been reached. It resets at midnight Pacific Time (US) - please try again after that."
+
+    if retry_seconds:
+        if retry_seconds < 60:
+            wait = int(retry_seconds) + 5  # small buffer
+            return f"The AI is temporarily busy. Try again in about {wait} seconds."
+        minutes = max(1, math.ceil(retry_seconds / 60))
+        return f"The AI is temporarily busy. Try again in about {minutes} minute(s)."
+
+    return "The AI usage limit has been reached for now. Please try again in a minute or two."
+
+SYSTEM_PROMPT = """You are helping explain code bugs to someone who may have very little
+programming knowledge - a beginner, or someone who has never coded at all. You will be
+given ONE candidate issue found by a static analyzer in a real source file, plus a small
+number of similar historical bugs retrieved from a knowledge base (for your own context only
+- do not mention this knowledge base to the reader).
 
 Your job:
 1. Decide whether this candidate is worth reporting as a possible bug, given the evidence.
-2. If yes, explain the cause AND why it likely happened (e.g. leftover from refactoring,
-   missing validation, unsafe string handling), based on the ACTUAL code shown - never
-   invent unrelated code.
+2. Write "cause" in EXTREMELY SIMPLE English - no jargon, no technical terms a non-programmer
+   wouldn't know. It must explain BOTH what is wrong AND why that causes a problem, in plain
+   everyday words. Example of the required style:
+   Bad (too technical): "An unmatched delimiter causes a parser failure."
+   Good (required style): "You opened a { bracket, but you did not close it with }. Because
+   of this, the computer cannot understand where this part of the code ends."
+   Always write "cause" in this same plain, friendly, step-by-step style - imagine explaining
+   it to a smart 12-year-old who has never programmed before.
 3. If solution_type is "replace", you MUST always provide a non-null, non-empty
    replacement_code with the actual corrected code - never leave it null for a
    replace solution. If you cannot write a concrete fix, use solution_type "add"
@@ -45,15 +104,22 @@ Your job:
    - "add": nothing is wrong with existing code, but a check/line is missing and needs adding
    - "remove": the code should simply be deleted (e.g. unused/dead code)
    - "create_file": a new file is needed (rare - only use this if that's genuinely the fix)
-5. Write solution_intro as the exact required first sentence for that solution_type:
-   - replace -> "Replace the given code with the new code shown below."
-   - add -> "Add the following code as instructed below."
-   - remove -> "Remove the given code."
-   - create_file -> "Create the file at the location given below and paste the following code into it."
-6. Write action as ONE short final sentence telling the developer exactly what to do, e.g.
-   "Replace the current code with the code shown above." or "Remove this code from the file."
+5. Write solution_intro in simple, plain English that tells the reader exactly what to do,
+   using the required first sentence for that solution_type:
+   - replace -> "Replace the code shown above with the corrected code below."
+   - add -> "Add the following code as shown below."
+   - remove -> "Remove this code from the file."
+   - create_file -> "Create this file at the location shown below and paste the following code into it."
+   If solution_type is "add", also fill add_location with a simple plain-English description of
+   exactly where to add the code, e.g. "Add this code between lines 20 and 25." or "Add this
+   code right after the function called validate_user finishes."
+6. Write "action" as ONE short, extremely simple final sentence telling the reader exactly what
+   to do, in plain English, e.g. "Add the missing closing bracket shown above." or "Delete this
+   code from the file." Never say something vague like "fix the issue" or "modify the function
+   accordingly" - always say exactly what to add, remove, or replace.
 7. If the evidence is weak (e.g. only a vague heuristic match, no real historical support), set
-   "insufficient_evidence" to true and explain why in "explanation", rather than guessing.
+   "insufficient_evidence" to true, and still explain in "cause" what looks suspicious, in the
+   same simple plain English style.
 
 Reply with ONLY a JSON object, no markdown fences, no extra text, with exactly these keys:
 {
@@ -102,33 +168,65 @@ Now produce the JSON bug report."""
 
 
 def _fallback_report(finding: dict) -> dict:
-    """Used only when no LLM API key is configured - clearly a formatter, not an analysis."""
+    """Used when no LLM reasoning is available - either no API key is configured, or the
+    live LLM call failed/timed out. Kept in plain, non-technical English since this is
+    shown directly to the end user - technical failure details are logged to the server
+    console instead (see analyze_finding), never shown in the UI."""
     is_unused = finding.get("rule") == "possibly_unused_function"
     return {
         "error": finding.get("error", "Possible issue"),
         "bug_type": finding.get("bug_type", "Other"),
-        "cause": finding.get("cause", ""),
-        "why_occurs": "This was flagged by static analysis rules; no LLM reasoning is available right now.",
+        "cause": finding.get("cause", "Something in this code looks like it could cause a problem."),
+        "why_occurs": "",
         "solution_type": "remove" if is_unused else "replace",
-        "solution_intro": "Remove the given code." if is_unused else "Replace the given code with the new code shown below.",
+        "solution_intro": (
+            "Remove this code from the file." if is_unused else
+            "We could not prepare an automatic fix for this one right now - please look at "
+            "the code below and fix it yourself."
+        ),
         "replacement_code": None,
         "add_location": None,
         "new_file_path": None,
-        "action": "Remove this code from the file." if is_unused else "Review this code and apply a fix manually.",
-        "explanation": "No LLM API key configured (GEMINI_API_KEY missing) - showing the raw static "
-                       "analyzer finding without LLM reasoning or a suggested fix.",
+        "action": "Remove this code from the file." if is_unused else "Review this code and fix it yourself.",
+        "explanation": "",
         "insufficient_evidence": True,
     }
 
 
 def analyze_finding(finding: dict, retrieved: list) -> dict:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    api_keys = []
+
+    # Read multiple Gemini API keys from environment variables.
+    for i in range(1, 11):
+        key = os.getenv(f"GEMINI_API_KEY_{i}")
+        if key and key.strip():
+            api_keys.append(key.strip())
+
+    # Keep support for the old single-key variable.
+    old_key = os.getenv("GEMINI_API_KEY")
+    if old_key and old_key.strip() and old_key.strip() not in api_keys:
+        api_keys.append(old_key.strip())
+
+    if not api_keys:
         return _fallback_report(finding)
 
     payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": _build_user_message(finding, retrieved)}]}],
+        "system_instruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": _build_user_message(
+                            finding,
+                            retrieved
+                        )
+                    }
+                ],
+            }
+        ],
         "generationConfig": {
             "response_mime_type": "application/json",
             "temperature": 0.2,
@@ -136,30 +234,61 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
         },
     }
 
-    try:
-        resp = requests.post(
-            GEMINI_URL,
-            params={"key": api_key},
-            json=payload,
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Gemini API returned status {resp.status_code}: {resp.text[:300]}")
+    last_error = None
+    last_429_response = None
 
-        data = resp.json()
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        # LLM call failed for any reason (bad key, rate limit, network) -
-        # never let this crash the whole scan.
-        fallback = _fallback_report(finding)
-        fallback["explanation"] = f"LLM call failed ({e}). Showing the raw static analyzer result instead."
-        return fallback
+    # Try each Gemini API key until one succeeds.
+    for key_number, api_key in enumerate(api_keys, start=1):
+        try:
+            resp = requests.post(
+                GEMINI_URL,
+                params={"key": api_key},
+                json=payload,
+                timeout=30,
+            )
 
-    try:
-        cleaned = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        return json.loads(cleaned)
-    except (json.JSONDecodeError, ValueError):
-        fallback = _fallback_report(finding)
-        fallback["explanation"] = "The LLM response could not be parsed as JSON, so this finding is shown " \
-                                   "using the raw static analyzer result instead."
-        return fallback
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+                try:
+                    cleaned = (
+                        raw_text
+                        .strip()
+                        .removeprefix("```json")
+                        .removeprefix("```")
+                        .removesuffix("```")
+                        .strip()
+                    )
+
+                    return json.loads(cleaned)
+
+                except (json.JSONDecodeError, ValueError):
+                    print(f"[llm_client] Gemini returned non-JSON response: {raw_text[:300]}")
+                    return _fallback_report(finding)
+
+            if resp.status_code == 429:
+                last_429_response = resp
+
+            # Key failed - try the next key. Log the technical detail server-side
+            # only - the person using the app should never see raw HTTP/API errors.
+            last_error = f"Gemini key {key_number} returned HTTP {resp.status_code}: {resp.text[:200]}"
+
+        except Exception as e:
+            last_error = f"Gemini key {key_number} failed: {e}"
+
+    # All keys failed. Print the real reason to the server logs (visible in Render's
+    # Logs tab) so it can still be debugged, but keep the user-facing result simple.
+    print(f"[llm_client] All Gemini API keys failed. Last error: {last_error}")
+
+    fallback = _fallback_report(finding)
+
+    # If every key failed specifically because of a rate limit, tell the person
+    # clearly (and when they can try again) instead of the generic "fix it
+    # yourself" message - this is shown once at the top of the scan results.
+    if last_429_response is not None:
+        retry_seconds, is_daily = _parse_rate_limit_info(last_429_response)
+        fallback["rate_limited"] = True
+        fallback["rate_limit_message"] = _build_rate_limit_message(retry_seconds, is_daily)
+
+    return fallback

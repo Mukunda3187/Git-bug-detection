@@ -20,6 +20,8 @@ from models import ScanRequest, ScanResult, ScanSummary, BugReport, RetrievedBug
 from github_handler import check_repository, download_repository, cleanup
 from file_scanner import find_source_files, read_file_safely
 from detectors.python_detector import detect as detect_python
+from detectors.js_detector import detect as detect_js
+from detectors.cfamily_detector import detect as detect_cfamily
 from rag.retriever import retrieve_similar_bugs
 from llm_client import analyze_finding
 
@@ -34,9 +36,20 @@ app.add_middleware(
 
 DETECTORS_BY_EXTENSION = {
     ".py": detect_python,
-    # Other extensions (.js, .java, etc.) are scanned for supported-file
-    # listing per the abstract, but only Python has a real AST detector
-    # in this build. Add more detectors here as detectors/<lang>_detector.py.
+    # JS/JSX/TS/TSX: structural (bracket/string) syntax check - catches the
+    # class of error that broke the Render/Vite build - plus a few precise
+    # heuristics (loose equality, var, empty catch, leftover console/debugger).
+    ".js": detect_js,
+    ".jsx": detect_js,
+    ".ts": detect_js,
+    ".tsx": detect_js,
+    # Java/C/C++/C#/Go/PHP: structural syntax check only for now.
+    ".java": detect_cfamily,
+    ".c": detect_cfamily,
+    ".cpp": detect_cfamily,
+    ".cs": detect_cfamily,
+    ".go": detect_cfamily,
+    ".php": detect_cfamily,
 }
 MAX_FILES_TO_SCAN = 40          # keeps a single scan fast enough to not hit a gateway timeout
 MAX_LLM_CALLS_PER_SCAN = 15     # LLM calls are the slow part - cap them per scan
@@ -46,27 +59,27 @@ def _empty_summary(repo: str, message: str) -> ScanResult:
     return ScanResult(
         summary=ScanSummary(
             repo=repo, files_scanned=0, bugs_found=0,
-            unnecessary_code_found=0, accuracy=100, error_level="Less Errors",
+            unnecessary_code_found=0, error_level="Less Errors",
             scan_status=message,
         ),
         bugs=[],
     )
 
 
-def _compute_accuracy_and_level(confident_issue_count: int):
+def _compute_error_level(bug_reports):
     """
-    Accuracy = how likely the current code is to run correctly as-is, based
-    purely on the number of confidently-detected issues (not LLM confidence,
-    not detection-system confidence). Every confident issue costs 8 points.
+    Gives the repository a simple overall error level based on how many
+    issues were actually detected - no hidden percentage, no LLM confidence
+    involved, just a plain count-based bucket.
     """
-    accuracy = max(0, 100 - confident_issue_count * 8)
-    if confident_issue_count <= 2:
-        error_level = "Less Errors"
-    elif confident_issue_count <= 6:
-        error_level = "Medium Errors"
+    issue_count = len(bug_reports)
+
+    if issue_count <= 10:
+        return "Less Errors"
+    elif issue_count <= 30:
+        return "Medium Errors"
     else:
-        error_level = "More Errors"
-    return accuracy, error_level
+        return "More Errors"
 
 
 @app.get("/api/health")
@@ -100,6 +113,7 @@ def scan_repo(req: ScanRequest):
         bug_reports = []
         llm_calls_used = 0
         bug_number = 0
+        ai_notice = None
 
         for full_path in files_to_scan:
             ext = os.path.splitext(full_path)[1]
@@ -128,7 +142,14 @@ def scan_repo(req: ScanRequest):
                 )
                 analysis = analyze_finding(finding, retrieved)
 
-                is_unnecessary = finding.get("rule") == "possibly_unused_function"
+                # Surface the AI usage-limit message once per scan, at the top,
+                # instead of repeating a generic "fix it yourself" note per bug.
+                if ai_notice is None and analysis.get("rate_limited"):
+                    ai_notice = analysis.get("rate_limit_message")
+
+                # Keyed on bug_type (every detector sets this), not on one Python-specific
+                # rule name, so this stays correct as more language detectors are added.
+                is_unnecessary = finding.get("bug_type") == "Unnecessary Code"
                 bug_number += 1
 
                 bug_reports.append(BugReport(
@@ -165,9 +186,11 @@ def scan_repo(req: ScanRequest):
                     insufficient_evidence=bool(analysis.get("insufficient_evidence", False)),
                 ))
 
-        unnecessary_code_found = sum(1 for b in bug_reports if b.kind == "unnecessary_code")
-        confident_issue_count = sum(1 for b in bug_reports if not b.insufficient_evidence)
-        accuracy, error_level = _compute_accuracy_and_level(confident_issue_count)
+        unnecessary_code_found = sum(
+            1 for b in bug_reports if b.kind == "unnecessary_code"
+        )
+
+        error_level = _compute_error_level(bug_reports)
 
         return ScanResult(
             summary=ScanSummary(
@@ -175,9 +198,9 @@ def scan_repo(req: ScanRequest):
                 files_scanned=len(files_to_scan),
                 bugs_found=len(bug_reports),
                 unnecessary_code_found=unnecessary_code_found,
-                accuracy=accuracy,
                 error_level=error_level,
                 scan_status="Completed",
+                ai_notice=ai_notice,
             ),
             bugs=bug_reports,
         )
