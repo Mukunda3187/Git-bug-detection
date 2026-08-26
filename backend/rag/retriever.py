@@ -146,11 +146,11 @@ def _retrieve_tfidf(query_text: str, top_k: int):
     try:
         from sklearn.metrics.pairwise import cosine_similarity
         
-        # Transform query using the fitted vectorizer
         query_vec = _vectorizer.transform([query_text])
-        scores = cosine_similarity(query_vec, _vectorizer.transform(
-            [_embedding_text(r) for r in _metadata]
-        ))[0]
+document_matrix = _vectorizer.transform(
+    [_embedding_text(r) for r in _metadata]
+)
+scores = cosine_similarity(query_vec, document_matrix)[0]
         
         # Get top k
         top_k = min(top_k, len(scores))
