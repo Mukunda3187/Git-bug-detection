@@ -145,30 +145,29 @@ def _retrieve_tfidf(query_text: str, top_k: int):
     """Retrieve using TF-IDF (lightweight fallback)."""
     try:
         from sklearn.metrics.pairwise import cosine_similarity
-        
+
         query_vec = _vectorizer.transform([query_text])
-document_matrix = _vectorizer.transform(
-    [_embedding_text(r) for r in _metadata]
-)
-scores = cosine_similarity(query_vec, document_matrix)[0]
-        
-        # Get top k
+        document_matrix = _vectorizer.transform(
+            [_embedding_text(r) for r in _metadata]
+        )
+        scores = cosine_similarity(query_vec, document_matrix)[0]
+
         top_k = min(top_k, len(scores))
         top_indices = scores.argsort()[::-1][:top_k]
-        
+
         results = []
+
         for idx in top_indices:
             score = float(scores[idx])
-            if score > 0.01:  # Minimal threshold for TF-IDF
-                try:
-                    results.append({
-                        "record": _metadata[idx],
-                        "similarity": min(score, 1.0),  # Cap at 1.0
-                    })
-                except (IndexError, TypeError):
-                    continue
-        
+
+            if score > 0.01:
+                results.append({
+                    "record": _metadata[idx],
+                    "similarity": min(score, 1.0),
+                })
+
         return results
+
     except Exception as e:
         print(f"[retriever] TF-IDF retrieval failed: {e}")
         return []
