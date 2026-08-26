@@ -19,7 +19,7 @@ import os
 
 import requests
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 
@@ -73,55 +73,27 @@ def _build_rate_limit_message(retry_seconds, is_daily):
 
     return "The AI usage limit has been reached for now. Please try again in a minute or two."
 
-SYSTEM_PROMPT = """You are helping explain code bugs to someone who may have very little
-programming knowledge - a beginner, or someone who has never coded at all. You will be
-given ONE candidate issue found by a static analyzer in a real source file, plus a small
-number of similar historical bugs retrieved from a knowledge base (for your own context only
-- do not mention this knowledge base to the reader).
+SYSTEM_PROMPT = """You are an expert code reviewer helping explain bugs to developers. Your goal is to provide clear, 
+actionable solutions that can be immediately applied.
 
-Your job:
-1. Decide whether this candidate is worth reporting as a possible bug, given the evidence.
-2. Write "cause" in EXTREMELY SIMPLE English - no jargon, no technical terms a non-programmer
-   wouldn't know. It must explain BOTH what is wrong AND why that causes a problem, in plain
-   everyday words. Example of the required style:
-   Bad (too technical): "An unmatched delimiter causes a parser failure."
-   Good (required style): "You opened a { bracket, but you did not close it with }. Because
-   of this, the computer cannot understand where this part of the code ends."
-   Always write "cause" in this same plain, friendly, step-by-step style - imagine explaining
-   it to a smart 12-year-old who has never programmed before.
-3. If solution_type is "replace", you MUST always provide a non-null, non-empty
-   replacement_code with the actual corrected code - never leave it null for a
-   replace solution. If you cannot write a concrete fix, use solution_type "add"
-   or set insufficient_evidence to true instead of leaving replacement_code empty.
-   CRITICAL: replacement_code must be a direct, drop-in replacement for exactly
-   the current_code shown - the developer must be able to find current_code in
-   their file and swap it for replacement_code verbatim. Keep the same variable
-   names, same structure, same surrounding logic - change ONLY what is actually
-   broken. Do not paraphrase unrelated parts, rename variables, or restructure
-   code that isn't part of the bug.
-4. Pick exactly ONE solution_type that matches what the developer needs to do:
-   - "replace": existing code is wrong and should be swapped for corrected code
-   - "add": nothing is wrong with existing code, but a check/line is missing and needs adding
-   - "remove": the code should simply be deleted (e.g. unused/dead code)
-   - "create_file": a new file is needed (rare - only use this if that's genuinely the fix)
-5. Write solution_intro in simple, plain English that tells the reader exactly what to do,
-   using the required first sentence for that solution_type:
-   - replace -> "Replace the code shown above with the corrected code below."
-   - add -> "Add the following code as shown below."
-   - remove -> "Remove this code from the file."
-   - create_file -> "Create this file at the location shown below and paste the following code into it."
-   If solution_type is "add", also fill add_location with a simple plain-English description of
-   exactly where to add the code, e.g. "Add this code between lines 20 and 25." or "Add this
-   code right after the function called validate_user finishes."
-6. Write "action" as ONE short, extremely simple final sentence telling the reader exactly what
-   to do, in plain English, e.g. "Add the missing closing bracket shown above." or "Delete this
-   code from the file." Never say something vague like "fix the issue" or "modify the function
-   accordingly" - always say exactly what to add, remove, or replace.
-7. If the evidence is weak (e.g. only a vague heuristic match, no real historical support), set
-   "insufficient_evidence" to true, and still explain in "cause" what looks suspicious, in the
-   same simple plain English style.
+For each reported issue, provide a response with:
+1. **cause**: Explain EXACTLY why this code is problematic in 2-3 sentences, no jargon.
+2. **solution_type**: Choose from "replace", "add", "remove", or "create_file" - pick the most direct fix.
+3. **replacement_code**: For "replace" solutions, provide the EXACT corrected code that can be directly substituted.
+   - Keep variable names and structure identical
+   - Only modify the problematic part
+   - Ensure it's production-ready and handles edge cases
+4. **action**: One specific sentence describing what to do (e.g., "Replace line 42 with the corrected code" or "Add this try-except block after the variable assignment").
+5. **explanation**: Provide a brief technical explanation of why the fix works.
 
-Reply with ONLY a JSON object, no markdown fences, no extra text, with exactly these keys:
+CRITICAL RULES:
+- If solution_type is "replace", replacement_code MUST NEVER be null or empty. Always provide working code.
+- If you cannot provide a concrete fix, use solution_type "add" or set insufficient_evidence to true.
+- Do not paraphrase or restructure unrelated code.
+- Provide solutions that are immediately applicable to the codebase.
+- Consider edge cases and error handling in your fixes.
+
+Reply with ONLY a JSON object, no markdown fences or extra text:
 {
   "error": string,
   "bug_type": one of ["Runtime Error","Logic Error","Syntax Error","Type Error","Dependency Error","Security Issue","Performance Issue","API Error","Unnecessary Code","Other"],
@@ -135,8 +107,7 @@ Reply with ONLY a JSON object, no markdown fences, no extra text, with exactly t
   "action": string,
   "explanation": string,
   "insufficient_evidence": boolean
-}
-"""
+}"""
 
 
 def _build_user_message(finding: dict, retrieved: list) -> str:
@@ -144,27 +115,30 @@ def _build_user_message(finding: dict, retrieved: list) -> str:
         f"- Dataset: {r['record'].get('dataset_source')}\n"
         f"  Bug type: {r['record'].get('bug_type')}\n"
         f"  Description: {r['record'].get('bug_description')}\n"
+        f"  Solution: {r['record'].get('solution', 'N/A')}\n"
         f"  Similarity: {round(r['similarity'] * 100)}%"
         for r in retrieved
     ) or "(no similar historical bugs found)"
 
-    return f"""Candidate issue detected by static analyzer:
-File: {finding.get('file')}
-Function: {finding.get('function')}
-Line(s): {finding.get('line_start')}-{finding.get('line_end')}
-Detector rule: {finding.get('rule')}
-Detector's initial label: {finding.get('error')} ({finding.get('bug_type')})
-Detector's initial cause note: {finding.get('cause')}
+    return f"""**Candidate Issue from Static Analysis:**
 
-Code:
+**File:** {finding.get('file')}
+**Function:** {finding.get('function') or 'N/A'}
+**Lines:** {finding.get('line_start')}-{finding.get('line_end')}
+**Rule:** {finding.get('rule')}
+**Initial Assessment:** {finding.get('error')} ({finding.get('bug_type')})
+**Detector's Note:** {finding.get('cause')}
+
+**Current Code:**
 ```
 {finding.get('current_code')}
 ```
 
-Similar historical bugs retrieved from the knowledge base:
+**Historical Context (Similar Bugs from Knowledge Base):**
 {retrieved_block}
 
-Now produce the JSON bug report."""
+**Your Task:**
+Analyze this candidate and provide a complete, production-ready fix. Ensure replacement_code is never empty for "replace" solutions."""
 
 
 def _fallback_report(finding: dict) -> dict:
@@ -173,22 +147,42 @@ def _fallback_report(finding: dict) -> dict:
     shown directly to the end user - technical failure details are logged to the server
     console instead (see analyze_finding), never shown in the UI."""
     is_unused = finding.get("rule") == "possibly_unused_function"
+    
+    # Better fallback solutions based on bug type
+    bug_type = finding.get("bug_type", "Other")
+    rule = finding.get("rule", "")
+    
+    if is_unused:
+        solution_intro = "Remove this code from the file."
+        action = "Delete this unused function."
+    elif rule == "bare_except":
+        solution_intro = "Replace the bare 'except:' clause with a specific exception type."
+        action = "Specify which exceptions should be caught (e.g., 'except ValueError:')."
+    elif rule == "mutable_default_arg":
+        solution_intro = "Replace the mutable default argument with None and initialize inside the function."
+        action = "Use None as default and create a new object inside the function body."
+    elif rule == "eq_none":
+        solution_intro = "Replace '==' with 'is' for None comparison."
+        action = "Change '== None' to 'is None' and '!= None' to 'is not None'."
+    elif rule == "possible_division_by_zero":
+        solution_intro = "Add a check to ensure the denominator is not zero before dividing."
+        action = "Add a conditional check: 'if denominator != 0: result = numerator / denominator'."
+    else:
+        solution_intro = "Review and fix this issue according to the code analysis."
+        action = "Analyze the code and apply the appropriate fix."
+    
     return {
         "error": finding.get("error", "Possible issue"),
-        "bug_type": finding.get("bug_type", "Other"),
+        "bug_type": bug_type,
         "cause": finding.get("cause", "Something in this code looks like it could cause a problem."),
-        "why_occurs": "",
+        "why_occurs": f"This is a {bug_type.lower()} detected by static analysis.",
         "solution_type": "remove" if is_unused else "replace",
-        "solution_intro": (
-            "Remove this code from the file." if is_unused else
-            "We could not prepare an automatic fix for this one right now - please look at "
-            "the code below and fix it yourself."
-        ),
+        "solution_intro": solution_intro,
         "replacement_code": None,
         "add_location": None,
         "new_file_path": None,
-        "action": "Remove this code from the file." if is_unused else "Review this code and fix it yourself.",
-        "explanation": "",
+        "action": action,
+        "explanation": "Unable to generate LLM explanation - check the code and apply the recommended fix.",
         "insufficient_evidence": True,
     }
 
@@ -229,8 +223,10 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
         ],
         "generationConfig": {
             "response_mime_type": "application/json",
-            "temperature": 0.2,
-            "maxOutputTokens": 1000,
+            "temperature": 0.1,  # Lower for more consistent/reliable outputs
+            "maxOutputTokens": 1500,  # Increased for better solutions
+            "topP": 0.9,
+            "topK": 40,
         },
     }
 
@@ -261,10 +257,18 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
                         .strip()
                     )
 
-                    return json.loads(cleaned)
+                    result = json.loads(cleaned)
+                    
+                    # Validate that replacement_code is not empty for "replace" solutions
+                    if result.get("solution_type") == "replace" and not result.get("replacement_code"):
+                        print(f"[llm_client] Gemini returned empty replacement_code for replace solution. Using fallback.")
+                        return _fallback_report(finding)
+                    
+                    return result
 
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError) as e:
                     print(f"[llm_client] Gemini returned non-JSON response: {raw_text[:300]}")
+                    print(f"[llm_client] JSON parse error: {e}")
                     return _fallback_report(finding)
 
             if resp.status_code == 429:
