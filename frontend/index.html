@@ -134,6 +134,7 @@
   }
   .status-banner.error { border-color: var(--removed); color: var(--removed); background: var(--removed-bg); }
   .status-banner.ok { border-color: var(--added); color: var(--added); background: var(--added-bg); }
+  .status-banner.warn { border-color: var(--warn); color: var(--warn); background: rgba(210,153,34,0.08); }
 
   .summary-grid {
     display: grid;
@@ -463,6 +464,11 @@ async function scanRepo() {
     }
 
     bannerHolder.innerHTML = `<div class="status-banner ok">Scan Status: Completed — ${escapeHtml(data.summary.repo)}</div>`;
+
+    if (data.summary.ai_notice) {
+      bannerHolder.innerHTML += `<div class="status-banner warn">⚠ ${escapeHtml(data.summary.ai_notice)}</div>`;
+    }
+
     renderSummary(data.summary);
 
     if (data.bugs.length === 0) {
