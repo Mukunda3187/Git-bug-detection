@@ -137,7 +137,7 @@
 
   .summary-grid {
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     gap: 1px;
     background: var(--border);
     border: 1px solid var(--border);
@@ -165,10 +165,6 @@
     text-transform: uppercase;
     letter-spacing: 0.06em;
   }
-
-  .num.accuracy-high { color: var(--added); }
-  .num.accuracy-medium { color: var(--warn); }
-  .num.accuracy-low { color: var(--crit); }
 
   .error-level-pill {
     display: inline-block;
@@ -243,28 +239,11 @@
   pre.code-block.added { background: var(--added-bg); border-color: rgba(63,185,80,0.3); }
   pre.code-block .ln { color: var(--text-dim); user-select: none; margin-right: 8px; }
 
-  .retrieved-item {
-    border: 1px dashed var(--border);
-    border-radius: var(--radius);
-    padding: 10px 12px;
-    margin-bottom: 8px;
-    font-size: 12px;
-    display: flex;
-    justify-content: space-between;
-    gap: 10px;
-  }
-  .retrieved-item .rleft { color: var(--text-dim); }
-  .retrieved-item .rleft b { color: var(--retrieval); }
-  .retrieved-item .sim { color: var(--retrieval); white-space: nowrap; }
-
-  .insufficient-banner {
+  .simple-note {
     margin-top: 14px;
-    padding: 10px 12px;
-    border-radius: var(--radius);
-    background: rgba(210,153,34,0.08);
-    border: 1px solid rgba(210,153,34,0.3);
-    color: var(--warn);
     font-size: 12px;
+    color: var(--text-dim);
+    font-style: italic;
   }
 
   .empty-state {
@@ -357,93 +336,63 @@ function renderSolutionBlock(bug) {
   if (bug.solution_type === "add") {
     return `
       ${intro}
-      ${bug.add_location ? `<div class="field-label">Where to add</div><div class="location-line">${escapeHtml(bug.add_location)}</div>` : ""}
-      ${bug.replacement_code ? `<div class="field-label">Code to add</div>${renderCodeBlock(bug.replacement_code, "added")}` : ""}
+      ${bug.add_location ? `<div class="cause-text" style="margin-top:8px;">${escapeHtml(bug.add_location)}</div>` : ""}
+      ${bug.replacement_code ? renderCodeBlock(bug.replacement_code, "added") : ""}
     `;
   }
   if (bug.solution_type === "remove") {
-    return `
-      ${intro}
-      <div class="field-label">Code to remove</div>
-      ${renderCodeBlock(bug.current_code, "removed")}
-    `;
+    return `${intro}`;
   }
   if (bug.solution_type === "create_file") {
     return `
       ${intro}
-      ${bug.new_file_path ? `<div class="field-label">File</div><div class="location-line">${escapeHtml(bug.new_file_path)}</div>` : ""}
-      ${bug.replacement_code ? `<div class="field-label">Code to paste</div>${renderCodeBlock(bug.replacement_code, "added")}` : ""}
+      ${bug.new_file_path ? `<div class="location-line" style="margin-top:8px;">${escapeHtml(bug.new_file_path)}</div>` : ""}
+      ${bug.replacement_code ? renderCodeBlock(bug.replacement_code, "added") : ""}
     `;
   }
   // default: "replace"
   return `
     ${intro}
-    <div class="field-label">Current code</div>
-    ${renderCodeBlock(bug.current_code, "removed")}
-    ${bug.replacement_code ? `<div class="field-label">Replace with</div>${renderCodeBlock(bug.replacement_code, "added")}` : ""}
+    ${bug.replacement_code ? renderCodeBlock(bug.replacement_code, "added") : ""}
   `;
 }
 
 function renderBugCard(bug) {
   const icon = bug.kind === "unnecessary_code" ? "🟡" : "🔴";
 
-  const locationParts = [];
-  locationParts.push(escapeHtml(bug.file));
-  if (bug.function) locationParts.push(`fn <b>${escapeHtml(bug.function)}</b>`);
   const lineText = bug.line_note
     ? bug.line_note
     : (bug.line_start ? `Line${bug.line_end && bug.line_end !== bug.line_start ? "s" : ""} ${bug.line_start}${bug.line_end && bug.line_end !== bug.line_start ? "-" + bug.line_end : ""}` : "");
 
-  const retrievedHtml = (bug.retrieved_bugs || []).map(r => `
-    <div class="retrieved-item">
-      <div class="rleft"><b>${escapeHtml(r.dataset_source)}</b> · ${escapeHtml(r.bug_type || "Unclassified")} — ${escapeHtml(r.bug_description || "No description in source dataset")}</div>
-      <div class="sim">${r.similarity}%</div>
-    </div>
-  `).join("") || `<div class="hint">No closely matching historical bug found.</div>`;
-
   return `
     <div class="bug-card kind-${bug.kind}">
       <div class="bug-head">
-        <div class="bug-title">${icon} <span class="bug-number">Bug ${bug.number}</span> — ${escapeHtml(bug.error)}</div>
+        <div class="bug-title">${icon} <span class="bug-number">Bug ${bug.number}</span></div>
       </div>
       <div class="bug-body">
         <div class="field-label">Location</div>
-        <div class="location-line">${locationParts.join(" &nbsp;·&nbsp; ")} ${lineText ? "&nbsp;·&nbsp; " + escapeHtml(lineText) : ""}</div>
+        <div class="location-line">${escapeHtml(bug.file)} ${lineText ? "&nbsp;—&nbsp; " + escapeHtml(lineText) : ""}</div>
 
         <div class="field-label">Cause</div>
         <div class="cause-text">${escapeHtml(bug.cause)}</div>
 
-        ${bug.why_occurs ? `
-          <div class="field-label">Why it occurs</div>
-          <div class="cause-text">${escapeHtml(bug.why_occurs)}</div>
+        ${bug.current_code ? `
+          <div class="field-label">Error Code</div>
+          ${renderCodeBlock(bug.current_code, "removed")}
         ` : ""}
 
         <div class="field-label">Solution</div>
         ${renderSolutionBlock(bug)}
 
-        <div class="field-label">Action</div>
+        <div class="field-label">What To Do</div>
         <div class="explanation-text">${escapeHtml(bug.action)}</div>
 
-        ${bug.explanation ? `
-          <div class="field-label">Note</div>
-          <div class="explanation-text">${escapeHtml(bug.explanation)}</div>
-        ` : ""}
-
-        <div class="field-label">Similar historical bug (RAG)</div>
-        ${retrievedHtml}
-
         ${bug.insufficient_evidence ? `
-          <div class="insufficient-banner">Insufficient evidence to confidently identify this as a bug. Shown for review only.</div>
+          <div class="simple-note">We are not fully sure this is a real problem, so please check it yourself before making any changes.</div>
         ` : ""}
       </div>
     </div>
   `;
-}
-
-function accuracyClass(accuracy) {
-  if (accuracy >= 80) return "accuracy-high";
-  if (accuracy >= 50) return "accuracy-medium";
-  return "accuracy-low";
 }
 
 function errorLevelClass(level) {
@@ -463,7 +412,6 @@ function renderSummary(summary) {
       <div class="summary-cell"><div class="num">${summary.files_scanned}</div><div class="label">Files scanned</div></div>
       <div class="summary-cell"><div class="num">${summary.bugs_found}</div><div class="label">Possible bugs</div></div>
       <div class="summary-cell"><div class="num">${summary.unnecessary_code_found}</div><div class="label">Unnecessary code</div></div>
-      <div class="summary-cell"><div class="num ${accuracyClass(summary.accuracy)}">${summary.accuracy}%</div><div class="label">accuracy</div></div>
       <div class="summary-cell">
         <div class="error-level-pill ${errorLevelClass(summary.error_level)}">${escapeHtml(summary.error_level)}</div>
         <div class="label" style="margin-top:6px;">Error level</div>
