@@ -1,0 +1,9 @@
+# Force proper language detection
+*.py linguist-language=Python
+*.html linguist-language=HTML
+*.jsonl linguist-language=JSON
+*.json linguist-language=JSON
+
+# Exclude generated/vendored files from stats
+datasets/normalized/ linguist-generated=true
+backend/rag/index/ linguist-generated=true
