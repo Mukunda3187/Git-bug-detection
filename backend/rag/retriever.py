@@ -1,32 +1,37 @@
 """
-Loads the FAISS index and metadata built by build_index.py and exposes
-a single function: retrieve_similar_bugs(query_text, top_k).
-
-Uses semantic embeddings via sentence-transformers for better bug matching.
+Loads the RAG index and metadata. Supports both:
+1. FAISS + semantic embeddings (if sentence-transformers available)
+2. TF-IDF fallback (lightweight, works everywhere)
 
 If the index hasn't been built yet, this module builds it automatically
-from whatever is in datasets/normalized/ (so a fresh clone works immediately
-using the bundled sample.jsonl).
+from whatever is in datasets/normalized/.
 """
 import json
 import os
 
-from sentence_transformers import SentenceTransformer
-
 INDEX_DIR = os.path.join(os.path.dirname(__file__), "index")
 INDEX_PATH = os.path.join(INDEX_DIR, "faiss.index")
+TFIDF_VECTORIZER_PATH = os.path.join(INDEX_DIR, "vectorizer.joblib")
 METADATA_PATH = os.path.join(INDEX_DIR, "metadata.json")
-
-MODEL_NAME = "all-MiniLM-L6-v2"
 
 _index = None
 _metadata = None
 _model = None
+_vectorizer = None
+_use_semantic = False
+
+# Try to import semantic embedding dependencies
+try:
+    import faiss
+    from sentence_transformers import SentenceTransformer
+    _SEMANTIC_AVAILABLE = True
+except ImportError:
+    _SEMANTIC_AVAILABLE = False
 
 
 def _ensure_index_built():
     """Build index if it doesn't exist."""
-    if not os.path.exists(INDEX_PATH) or not os.path.exists(METADATA_PATH):
+    if not os.path.exists(METADATA_PATH):
         print("[retriever] Index not found. Building from datasets...")
         try:
             from rag.build_index import build
@@ -36,38 +41,49 @@ def _ensure_index_built():
 
 
 def _load():
-    """Load FAISS index, metadata, and model once."""
-    global _index, _metadata, _model
+    """Load index, metadata, and model once."""
+    global _index, _metadata, _model, _vectorizer, _use_semantic
     
-    if _index is not None and _metadata is not None and _model is not None:
+    if _metadata is not None:  # Already loaded
         return
     
     _ensure_index_built()
     
     try:
-        import faiss
-    except ImportError:
-        print("[retriever] ❌ FAISS not installed. Install with: pip install faiss-cpu")
-        return
-    
-    try:
-        _model = SentenceTransformer(MODEL_NAME)
-        _index = faiss.read_index(INDEX_PATH)
-        
         with open(METADATA_PATH, "r", encoding="utf-8") as f:
             _metadata = json.load(f)
-        
-        print(f"[retriever] ✅ Loaded FAISS index with {_index.ntotal} records")
     except Exception as e:
-        print(f"[retriever] ❌ Failed to load index/model: {e}")
-        _index = None
-        _metadata = None
-        _model = None
+        print(f"[retriever] ❌ Failed to load metadata: {e}")
+        _metadata = []
+        return
+    
+    # Try semantic embeddings (FAISS + sentence-transformers)
+    if _SEMANTIC_AVAILABLE and os.path.exists(INDEX_PATH):
+        try:
+            _model = SentenceTransformer("all-MiniLM-L6-v2")
+            _index = faiss.read_index(INDEX_PATH)
+            _use_semantic = True
+            print(f"[retriever] ✅ Loaded FAISS semantic index with {_index.ntotal} records")
+            return
+        except Exception as e:
+            print(f"[retriever] ⚠️  Semantic embeddings unavailable: {e}. Falling back to TF-IDF.")
+    
+    # Fallback to TF-IDF (lightweight)
+    try:
+        import joblib
+        _vectorizer = joblib.load(TFIDF_VECTORIZER_PATH)
+        _use_semantic = False
+        print(f"[retriever] ✅ Loaded TF-IDF index with {len(_metadata)} records")
+    except Exception as e:
+        print(f"[retriever] ⚠️  TF-IDF also unavailable: {e}")
+        _vectorizer = None
 
 
 def retrieve_similar_bugs(query_text: str, top_k: int = 3):
     """
     Retrieve the top-k similar bugs from the knowledge base.
+    
+    Uses semantic embeddings if available, otherwise falls back to TF-IDF.
     
     Args:
         query_text: The bug description/code to search for
@@ -78,42 +94,99 @@ def retrieve_similar_bugs(query_text: str, top_k: int = 3):
     """
     _load()
     
-    if _index is None or _metadata is None or _model is None:
-        print("[retriever] ⚠️  Index not available, returning empty results")
-        return []
-    
-    if _index.ntotal == 0:
+    if _metadata is None or len(_metadata) == 0:
+        print("[retriever] ⚠️  No metadata available")
         return []
     
     try:
+        if _use_semantic and _model is not None and _index is not None:
+            return _retrieve_semantic(query_text, top_k)
+        elif _vectorizer is not None:
+            return _retrieve_tfidf(query_text, top_k)
+        else:
+            print("[retriever] ❌ No retrieval method available")
+            return []
+    except Exception as e:
+        print(f"[retriever] ❌ Error during retrieval: {e}")
+        return []
+
+
+def _retrieve_semantic(query_text: str, top_k: int):
+    """Retrieve using FAISS semantic embeddings."""
+    try:
+        import numpy as np
+        
         # Generate embedding for query
         query_embedding = _model.encode([query_text], convert_to_numpy=True)
         
-        # Search FAISS index (returns distances and indices)
-        # L2 distance: smaller = more similar
+        # Search FAISS index
         k = min(top_k, _index.ntotal)
         distances, indices = _index.search(query_embedding.astype("float32"), k)
         
         results = []
         for idx, distance in zip(indices[0], distances[0]):
-            # Convert L2 distance to similarity score (0-1 range)
-            # Use exponential decay: similarity = exp(-distance)
-            similarity = max(0, 1.0 / (1.0 + distance))
+            # Convert L2 distance to similarity score
+            similarity = max(0, 1.0 / (1.0 + float(distance)))
             
             # Filter out very low similarity matches
-            if similarity >= 0.1:  # Configurable threshold
+            if similarity >= 0.1:
                 try:
                     record = _metadata[int(idx)]
                     results.append({
                         "record": record,
-                        "similarity": float(similarity),
+                        "similarity": similarity,
                     })
-                except (IndexError, TypeError) as e:
-                    print(f"[retriever] ⚠️  Error retrieving record at index {idx}: {e}")
+                except (IndexError, TypeError):
                     continue
         
         return results
-    
     except Exception as e:
-        print(f"[retriever] ❌ Error during retrieval: {e}")
+        print(f"[retriever] Semantic retrieval failed: {e}")
         return []
+
+
+def _retrieve_tfidf(query_text: str, top_k: int):
+    """Retrieve using TF-IDF (lightweight fallback)."""
+    try:
+        from sklearn.metrics.pairwise import cosine_similarity
+        
+        # Transform query using the fitted vectorizer
+        query_vec = _vectorizer.transform([query_text])
+        scores = cosine_similarity(query_vec, _vectorizer.transform(
+            [_embedding_text(r) for r in _metadata]
+        ))[0]
+        
+        # Get top k
+        top_k = min(top_k, len(scores))
+        top_indices = scores.argsort()[::-1][:top_k]
+        
+        results = []
+        for idx in top_indices:
+            score = float(scores[idx])
+            if score > 0.01:  # Minimal threshold for TF-IDF
+                try:
+                    results.append({
+                        "record": _metadata[idx],
+                        "similarity": min(score, 1.0),  # Cap at 1.0
+                    })
+                except (IndexError, TypeError):
+                    continue
+        
+        return results
+    except Exception as e:
+        print(f"[retriever] TF-IDF retrieval failed: {e}")
+        return []
+
+
+def _embedding_text(record: dict) -> str:
+    """Extract text from a record for embedding."""
+    parts = []
+    if record.get("bug_description"):
+        parts.append(record["bug_description"])
+    if record.get("error"):
+        parts.append(f"Error: {record['error']}")
+    if record.get("bug_type"):
+        parts.append(f"Type: {record['bug_type']}")
+    if record.get("buggy_code"):
+        parts.append(f"Code: {record['buggy_code']}")
+    return "\n".join(filter(None, parts))
