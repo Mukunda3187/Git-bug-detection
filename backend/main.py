@@ -66,19 +66,49 @@ def _empty_summary(repo: str, message: str) -> ScanResult:
     )
 
 
-def _compute_accuracy_and_level(confident_issue_count: int):
+def _compute_accuracy_and_level(bug_reports):
     """
-    Accuracy = how likely the current code is to run correctly as-is, based
-    purely on the number of confidently-detected issues (not LLM confidence,
-    not detection-system confidence). Every confident issue costs 8 points.
+    Accuracy represents how likely the scanned code is to run correctly
+    based on the issues actually detected in the repository.
+
+    More serious issues reduce the estimated runtime correctness more.
+    LLM confidence does not control this value.
     """
-    accuracy = max(0, 100 - confident_issue_count * 8)
-    if confident_issue_count <= 2:
+
+    penalty = 0
+
+    for bug in bug_reports:
+        bug_type = bug.bug_type or ""
+        kind = bug.kind or ""
+
+        if bug_type == "Syntax Error":
+            penalty += 30
+        elif bug_type in ("Runtime Error", "Type Error", "Dependency Error"):
+            penalty += 20
+        elif bug_type in ("Security Issue", "API Error"):
+            penalty += 18
+        elif bug_type == "Logic Error":
+            penalty += 15
+        elif bug_type == "Performance Issue":
+            penalty += 8
+        elif kind == "unnecessary_code":
+            penalty += 3
+        else:
+            penalty += 10
+
+    accuracy = max(0, 100 - penalty)
+
+    issue_count = len(bug_reports)
+
+    if issue_count == 0:
         error_level = "Less Errors"
-    elif confident_issue_count <= 6:
+    elif issue_count <= 10:
+        error_level = "Less Errors"
+    elif issue_count <= 30:
         error_level = "Medium Errors"
     else:
         error_level = "More Errors"
+
     return accuracy, error_level
 
 
