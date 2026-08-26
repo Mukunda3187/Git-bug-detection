@@ -102,7 +102,9 @@ Now produce the JSON bug report."""
 
 
 def _fallback_report(finding: dict) -> dict:
-    """Used only when no LLM API key is configured - clearly a formatter, not an analysis."""
+    """Used when no LLM reasoning is available - either no API key is configured, or the
+    live LLM call failed/timed out (analyze_finding overwrites `explanation` for that case).
+    Never claims to show a "new code below" it doesn't actually have."""
     is_unused = finding.get("rule") == "possibly_unused_function"
     return {
         "error": finding.get("error", "Possible issue"),
@@ -110,7 +112,11 @@ def _fallback_report(finding: dict) -> dict:
         "cause": finding.get("cause", ""),
         "why_occurs": "This was flagged by static analysis rules; no LLM reasoning is available right now.",
         "solution_type": "remove" if is_unused else "replace",
-        "solution_intro": "Remove the given code." if is_unused else "Replace the given code with the new code shown below.",
+        "solution_intro": (
+            "Remove the given code." if is_unused else
+            "No automated fix could be generated right now (see note below) - review the code "
+            "shown below and apply a fix manually."
+        ),
         "replacement_code": None,
         "add_location": None,
         "new_file_path": None,
