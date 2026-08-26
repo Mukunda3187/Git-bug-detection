@@ -64,7 +64,7 @@ def check_repository(url: str) -> RepoStatus:
     if resp.status_code == 403:
         return RepoStatus(
             status="unreachable",
-            message="Unable to access this repository. Please try again later or check the repository link. (GitHub API rate limit hit - add a GITHUB_TOKEN environment variable)",
+            message="Unable to access this repository. Please try again later or check the repository link.",
         )
 
     if resp.status_code != 200:
