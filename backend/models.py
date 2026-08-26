@@ -59,6 +59,7 @@ class ScanSummary(BaseModel):
     unnecessary_code_found: int
     error_level: str           # "Less Errors" | "Medium Errors" | "More Errors"
     scan_status: str
+    ai_notice: Optional[str] = None   # shown when the AI hit a usage limit during this scan
 
 
 class ScanResult(BaseModel):
