@@ -14,12 +14,64 @@ NOT pretend to be the LLM's reasoning, it just formats what the detector
 already found.
 """
 import json
+import math
 import os
 
 import requests
 
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+
+def _parse_rate_limit_info(resp):
+    """
+    Reads Google's 429 error body to figure out how long to wait and whether
+    this is a short per-minute limit or the daily free-tier cap. Returns
+    (retry_seconds_or_None, is_daily_limit).
+    """
+    try:
+        data = resp.json()
+    except (ValueError, json.JSONDecodeError):
+        return None, False
+
+    error = data.get("error", {})
+    details = error.get("details", [])
+    retry_seconds = None
+    is_daily = False
+
+    for d in details:
+        type_str = d.get("@type", "")
+        if type_str.endswith("RetryInfo"):
+            delay = d.get("retryDelay", "")
+            try:
+                retry_seconds = float(str(delay).rstrip("s"))
+            except ValueError:
+                pass
+        if type_str.endswith("QuotaFailure"):
+            for v in d.get("violations", []):
+                combined = f"{v.get('quotaId', '')} {v.get('quotaMetric', '')}"
+                if "PerDay" in combined or "per_day" in combined:
+                    is_daily = True
+
+    return retry_seconds, is_daily
+
+
+def _build_rate_limit_message(retry_seconds, is_daily):
+    """Turns the parsed rate-limit details into one plain-English sentence."""
+    if is_daily:
+        if retry_seconds:
+            minutes = max(1, math.ceil(retry_seconds / 60))
+            return f"The free AI usage limit for today has been reached. Try again in about {minutes} minute(s), or after Google's daily reset (midnight Pacific Time, US)."
+        return "The free AI usage limit for today has been reached. It resets at midnight Pacific Time (US) - please try again after that."
+
+    if retry_seconds:
+        if retry_seconds < 60:
+            wait = int(retry_seconds) + 5  # small buffer
+            return f"The AI is temporarily busy. Try again in about {wait} seconds."
+        minutes = max(1, math.ceil(retry_seconds / 60))
+        return f"The AI is temporarily busy. Try again in about {minutes} minute(s)."
+
+    return "The AI usage limit has been reached for now. Please try again in a minute or two."
 
 SYSTEM_PROMPT = """You are helping explain code bugs to someone who may have very little
 programming knowledge - a beginner, or someone who has never coded at all. You will be
@@ -183,6 +235,7 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
     }
 
     last_error = None
+    last_429_response = None
 
     # Try each Gemini API key until one succeeds.
     for key_number, api_key in enumerate(api_keys, start=1):
@@ -214,6 +267,9 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
                     print(f"[llm_client] Gemini returned non-JSON response: {raw_text[:300]}")
                     return _fallback_report(finding)
 
+            if resp.status_code == 429:
+                last_429_response = resp
+
             # Key failed - try the next key. Log the technical detail server-side
             # only - the person using the app should never see raw HTTP/API errors.
             last_error = f"Gemini key {key_number} returned HTTP {resp.status_code}: {resp.text[:200]}"
@@ -224,4 +280,15 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
     # All keys failed. Print the real reason to the server logs (visible in Render's
     # Logs tab) so it can still be debugged, but keep the user-facing result simple.
     print(f"[llm_client] All Gemini API keys failed. Last error: {last_error}")
-    return _fallback_report(finding)
+
+    fallback = _fallback_report(finding)
+
+    # If every key failed specifically because of a rate limit, tell the person
+    # clearly (and when they can try again) instead of the generic "fix it
+    # yourself" message - this is shown once at the top of the scan results.
+    if last_429_response is not None:
+        retry_seconds, is_daily = _parse_rate_limit_info(last_429_response)
+        fallback["rate_limited"] = True
+        fallback["rate_limit_message"] = _build_rate_limit_message(retry_seconds, is_daily)
+
+    return fallback
