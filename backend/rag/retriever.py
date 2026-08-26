@@ -20,13 +20,9 @@ _model = None
 _vectorizer = None
 _use_semantic = False
 
-# Try to import semantic embedding dependencies
-try:
-    import faiss
-    from sentence_transformers import SentenceTransformer
-    _SEMANTIC_AVAILABLE = True
-except ImportError:
-    _SEMANTIC_AVAILABLE = False
+# Semantic embeddings are disabled on Render.
+# We use the lightweight TF-IDF retriever instead.
+_SEMANTIC_AVAILABLE = False
 
 
 def _ensure_index_built():
