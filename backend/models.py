@@ -29,22 +29,25 @@ class RetrievedBug(BaseModel):
 
 class BugReport(BaseModel):
     id: str
+    number: int                    # sequential display number: Bug 1, Bug 2, ...
     kind: str = "bug"              # "bug" | "unnecessary_code"
-    error: str
+    error: str                     # short title, e.g. "Possibly unused function"
     bug_type: str
-    status_category: str           # Easy / Frequent / Complex / API / Runtime / Logic / Syntax / Type / Dependency / Security / Performance / Other
-    severity: str                  # Low / Medium / High / Critical
-    confidence: int                # 0-100
     file: str
     function: Optional[str] = None
     line_start: Optional[int] = None
     line_end: Optional[int] = None
     line_note: Optional[str] = None   # "Exact line could not be determined." when line is unknown
     cause: str
+    why_occurs: Optional[str] = None
+    solution_type: str = "replace"    # "replace" | "add" | "remove" | "create_file"
+    solution_intro: str = ""          # required first sentence, e.g. "Replace the given code with the new code shown below."
     current_code: str
     replacement_code: Optional[str] = None
+    add_location: Optional[str] = None   # human description of where to add code, for solution_type == "add"
+    new_file_path: Optional[str] = None  # for solution_type == "create_file"
+    action: str = ""                     # final one-line action sentence
     explanation: Optional[str] = None
-    action: Optional[str] = None       # for unnecessary code: "Remove this code."
     retrieved_bugs: List[RetrievedBug] = []
     insufficient_evidence: bool = False
 
@@ -53,12 +56,9 @@ class ScanSummary(BaseModel):
     repo: str
     files_scanned: int
     bugs_found: int
-    high_severity: int
-    medium_severity: int
-    low_severity: int
-    confidence_high: int
-    confidence_medium: int
-    confidence_low: int
+    unnecessary_code_found: int
+    accuracy: int              # 0-100, how likely the current code is to run correctly as-is
+    error_level: str           # "Less Errors" | "Medium Errors" | "More Errors"
     scan_status: str
 
 
