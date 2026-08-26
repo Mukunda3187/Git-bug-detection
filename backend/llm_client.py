@@ -240,7 +240,7 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
                 GEMINI_URL,
                 params={"key": api_key},
                 json=payload,
-                timeout=30,
+                timeout=12,
             )
 
             if resp.status_code == 200:
