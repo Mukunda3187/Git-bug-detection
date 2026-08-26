@@ -57,7 +57,6 @@ class ScanSummary(BaseModel):
     files_scanned: int
     bugs_found: int
     unnecessary_code_found: int
-    accuracy: int              # 0-100, how likely the current code is to run correctly as-is
     error_level: str           # "Less Errors" | "Medium Errors" | "More Errors"
     scan_status: str
 
