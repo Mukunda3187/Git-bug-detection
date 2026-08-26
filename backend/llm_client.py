@@ -22,19 +22,23 @@ Your job:
 2. If yes, explain the cause AND why it likely happened (e.g. leftover from refactoring,
    missing validation, unsafe string handling), based on the ACTUAL code shown - never
    invent unrelated code.
-3. Pick exactly ONE solution_type that matches what the developer needs to do:
+3. If solution_type is "replace", you MUST always provide a non-null, non-empty
+   replacement_code with the actual corrected code - never leave it null for a
+   replace solution. If you cannot write a concrete fix, use solution_type "add"
+   or set insufficient_evidence to true instead of leaving replacement_code empty.
+4. Pick exactly ONE solution_type that matches what the developer needs to do:
    - "replace": existing code is wrong and should be swapped for corrected code
    - "add": nothing is wrong with existing code, but a check/line is missing and needs adding
    - "remove": the code should simply be deleted (e.g. unused/dead code)
    - "create_file": a new file is needed (rare - only use this if that's genuinely the fix)
-4. Write solution_intro as the exact required first sentence for that solution_type:
+5. Write solution_intro as the exact required first sentence for that solution_type:
    - replace -> "Replace the given code with the new code shown below."
    - add -> "Add the following code as instructed below."
    - remove -> "Remove the given code."
    - create_file -> "Create the file at the location given below and paste the following code into it."
-5. Write action as ONE short final sentence telling the developer exactly what to do, e.g.
+7. Write action as ONE short final sentence telling the developer exactly what to do, e.g.
    "Replace the current code with the code shown above." or "Remove this code from the file."
-6. If the evidence is weak (e.g. only a vague heuristic match, no real historical support), set
+8. If the evidence is weak (e.g. only a vague heuristic match, no real historical support), set
    "insufficient_evidence" to true and explain why in "explanation", rather than guessing.
 
 Reply with ONLY a JSON object, no markdown fences, no extra text, with exactly these keys:
@@ -64,7 +68,7 @@ def _build_user_message(finding: dict, retrieved: list) -> str:
         for r in retrieved
     ) or "(no similar historical bugs found)"
 
-    return f"""Candidate issue detected by static analyzer:
+      return f"""Candidate issue detected by static analyzer:
 File: {finding.get('file')}
 Function: {finding.get('function')}
 Line(s): {finding.get('line_start')}-{finding.get('line_end')}
@@ -73,11 +77,6 @@ Detector's initial label: {finding.get('error')} ({finding.get('bug_type')})
 Detector's initial cause note: {finding.get('cause')}
 
 Code:
-
-Similar historical bugs retrieved from the knowledge base:
-{retrieved_block}
-
-Now produce the JSON bug report."""
 
 
 def _fallback_report(finding: dict) -> dict:
