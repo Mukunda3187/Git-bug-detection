@@ -128,13 +128,39 @@ def _fallback_report(finding: dict) -> dict:
 
 
 def analyze_finding(finding: dict, retrieved: list) -> dict:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    api_keys = []
+
+    # Read multiple Gemini API keys from environment variables.
+    for i in range(1, 11):
+        key = os.getenv(f"GEMINI_API_KEY_{i}")
+        if key and key.strip():
+            api_keys.append(key.strip())
+
+    # Keep support for the old single-key variable.
+    old_key = os.getenv("GEMINI_API_KEY")
+    if old_key and old_key.strip() and old_key.strip() not in api_keys:
+        api_keys.append(old_key.strip())
+
+    if not api_keys:
         return _fallback_report(finding)
 
     payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": _build_user_message(finding, retrieved)}]}],
+        "system_instruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": _build_user_message(
+                            finding,
+                            retrieved
+                        )
+                    }
+                ],
+            }
+        ],
         "generationConfig": {
             "response_mime_type": "application/json",
             "temperature": 0.2,
@@ -142,30 +168,56 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
         },
     }
 
-    try:
-        resp = requests.post(
-            GEMINI_URL,
-            params={"key": api_key},
-            json=payload,
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Gemini API returned status {resp.status_code}: {resp.text[:300]}")
+    last_error = None
 
-        data = resp.json()
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        # LLM call failed for any reason (bad key, rate limit, network) -
-        # never let this crash the whole scan.
-        fallback = _fallback_report(finding)
-        fallback["explanation"] = f"LLM call failed ({e}). Showing the raw static analyzer result instead."
-        return fallback
+    # Try each Gemini API key until one succeeds.
+    for key_number, api_key in enumerate(api_keys, start=1):
+        try:
+            resp = requests.post(
+                GEMINI_URL,
+                params={"key": api_key},
+                json=payload,
+                timeout=30,
+            )
 
-    try:
-        cleaned = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        return json.loads(cleaned)
-    except (json.JSONDecodeError, ValueError):
-        fallback = _fallback_report(finding)
-        fallback["explanation"] = "The LLM response could not be parsed as JSON, so this finding is shown " \
-                                   "using the raw static analyzer result instead."
-        return fallback
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+                try:
+                    cleaned = (
+                        raw_text
+                        .strip()
+                        .removeprefix("```json")
+                        .removeprefix("```")
+                        .removesuffix("```")
+                        .strip()
+                    )
+
+                    return json.loads(cleaned)
+
+                except (json.JSONDecodeError, ValueError):
+                    fallback = _fallback_report(finding)
+                    fallback["explanation"] = (
+                        "The LLM response could not be parsed as JSON."
+                    )
+                    return fallback
+
+            # Key failed - try the next key.
+            last_error = (
+                f"Gemini key {key_number} returned "
+                f"HTTP {resp.status_code}"
+            )
+
+        except Exception as e:
+            last_error = f"Gemini key {key_number} failed: {e}"
+
+    # All keys failed.
+    fallback = _fallback_report(finding)
+    fallback["explanation"] = (
+        f"All configured Gemini API keys failed. "
+        f"Last error: {last_error}. "
+        f"Showing the raw static analyzer result instead."
+    )
+
+    return fallback
