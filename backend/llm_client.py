@@ -85,3 +85,75 @@ Detector's initial label: {finding.get('error')} ({finding.get('bug_type')})
 Detector's initial cause note: {finding.get('cause')}
 
 Code:
+```
+{finding.get('current_code')}
+```
+
+Similar historical bugs retrieved from the knowledge base:
+{retrieved_block}
+
+Now produce the JSON bug report."""
+
+
+def _fallback_report(finding: dict) -> dict:
+    """Used only when no LLM API key is configured - clearly a formatter, not an analysis."""
+    is_unused = finding.get("rule") == "possibly_unused_function"
+    return {
+        "error": finding.get("error", "Possible issue"),
+        "bug_type": finding.get("bug_type", "Other"),
+        "cause": finding.get("cause", ""),
+        "why_occurs": "This was flagged by static analysis rules; no LLM reasoning is available right now.",
+        "solution_type": "remove" if is_unused else "replace",
+        "solution_intro": "Remove the given code." if is_unused else "Replace the given code with the new code shown below.",
+        "replacement_code": None,
+        "add_location": None,
+        "new_file_path": None,
+        "action": "Remove this code from the file." if is_unused else "Review this code and apply a fix manually.",
+        "explanation": "No LLM API key configured (GEMINI_API_KEY missing) - showing the raw static "
+                       "analyzer finding without LLM reasoning or a suggested fix.",
+        "insufficient_evidence": True,
+    }
+
+
+def analyze_finding(finding: dict, retrieved: list) -> dict:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return _fallback_report(finding)
+
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": _build_user_message(finding, retrieved)}]}],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.2,
+            "maxOutputTokens": 1000,
+        },
+    }
+
+    try:
+        resp = requests.post(
+            GEMINI_URL,
+            params={"key": api_key},
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gemini API returned status {resp.status_code}: {resp.text[:300]}")
+
+        data = resp.json()
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        # LLM call failed for any reason (bad key, rate limit, network) -
+        # never let this crash the whole scan.
+        fallback = _fallback_report(finding)
+        fallback["explanation"] = f"LLM call failed ({e}). Showing the raw static analyzer result instead."
+        return fallback
+
+    try:
+        cleaned = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        fallback = _fallback_report(finding)
+        fallback["explanation"] = "The LLM response could not be parsed as JSON, so this finding is shown " \
+                                   "using the raw static analyzer result instead."
+        return fallback
