@@ -210,9 +210,11 @@ def scan_repo(req: ScanRequest):
                     insufficient_evidence=bool(analysis.get("insufficient_evidence", False)),
                 ))
 
-        unnecessary_code_found = sum(1 for b in bug_reports if b.kind == "unnecessary_code")
-        confident_issue_count = sum(1 for b in bug_reports if not b.insufficient_evidence)
-        accuracy, error_level = _compute_accuracy_and_level(confident_issue_count)
+     unnecessary_code_found = sum(
+    1 for b in bug_reports if b.kind == "unnecessary_code"
+)
+
+accuracy, error_level = _compute_accuracy_and_level(bug_reports)
 
         return ScanResult(
             summary=ScanSummary(
