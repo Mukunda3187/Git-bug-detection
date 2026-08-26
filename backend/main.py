@@ -41,6 +41,34 @@ DETECTORS_BY_EXTENSION = {
 MAX_FILES_TO_SCAN = 40          # keeps a single scan fast enough to not hit a gateway timeout
 MAX_LLM_CALLS_PER_SCAN = 15     # LLM calls are the slow part - cap them per scan
 
+
+def _empty_summary(repo: str, message: str) -> ScanResult:
+    return ScanResult(
+        summary=ScanSummary(
+            repo=repo, files_scanned=0, bugs_found=0,
+            unnecessary_code_found=0, accuracy=100, error_level="Less Errors",
+            scan_status=message,
+        ),
+        bugs=[],
+    )
+
+
+def _compute_accuracy_and_level(confident_issue_count: int):
+    """
+    Accuracy = how likely the current code is to run correctly as-is, based
+    purely on the number of confidently-detected issues (not LLM confidence,
+    not detection-system confidence). Every confident issue costs 8 points.
+    """
+    accuracy = max(0, 100 - confident_issue_count * 8)
+    if confident_issue_count <= 2:
+        error_level = "Less Errors"
+    elif confident_issue_count <= 6:
+        error_level = "Medium Errors"
+    else:
+        error_level = "More Errors"
+    return accuracy, error_level
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
@@ -55,28 +83,15 @@ def validate_repo(req: ScanRequest):
 def scan_repo(req: ScanRequest):
     status = check_repository(req.repo_url)
     if status.status != "valid":
-        return ScanResult(
-            summary=ScanSummary(
-                repo=req.repo_url, files_scanned=0, bugs_found=0,
-                high_severity=0, medium_severity=0, low_severity=0,
-                confidence_high=0, confidence_medium=0, confidence_low=0,
-                scan_status=status.message,
-            ),
-            bugs=[],
-        )
+        return _empty_summary(req.repo_url, status.message)
 
     repo_path = None
     try:
         repo_path = download_repository(status.owner, status.name, status.default_branch)
     except RuntimeError as e:
-        return ScanResult(
-            summary=ScanSummary(
-                repo=req.repo_url, files_scanned=0, bugs_found=0,
-                high_severity=0, medium_severity=0, low_severity=0,
-                confidence_high=0, confidence_medium=0, confidence_low=0,
-                scan_status=f"Unable to access this repository. Please try again later or check the repository link. ({e})",
-            ),
-            bugs=[],
+        return _empty_summary(
+            req.repo_url,
+            f"Unable to access this repository. Please try again later or check the repository link. ({e})",
         )
 
     try:
@@ -84,6 +99,7 @@ def scan_repo(req: ScanRequest):
         files_to_scan = files[:MAX_FILES_TO_SCAN]
         bug_reports = []
         llm_calls_used = 0
+        bug_number = 0
 
         for full_path in files_to_scan:
             ext = os.path.splitext(full_path)[1]
@@ -113,25 +129,29 @@ def scan_repo(req: ScanRequest):
                 analysis = analyze_finding(finding, retrieved)
 
                 is_unnecessary = finding.get("rule") == "possibly_unused_function"
+                bug_number += 1
 
                 bug_reports.append(BugReport(
                     id=str(uuid.uuid4())[:8],
+                    number=bug_number,
                     kind="unnecessary_code" if is_unnecessary else "bug",
                     error=analysis.get("error", finding.get("error", "Possible issue")),
                     bug_type=analysis.get("bug_type", finding.get("bug_type", "Other")),
-                    status_category=analysis.get("status_category", finding.get("bug_type", "Other")),
-                    severity=analysis.get("severity", "Medium"),
-                    confidence=int(analysis.get("confidence", 50)),
                     file=relative_path,
                     function=finding.get("function"),
                     line_start=finding.get("line_start"),
                     line_end=finding.get("line_end"),
                     line_note=None if finding.get("line_start") else "Exact line could not be determined.",
                     cause=analysis.get("cause", finding.get("cause", "")),
+                    why_occurs=analysis.get("why_occurs"),
+                    solution_type=analysis.get("solution_type", "replace"),
+                    solution_intro=analysis.get("solution_intro", ""),
                     current_code=finding.get("current_code", ""),
                     replacement_code=analysis.get("replacement_code"),
+                    add_location=analysis.get("add_location"),
+                    new_file_path=analysis.get("new_file_path"),
+                    action=analysis.get("action", ""),
                     explanation=analysis.get("explanation"),
-                    action=analysis.get("action"),
                     retrieved_bugs=[
                         RetrievedBug(
                             dataset_source=r["record"].get("dataset_source", "Unknown"),
@@ -145,24 +165,18 @@ def scan_repo(req: ScanRequest):
                     insufficient_evidence=bool(analysis.get("insufficient_evidence", False)),
                 ))
 
-        high = sum(1 for b in bug_reports if b.severity == "High" or b.severity == "Critical")
-        medium = sum(1 for b in bug_reports if b.severity == "Medium")
-        low = sum(1 for b in bug_reports if b.severity == "Low")
-        conf_high = sum(1 for b in bug_reports if b.confidence >= 80)
-        conf_medium = sum(1 for b in bug_reports if 50 <= b.confidence < 80)
-        conf_low = sum(1 for b in bug_reports if b.confidence < 50)
+        unnecessary_code_found = sum(1 for b in bug_reports if b.kind == "unnecessary_code")
+        confident_issue_count = sum(1 for b in bug_reports if not b.insufficient_evidence)
+        accuracy, error_level = _compute_accuracy_and_level(confident_issue_count)
 
         return ScanResult(
             summary=ScanSummary(
                 repo=f"{status.owner}/{status.name}",
                 files_scanned=len(files_to_scan),
                 bugs_found=len(bug_reports),
-                high_severity=high,
-                medium_severity=medium,
-                low_severity=low,
-                confidence_high=conf_high,
-                confidence_medium=conf_medium,
-                confidence_low=conf_low,
+                unnecessary_code_found=unnecessary_code_found,
+                accuracy=accuracy,
+                error_level=error_level,
                 scan_status="Completed",
             ),
             bugs=bug_reports,
