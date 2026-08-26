@@ -463,7 +463,7 @@ function renderSummary(summary) {
       <div class="summary-cell"><div class="num">${summary.files_scanned}</div><div class="label">Files scanned</div></div>
       <div class="summary-cell"><div class="num">${summary.bugs_found}</div><div class="label">Possible bugs</div></div>
       <div class="summary-cell"><div class="num">${summary.unnecessary_code_found}</div><div class="label">Unnecessary code</div></div>
-      <div class="summary-cell"><div class="num ${accuracyClass(summary.accuracy)}">${summary.accuracy}%</div><div class="label">Accuracy</div></div>
+      <div class="summary-cell"><div class="num ${accuracyClass(summary.accuracy)}">${summary.accuracy}%</div><div class="label">Code Health</div></div>
       <div class="summary-cell">
         <div class="error-level-pill ${errorLevelClass(summary.error_level)}">${escapeHtml(summary.error_level)}</div>
         <div class="label" style="margin-top:6px;">Error level</div>
