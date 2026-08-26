@@ -166,30 +166,35 @@
     letter-spacing: 0.06em;
   }
 
-  .num.high { color: var(--crit); }
-  .num.medium { color: var(--warn); }
-  .num.low { color: var(--added); }
+  .num.accuracy-high { color: var(--added); }
+  .num.accuracy-medium { color: var(--warn); }
+  .num.accuracy-low { color: var(--crit); }
+
+  .error-level-pill {
+    display: inline-block;
+    margin-top: 4px;
+    font-size: 12px;
+    padding: 2px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .error-level-pill.less { color: var(--added); border-color: var(--added); }
+  .error-level-pill.medium { color: var(--warn); border-color: var(--warn); }
+  .error-level-pill.more { color: var(--crit); border-color: var(--crit); }
 
   .bug-card {
     border: 1px solid var(--border);
     border-left-width: 3px;
+    border-left-color: var(--retrieval);
     border-radius: var(--radius);
     background: var(--panel);
     margin-bottom: 18px;
     overflow: hidden;
   }
-  .bug-card.sev-High, .bug-card.sev-Critical { border-left-color: var(--crit); }
-  .bug-card.sev-Medium { border-left-color: var(--warn); }
-  .bug-card.sev-Low { border-left-color: var(--added); }
   .bug-card.kind-unnecessary_code { border-left-color: var(--warn); }
 
   .bug-head {
     padding: 14px 18px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 10px;
     border-bottom: 1px solid var(--border);
     background: var(--panel-raised);
   }
@@ -199,21 +204,7 @@
     font-weight: 600;
     font-size: 15px;
   }
-
-  .badge-row { display: flex; gap: 6px; flex-wrap: wrap; }
-
-  .badge {
-    font-size: 11px;
-    padding: 3px 9px;
-    border-radius: 999px;
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    white-space: nowrap;
-  }
-  .badge.sev-High, .badge.sev-Critical { color: var(--crit); border-color: var(--crit); }
-  .badge.sev-Medium { color: var(--warn); border-color: var(--warn); }
-  .badge.sev-Low { color: var(--added); border-color: var(--added); }
-  .badge.confidence { color: var(--retrieval); border-color: var(--retrieval); }
+  .bug-title .bug-number { color: var(--retrieval); }
 
   .bug-body { padding: 18px; }
 
@@ -360,11 +351,41 @@ function renderCodeBlock(code, cssClass) {
   return `<pre class="code-block ${cssClass}">${body}</pre>`;
 }
 
-function severityClass(sev) { return "sev-" + sev; }
+function renderSolutionBlock(bug) {
+  const intro = bug.solution_intro ? `<div class="cause-text">${escapeHtml(bug.solution_intro)}</div>` : "";
+
+  if (bug.solution_type === "add") {
+    return `
+      ${intro}
+      ${bug.add_location ? `<div class="field-label">Where to add</div><div class="location-line">${escapeHtml(bug.add_location)}</div>` : ""}
+      ${bug.replacement_code ? `<div class="field-label">Code to add</div>${renderCodeBlock(bug.replacement_code, "added")}` : ""}
+    `;
+  }
+  if (bug.solution_type === "remove") {
+    return `
+      ${intro}
+      <div class="field-label">Code to remove</div>
+      ${renderCodeBlock(bug.current_code, "removed")}
+    `;
+  }
+  if (bug.solution_type === "create_file") {
+    return `
+      ${intro}
+      ${bug.new_file_path ? `<div class="field-label">File</div><div class="location-line">${escapeHtml(bug.new_file_path)}</div>` : ""}
+      ${bug.replacement_code ? `<div class="field-label">Code to paste</div>${renderCodeBlock(bug.replacement_code, "added")}` : ""}
+    `;
+  }
+  // default: "replace"
+  return `
+    ${intro}
+    <div class="field-label">Current code</div>
+    ${renderCodeBlock(bug.current_code, "removed")}
+    ${bug.replacement_code ? `<div class="field-label">Replace with</div>${renderCodeBlock(bug.replacement_code, "added")}` : ""}
+  `;
+}
 
 function renderBugCard(bug) {
-  const isUnnecessary = bug.kind === "unnecessary_code";
-  const icon = isUnnecessary ? "🟡" : (bug.severity === "High" || bug.severity === "Critical" ? "🔴" : "🟠");
+  const icon = bug.kind === "unnecessary_code" ? "🟡" : "🔴";
 
   const locationParts = [];
   locationParts.push(escapeHtml(bug.file));
@@ -381,14 +402,9 @@ function renderBugCard(bug) {
   `).join("") || `<div class="hint">No closely matching historical bug found.</div>`;
 
   return `
-    <div class="bug-card ${severityClass(bug.severity)} kind-${bug.kind}">
+    <div class="bug-card kind-${bug.kind}">
       <div class="bug-head">
-        <div class="bug-title">${icon} ${escapeHtml(bug.error)}</div>
-        <div class="badge-row">
-          <span class="badge">${escapeHtml(bug.status_category)}</span>
-          <span class="badge sev-${bug.severity}">${escapeHtml(bug.severity)}</span>
-          <span class="badge confidence">${bug.confidence}% confidence</span>
-        </div>
+        <div class="bug-title">${icon} <span class="bug-number">Bug ${bug.number}</span> — ${escapeHtml(bug.error)}</div>
       </div>
       <div class="bug-body">
         <div class="field-label">Location</div>
@@ -397,22 +413,20 @@ function renderBugCard(bug) {
         <div class="field-label">Cause</div>
         <div class="cause-text">${escapeHtml(bug.cause)}</div>
 
-        <div class="field-label">Current code</div>
-        ${renderCodeBlock(bug.current_code, "removed")}
-
-        ${bug.replacement_code ? `
-          <div class="field-label">Replace with</div>
-          ${renderCodeBlock(bug.replacement_code, "added")}
+        ${bug.why_occurs ? `
+          <div class="field-label">Why it occurs</div>
+          <div class="cause-text">${escapeHtml(bug.why_occurs)}</div>
         ` : ""}
+
+        <div class="field-label">Solution</div>
+        ${renderSolutionBlock(bug)}
+
+        <div class="field-label">Action</div>
+        <div class="explanation-text">${escapeHtml(bug.action)}</div>
 
         ${bug.explanation ? `
-          <div class="field-label">Why</div>
+          <div class="field-label">Note</div>
           <div class="explanation-text">${escapeHtml(bug.explanation)}</div>
-        ` : ""}
-
-        ${bug.action ? `
-          <div class="field-label">Action</div>
-          <div class="explanation-text">${escapeHtml(bug.action)}</div>
         ` : ""}
 
         <div class="field-label">Similar historical bug (RAG)</div>
@@ -426,6 +440,18 @@ function renderBugCard(bug) {
   `;
 }
 
+function accuracyClass(accuracy) {
+  if (accuracy >= 80) return "accuracy-high";
+  if (accuracy >= 50) return "accuracy-medium";
+  return "accuracy-low";
+}
+
+function errorLevelClass(level) {
+  if (level === "Less Errors") return "less";
+  if (level === "Medium Errors") return "medium";
+  return "more";
+}
+
 function renderSummary(summary) {
   const holder = document.getElementById("summary-holder");
   if (summary.files_scanned === 0 && summary.bugs_found === 0 && summary.scan_status === "Completed") {
@@ -436,9 +462,12 @@ function renderSummary(summary) {
     <div class="summary-grid">
       <div class="summary-cell"><div class="num">${summary.files_scanned}</div><div class="label">Files scanned</div></div>
       <div class="summary-cell"><div class="num">${summary.bugs_found}</div><div class="label">Possible bugs</div></div>
-      <div class="summary-cell"><div class="num high">${summary.high_severity}</div><div class="label">High severity</div></div>
-      <div class="summary-cell"><div class="num medium">${summary.medium_severity}</div><div class="label">Medium severity</div></div>
-      <div class="summary-cell"><div class="num low">${summary.low_severity}</div><div class="label">Low severity</div></div>
+      <div class="summary-cell"><div class="num">${summary.unnecessary_code_found}</div><div class="label">Unnecessary code</div></div>
+      <div class="summary-cell"><div class="num ${accuracyClass(summary.accuracy)}">${summary.accuracy}%</div><div class="label">Accuracy</div></div>
+      <div class="summary-cell">
+        <div class="error-level-pill ${errorLevelClass(summary.error_level)}">${escapeHtml(summary.error_level)}</div>
+        <div class="label" style="margin-top:6px;">Error level</div>
+      </div>
     </div>
   `;
 }
