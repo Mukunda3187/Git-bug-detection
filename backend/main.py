@@ -1,66 +1,208 @@
 """
-Shared data models for the whole backend.
-Every module imports from here so the JSON shape sent to the frontend
-never drifts between files.
+Entry point for the backend. Run with:
+    uvicorn main:app --reload --port 8000
+
+Flow per request (matches the abstract exactly):
+GitHub URL -> validate -> download -> scan files -> detect candidates
+-> RAG retrieve similar historical bugs -> LLM analyze -> build report
 """
-from typing import Optional, List
-from pydantic import BaseModel
+import os
+import uuid
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from models import ScanRequest, ScanResult, ScanSummary, BugReport, RetrievedBug
+from github_handler import check_repository, download_repository, cleanup
+from file_scanner import find_source_files, read_file_safely
+from detectors.python_detector import detect as detect_python
+from detectors.js_detector import detect as detect_js
+from detectors.cfamily_detector import detect as detect_cfamily
+from rag.retriever import retrieve_similar_bugs
+from llm_client import analyze_finding
+
+app = FastAPI(title="RAG-Enhanced LLM for GitHub Bug Detection and Recovery")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DETECTORS_BY_EXTENSION = {
+    ".py": detect_python,
+    # JS/JSX/TS/TSX: structural (bracket/string) syntax check - catches the
+    # class of error that broke the Render/Vite build - plus a few precise
+    # heuristics (loose equality, var, empty catch, leftover console/debugger).
+    ".js": detect_js,
+    ".jsx": detect_js,
+    ".ts": detect_js,
+    ".tsx": detect_js,
+    # Java/C/C++/C#/Go/PHP: structural syntax check only for now.
+    ".java": detect_cfamily,
+    ".c": detect_cfamily,
+    ".cpp": detect_cfamily,
+    ".cs": detect_cfamily,
+    ".go": detect_cfamily,
+    ".php": detect_cfamily,
+}
+MAX_FILES_TO_SCAN = 40          # keeps a single scan fast enough to not hit a gateway timeout
+MAX_LLM_CALLS_PER_SCAN = 15     # LLM calls are the slow part - cap them per scan
 
 
-class ScanRequest(BaseModel):
-    repo_url: str
+def _empty_summary(repo: str, message: str) -> ScanResult:
+    return ScanResult(
+        summary=ScanSummary(
+            repo=repo, files_scanned=0, bugs_found=0,
+            unnecessary_code_found=0, error_level="Less Errors",
+            scan_status=message,
+        ),
+        bugs=[],
+    )
 
 
-class RepoStatus(BaseModel):
-    status: str          # "valid" | "invalid" | "private" | "not_found" | "unreachable"
-    message: str
-    owner: Optional[str] = None
-    name: Optional[str] = None
-    default_branch: Optional[str] = None
+def _compute_error_level(bug_reports):
+    """
+    Gives the repository a simple overall error level based on how many
+    issues were actually detected - no hidden percentage, no LLM confidence
+    involved, just a plain count-based bucket.
+    """
+    issue_count = len(bug_reports)
+
+    if issue_count <= 10:
+        return "Less Errors"
+    elif issue_count <= 30:
+        return "Medium Errors"
+    else:
+        return "More Errors"
 
 
-class RetrievedBug(BaseModel):
-    dataset_source: str
-    bug_type: Optional[str] = None
-    bug_description: Optional[str] = None
-    solution: Optional[str] = None
-    similarity: float
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
 
 
-class BugReport(BaseModel):
-    id: str
-    number: int                    # sequential display number: Bug 1, Bug 2, ...
-    kind: str = "bug"              # "bug" | "unnecessary_code"
-    error: str                     # short title, e.g. "Possibly unused function"
-    bug_type: str
-    file: str
-    function: Optional[str] = None
-    line_start: Optional[int] = None
-    line_end: Optional[int] = None
-    line_note: Optional[str] = None   # "Exact line could not be determined." when line is unknown
-    cause: str
-    why_occurs: Optional[str] = None
-    solution_type: str = "replace"    # "replace" | "add" | "remove" | "create_file"
-    solution_intro: str = ""          # required first sentence, e.g. "Replace the given code with the new code shown below."
-    current_code: str
-    replacement_code: Optional[str] = None
-    add_location: Optional[str] = None   # human description of where to add code, for solution_type == "add"
-    new_file_path: Optional[str] = None  # for solution_type == "create_file"
-    action: str = ""                     # final one-line action sentence
-    explanation: Optional[str] = None
-    retrieved_bugs: List[RetrievedBug] = []
-    insufficient_evidence: bool = False
+@app.post("/api/validate")
+def validate_repo(req: ScanRequest):
+    return check_repository(req.repo_url)
 
 
-class ScanSummary(BaseModel):
-    repo: str
-    files_scanned: int
-    bugs_found: int
-    unnecessary_code_found: int
-    error_level: str           # "Less Errors" | "Medium Errors" | "More Errors"
-    scan_status: str
+@app.post("/api/scan", response_model=ScanResult)
+def scan_repo(req: ScanRequest):
+    status = check_repository(req.repo_url)
+    if status.status != "valid":
+        return _empty_summary(req.repo_url, status.message)
+
+    repo_path = None
+    try:
+        repo_path = download_repository(status.owner, status.name, status.default_branch)
+    except RuntimeError as e:
+        return _empty_summary(
+            req.repo_url,
+            f"Unable to access this repository. Please try again later or check the repository link. ({e})",
+        )
+
+    try:
+        files = find_source_files(repo_path)
+        files_to_scan = files[:MAX_FILES_TO_SCAN]
+        bug_reports = []
+        llm_calls_used = 0
+        bug_number = 0
+
+        for full_path in files_to_scan:
+            ext = os.path.splitext(full_path)[1]
+            detector = DETECTORS_BY_EXTENSION.get(ext)
+            if not detector:
+                continue
+
+            source = read_file_safely(full_path)
+            if not source:
+                continue
+
+            relative_path = os.path.relpath(full_path, repo_path)
+
+            try:
+                findings = detector(relative_path, source)
+            except Exception:
+                continue
+
+            for finding in findings:
+                if llm_calls_used >= MAX_LLM_CALLS_PER_SCAN:
+                    break
+                llm_calls_used += 1
+                retrieved = retrieve_similar_bugs(
+                    query_text=f"{finding.get('error')}\n{finding.get('current_code')}",
+                    top_k=3,
+                )
+                analysis = analyze_finding(finding, retrieved)
+
+                # Keyed on bug_type (every detector sets this), not on one Python-specific
+                # rule name, so this stays correct as more language detectors are added.
+                is_unnecessary = finding.get("bug_type") == "Unnecessary Code"
+                bug_number += 1
+
+                bug_reports.append(BugReport(
+                    id=str(uuid.uuid4())[:8],
+                    number=bug_number,
+                    kind="unnecessary_code" if is_unnecessary else "bug",
+                    error=analysis.get("error", finding.get("error", "Possible issue")),
+                    bug_type=analysis.get("bug_type", finding.get("bug_type", "Other")),
+                    file=relative_path,
+                    function=finding.get("function"),
+                    line_start=finding.get("line_start"),
+                    line_end=finding.get("line_end"),
+                    line_note=None if finding.get("line_start") else "Exact line could not be determined.",
+                    cause=analysis.get("cause", finding.get("cause", "")),
+                    why_occurs=analysis.get("why_occurs"),
+                    solution_type=analysis.get("solution_type", "replace"),
+                    solution_intro=analysis.get("solution_intro", ""),
+                    current_code=finding.get("current_code", ""),
+                    replacement_code=analysis.get("replacement_code"),
+                    add_location=analysis.get("add_location"),
+                    new_file_path=analysis.get("new_file_path"),
+                    action=analysis.get("action", ""),
+                    explanation=analysis.get("explanation"),
+                    retrieved_bugs=[
+                        RetrievedBug(
+                            dataset_source=r["record"].get("dataset_source", "Unknown"),
+                            bug_type=r["record"].get("bug_type"),
+                            bug_description=r["record"].get("bug_description"),
+                            solution=r["record"].get("solution"),
+                            similarity=round(r["similarity"] * 100, 1),
+                        )
+                        for r in retrieved
+                    ],
+                    insufficient_evidence=bool(analysis.get("insufficient_evidence", False)),
+                ))
+
+        unnecessary_code_found = sum(
+            1 for b in bug_reports if b.kind == "unnecessary_code"
+        )
+
+        error_level = _compute_error_level(bug_reports)
+
+        return ScanResult(
+            summary=ScanSummary(
+                repo=f"{status.owner}/{status.name}",
+                files_scanned=len(files_to_scan),
+                bugs_found=len(bug_reports),
+                unnecessary_code_found=unnecessary_code_found,
+                error_level=error_level,
+                scan_status="Completed",
+            ),
+            bugs=bug_reports,
+        )
+    finally:
+        if repo_path:
+            cleanup(repo_path)
 
 
-class ScanResult(BaseModel):
-    summary: ScanSummary
-    bugs: List[BugReport]
+# Serve the frontend as static files so the whole app can run from one process.
+frontend_dir = os.path.join(os.path.dirname(__file__), "..", "frontend")
+if os.path.isdir(frontend_dir):
+    app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
