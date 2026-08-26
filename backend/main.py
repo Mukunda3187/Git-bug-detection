@@ -113,6 +113,7 @@ def scan_repo(req: ScanRequest):
         bug_reports = []
         llm_calls_used = 0
         bug_number = 0
+        ai_notice = None
 
         for full_path in files_to_scan:
             ext = os.path.splitext(full_path)[1]
@@ -140,6 +141,11 @@ def scan_repo(req: ScanRequest):
                     top_k=3,
                 )
                 analysis = analyze_finding(finding, retrieved)
+
+                # Surface the AI usage-limit message once per scan, at the top,
+                # instead of repeating a generic "fix it yourself" note per bug.
+                if ai_notice is None and analysis.get("rate_limited"):
+                    ai_notice = analysis.get("rate_limit_message")
 
                 # Keyed on bug_type (every detector sets this), not on one Python-specific
                 # rule name, so this stays correct as more language detectors are added.
@@ -194,6 +200,7 @@ def scan_repo(req: ScanRequest):
                 unnecessary_code_found=unnecessary_code_found,
                 error_level=error_level,
                 scan_status="Completed",
+                ai_notice=ai_notice,
             ),
             bugs=bug_reports,
         )
