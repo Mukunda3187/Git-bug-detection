@@ -51,9 +51,8 @@ DETECTORS_BY_EXTENSION = {
     ".go": detect_cfamily,
     ".php": detect_cfamily,
 }
-MAX_FILES_TO_SCAN = 40          # keeps a single scan fast enough to not hit a gateway timeout
-MAX_LLM_CALLS_PER_SCAN = 15     # LLM calls are the slow part - cap them per scan
-
+MAX_FILES_TO_SCAN = 25
+MAX_LLM_CALLS_PER_SCAN = 8
 
 def _empty_summary(repo: str, message: str) -> ScanResult:
     return ScanResult(
