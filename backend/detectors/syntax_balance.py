@@ -45,6 +45,17 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
     # JSX state
     jsx_tag_depth = 0
     in_jsx_text = False
+    # Set True right when a closing tag's </ is seen, cleared at its own '>'.
+    # Needed because </> (a Fragment close) ends with the same '/','>' pair
+    # that a self-closing tag like <Home /> ends with - without this flag,
+    # the '>' looks like a self-close and decrements depth a second time.
+    in_closing_tag = False
+
+    # Tracks the last meaningful (non-whitespace) character seen in code mode,
+    # used to guess whether a '/' starts a regex literal or is division -
+    # this is the same ambiguity every JS tokenizer has to resolve.
+    prev_significant_char = ""
+    REGEX_START_TRIGGERS = set("([{,;:=&|!?+-*%<>~^\n")
 
     while i < n:
         c = source[i]
@@ -90,6 +101,8 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                     "line": line,
                     "col": col,
                     "is_template_expr": True,
+                    "jsx_tag_depth_before": jsx_tag_depth,
+                    "in_jsx_text_before": in_jsx_text,
                 })
                 mode = "code"
                 i += 1
@@ -101,8 +114,13 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                 if c == "<":
                     if nxt == "/":
                         in_jsx_text = False
+                        in_closing_tag = True
                         jsx_tag_depth = max(0, jsx_tag_depth - 1)
-                    elif nxt.isalpha():
+                    elif nxt.isalpha() or nxt == ">":
+                        # nxt == ">" is a React Fragment <> - it has no tag
+                        # name but still opens a JSX scope, exactly like a
+                        # named tag does; must be counted or its matching
+                        # </> later decrements a level that was never opened.
                         in_jsx_text = False
                         jsx_tag_depth += 1
 
@@ -126,6 +144,47 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                 i += 1
                 col += 1
 
+            elif (
+                c == "/"
+                and nxt not in ("/", "*")
+                and (i == 0 or source[i - 1] != "<")
+                and (not prev_significant_char or prev_significant_char in REGEX_START_TRIGGERS)
+            ):
+                # Looks like a regex literal (e.g. /^```json\s*/i), not division -
+                # skip over it entirely so backticks/quotes INSIDE the pattern
+                # (common when stripping markdown fences) don't get mistaken
+                # for the start of a string or template literal.
+                j = i + 1
+                in_char_class = False
+                while j < n:
+                    cj = source[j]
+                    if cj == "\\":
+                        j += 2
+                        continue
+                    if cj == "[":
+                        in_char_class = True
+                    elif cj == "]":
+                        in_char_class = False
+                    elif cj == "/" and not in_char_class:
+                        j += 1
+                        break
+                    elif cj == "\n":
+                        break  # unterminated regex on this line - bail out, don't skip past it
+                    j += 1
+                while j < n and source[j].isalpha():
+                    j += 1  # trailing flags like /i, /g, /gi
+
+                skipped = source[i:j]
+                newlines = skipped.count("\n")
+                if newlines:
+                    line += newlines
+                    col = len(skipped) - skipped.rfind("\n")
+                else:
+                    col += len(skipped)
+                i = j
+                prev_significant_char = "/"
+                continue
+
             elif config.template_quote and c == config.template_quote:
                 mode = "template"
 
@@ -133,14 +192,50 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                 mode = "string"
                 string_quote_char = c
 
-            elif c == "<" and nxt.isalpha():
-                # Enter JSX tag.
+            elif c == "<" and nxt == "/":
+                # A closing tag like </Routes> can be reached here (rather than
+                # via the in_jsx_text branch above) right after a self-closing
+                # sibling tag - still needs to decrement, or depth drifts
+                # upward forever and real brackets later get swallowed as
+                # if they were JSX text.
+                in_closing_tag = True
+                jsx_tag_depth = max(0, jsx_tag_depth - 1)
+
+            elif c == "<" and (nxt.isalpha() or nxt == ">"):
+                # Enter JSX tag - nxt == ">" is a React Fragment <>, which
+                # has no name but still opens a scope that </> will later
+                # close, so it must be counted the same as a named tag.
                 jsx_tag_depth += 1
 
             elif c == ">" and jsx_tag_depth > 0:
-                # Check whether this is a normal opening JSX tag.
-                if i > 0 and source[i - 1] != "/":
-                    in_jsx_text = True
+                # If we're currently inside a bracket that was opened while
+                # already inside JSX (e.g. the { of element={<Home />}),
+                # we're really still inside a JS expression, not JSX text -
+                # don't flip modes here even though a nested tag just
+                # opened/closed. The matching '}' close already restores the
+                # correct in_jsx_text when it's reached.
+                inside_jsx_expression = bool(stack) and stack[-1]["jsx_tag_depth_before"] > 0
+
+                if in_closing_tag:
+                    # This '>' completes a closing tag (</Foo> or </>) whose
+                    # depth was already decremented when its '<' was seen -
+                    # do NOT decrement again, even though a Fragment close
+                    # </> ends in the same '/','>' pair a self-close does.
+                    in_closing_tag = False
+                    if not inside_jsx_expression:
+                        in_jsx_text = jsx_tag_depth > 0
+                elif i > 0 and source[i - 1] == "/":
+                    # Self-closing tag like <Home /> opens and closes in the
+                    # same breath - it must decrement the depth it just
+                    # incremented, and correctly drop back to text mode if a
+                    # parent tag is still open, or later characters get
+                    # misread.
+                    jsx_tag_depth = max(0, jsx_tag_depth - 1)
+                    if not inside_jsx_expression:
+                        in_jsx_text = jsx_tag_depth > 0
+                else:
+                    if not inside_jsx_expression:
+                        in_jsx_text = True
 
             elif c in BRACKET_OPENERS:
                 stack.append({
@@ -148,6 +243,8 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                     "line": line,
                     "col": col,
                     "is_template_expr": False,
+                    "jsx_tag_depth_before": jsx_tag_depth,
+                    "in_jsx_text_before": in_jsx_text,
                 })
 
             elif c in BRACKET_CLOSERS:
@@ -167,9 +264,26 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                 if top["is_template_expr"] and c == "}":
                     stack.pop()
                     mode = "template"
+                    # A JSX element can appear inside a template interpolation
+                    # (e.g. `${<Home />}`) just like inside a JSX attribute
+                    # expression - restore whatever JSX state existed right
+                    # before this ${ was opened, discarding any drift from
+                    # JSX elements used inside it.
+                    jsx_tag_depth = top.get("jsx_tag_depth_before", jsx_tag_depth)
+                    in_jsx_text = top.get("in_jsx_text_before", in_jsx_text)
 
                 elif MATCH[top["char"]] == c:
                     stack.pop()
+                    if c == "}":
+                        # A `{...}` JSX expression container (e.g.
+                        # element={<Home />}) may contain nested JSX elements
+                        # that change jsx_tag_depth/in_jsx_text internally -
+                        # once the expression closes, restore exactly the
+                        # state that existed right before it opened so none
+                        # of that internal JSX drift leaks into the code that
+                        # follows.
+                        jsx_tag_depth = top.get("jsx_tag_depth_before", jsx_tag_depth)
+                        in_jsx_text = top.get("in_jsx_text_before", in_jsx_text)
 
                 else:
                     return [{
@@ -181,6 +295,9 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                         "current_code": _line_text(lines, line),
                         "cause": f"The bracket opened on line {top['line']} needs '{MATCH[top['char']]}', but '{c}' was used instead.",
                     }]
+
+            if c not in (" ", "\t"):
+                prev_significant_char = c
 
         if c == "\n":
             line += 1
