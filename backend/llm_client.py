@@ -145,44 +145,131 @@ def _fallback_report(finding: dict) -> dict:
     """Used when no LLM reasoning is available - either no API key is configured, or the
     live LLM call failed/timed out. Kept in plain, non-technical English since this is
     shown directly to the end user - technical failure details are logged to the server
-    console instead (see analyze_finding), never shown in the UI."""
-    is_unused = finding.get("rule") == "possibly_unused_function"
-    
-    # Better fallback solutions based on bug type
-    bug_type = finding.get("bug_type", "Other")
+    console instead (see analyze_finding), never shown in the UI.
+
+    Every rule every detector can produce gets a real, specific template here -
+    no rule should ever fall through to a generic "review and fix it" message.
+    """
     rule = finding.get("rule", "")
-    
-    if is_unused:
+    bug_type = finding.get("bug_type", "Other")
+    current_code = finding.get("current_code", "") or ""
+    cause_from_detector = finding.get("cause", "")
+
+    # Defaults - overridden below per rule. solution_type "replace" needs
+    # replacement_code; "remove" and "add" generally don't need it filled in
+    # for a deterministic fallback since there's nothing left to guess.
+    solution_type = "replace"
+    solution_intro = ""
+    action = ""
+    replacement_code = None
+    add_location = None
+    cause = cause_from_detector
+
+    if rule == "possibly_unused_function":
+        solution_type = "remove"
         solution_intro = "Remove this code from the file."
         action = "Delete this unused function."
+
     elif rule == "bare_except":
-        solution_intro = "Replace the bare 'except:' clause with a specific exception type."
-        action = "Specify which exceptions should be caught (e.g., 'except ValueError:')."
+        solution_type = "replace"
+        solution_intro = "Replace the given code with the new code shown below."
+        replacement_code = current_code.replace("except:", "except Exception as e:", 1)
+        action = "Replace the bare 'except:' with 'except Exception as e:' so real errors aren't silently hidden."
+
     elif rule == "mutable_default_arg":
-        solution_intro = "Replace the mutable default argument with None and initialize inside the function."
-        action = "Use None as default and create a new object inside the function body."
+        solution_type = "replace"
+        solution_intro = "Replace the given code with the new code shown below."
+        action = "Change the default value to None, then create a new list/dict inside the function body."
+
     elif rule == "eq_none":
-        solution_intro = "Replace '==' with 'is' for None comparison."
-        action = "Change '== None' to 'is None' and '!= None' to 'is not None'."
+        solution_type = "replace"
+        solution_intro = "Replace the given code with the new code shown below."
+        replacement_code = current_code.replace("== None", "is None").replace("!= None", "is not None")
+        action = "Use 'is None' / 'is not None' instead of '==' / '!=' when comparing to None."
+
     elif rule == "possible_division_by_zero":
-        solution_intro = "Add a check to ensure the denominator is not zero before dividing."
-        action = "Add a conditional check: 'if denominator != 0: result = numerator / denominator'."
+        solution_type = "add"
+        solution_intro = "Add a check for zero before this line, as shown below."
+        add_location = "Add this check on the line right before the division."
+        replacement_code = "if denominator != 0:  # replace 'denominator' with your actual variable name"
+        action = "Add a zero-check before dividing, so the program doesn't crash if the value is zero."
+
+    elif rule == "syntax_error":
+        solution_type = "replace"
+        solution_intro = "There is a Python syntax error on this line that needs to be fixed by hand."
+        cause = f"Python's own parser could not read this code. The exact reason it gave was: \"{cause_from_detector}\"."
+        action = f"Look closely at this line and fix the syntax issue Python reported: {cause_from_detector}."
+
+    elif rule in ("unclosed_bracket", "mismatched_bracket", "unexpected_closing_bracket"):
+        solution_type = "replace"
+        solution_intro = "There is a bracket that doesn't match up correctly - fix it by hand at the location shown."
+        action = "Check every '{', '(' and '[' near this line and make sure each one has a matching closing bracket in the right order."
+
+    elif rule == "unterminated_string":
+        solution_type = "replace"
+        solution_intro = "A text string on this line is missing its closing quote."
+        action = "Add the missing closing quote (matching the one that opened the string) at the end of the text."
+
+    elif rule == "unterminated_template_literal":
+        solution_type = "replace"
+        solution_intro = "A template string (using backticks) on this line is missing its closing backtick."
+        action = "Add the missing closing backtick ( ` ) to complete the template string."
+
+    elif rule == "unterminated_comment":
+        solution_type = "replace"
+        solution_intro = "A block comment was opened here but never closed."
+        action = "Add the missing */ to close this comment block."
+
+    elif rule == "loose_equality":
+        solution_type = "replace"
+        solution_intro = "Replace the given code with the new code shown below."
+        if "!=" in current_code:
+            replacement_code = current_code.replace("!=", "!==")
+            action = "Change '!=' to '!==' so values are compared without unexpected type conversion."
+        else:
+            replacement_code = current_code.replace("==", "===")
+            action = "Change '==' to '===' so values are compared without unexpected type conversion."
+
+    elif rule == "var_declaration":
+        solution_type = "replace"
+        solution_intro = "Replace the given code with the new code shown below."
+        replacement_code = current_code.replace("var ", "let ", 1)
+        action = "Change 'var' to 'let' (or 'const' if this value is never reassigned)."
+
+    elif rule == "empty_catch_block":
+        solution_type = "replace"
+        solution_intro = "Replace the given code with the new code shown below."
+        action = "Add at least a console.error(err) inside the catch block so failures aren't silently swallowed."
+
+    elif rule == "leftover_console_statement":
+        solution_type = "remove"
+        solution_intro = "Remove this code from the file."
+        action = "Delete this console.log/debug statement before shipping."
+
+    elif rule == "leftover_debugger_statement":
+        solution_type = "remove"
+        solution_intro = "Remove this code from the file."
+        action = "Delete this 'debugger' statement before shipping."
+
     else:
-        solution_intro = "Review and fix this issue according to the code analysis."
-        action = "Analyze the code and apply the appropriate fix."
-    
+        # Should not normally be reached - every known rule is handled above -
+        # but keep a safe, honest fallback for any future/unknown rule.
+        solution_type = "replace"
+        solution_intro = "We could not prepare an automatic fix for this one right now - please look at the code below and fix it yourself."
+        action = "Review this code and fix it yourself."
+
     return {
         "error": finding.get("error", "Possible issue"),
         "bug_type": bug_type,
-        "cause": finding.get("cause", "Something in this code looks like it could cause a problem."),
-        "why_occurs": f"This is a {bug_type.lower()} detected by static analysis.",
-        "solution_type": "remove" if is_unused else "replace",
+        "cause": cause or "Something in this code looks like it could cause a problem.",
+        "why_occurs": "",
+        "solution_type": solution_type,
         "solution_intro": solution_intro,
-        "replacement_code": None,
-        "add_location": None,
+        "replacement_code": replacement_code,
+        "add_location": add_location,
         "new_file_path": None,
         "action": action,
-        "explanation": "Unable to generate LLM explanation - check the code and apply the recommended fix.",
+        "explanation": "",
         "insufficient_evidence": True,
     }
 
