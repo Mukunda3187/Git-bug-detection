@@ -33,6 +33,53 @@ def parse_github_url(url: str):
     return match.group("owner"), match.group("repo")
 
 
+def _describe_403(resp) -> str:
+    """
+    Turns a GitHub 403 response into a specific, honest reason instead of a
+    generic message - a 403 from GitHub can mean several different things
+    (rate limit, bad token, temporary block), and each needs a different fix.
+    """
+    try:
+        body = resp.json()
+        github_message = body.get("message", "")
+    except (ValueError, requests.exceptions.JSONDecodeError):
+        github_message = ""
+
+    remaining = resp.headers.get("X-RateLimit-Remaining")
+    reset_epoch = resp.headers.get("X-RateLimit-Reset")
+
+    if remaining == "0":
+        wait_text = ""
+        if reset_epoch:
+            try:
+                import time
+                seconds_left = max(0, int(reset_epoch) - int(time.time()))
+                minutes_left = max(1, seconds_left // 60)
+                wait_text = f" It resets in about {minutes_left} minute(s)."
+            except ValueError:
+                pass
+        has_token = bool(os.getenv("GITHUB_TOKEN"))
+        if has_token:
+            return (
+                f"GitHub's API rate limit has been used up for the current token.{wait_text} "
+                f"(GitHub said: \"{github_message}\")"
+            )
+        return (
+            f"GitHub's API rate limit for unauthenticated requests has been used up "
+            f"(only 60/hour without a token, vs 5000/hour with one).{wait_text} "
+            f"Add a GITHUB_TOKEN environment variable to fix this permanently. "
+            f"(GitHub said: \"{github_message}\")"
+        )
+
+    if "secondary rate limit" in github_message.lower():
+        return f"GitHub temporarily blocked this app for making requests too quickly. Please wait a few minutes and try again. (GitHub said: \"{github_message}\")"
+
+    if github_message:
+        return f"GitHub rejected this request: \"{github_message}\". If you're using a GITHUB_TOKEN, check that it's still valid and hasn't expired."
+
+    return "GitHub rejected this request (403 Forbidden) for an unspecified reason. If you're using a GITHUB_TOKEN, check that it's still valid."
+
+
 def check_repository(url: str) -> RepoStatus:
     """
     Validates the URL, then asks the GitHub REST API whether the repo exists
@@ -61,10 +108,16 @@ def check_repository(url: str) -> RepoStatus:
             message="Repository not found. Please check the GitHub URL.",
         )
 
+    if resp.status_code == 401:
+        return RepoStatus(
+            status="unreachable",
+            message="GitHub rejected the configured GITHUB_TOKEN as invalid or expired. Generate a new token and update it in your environment variables.",
+        )
+
     if resp.status_code == 403:
         return RepoStatus(
             status="unreachable",
-            message="Unable to access this repository. Please try again later or check the repository link.",
+            message=f"Unable to access this repository. {_describe_403(resp)}",
         )
 
     if resp.status_code != 200:
