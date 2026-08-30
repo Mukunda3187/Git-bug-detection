@@ -4,9 +4,9 @@ Handles everything related to talking to GitHub:
 - checking the repo exists / is public
 - downloading it to a temp folder so file_scanner.py can read it
 
-Uses plain, unauthenticated requests to the GitHub API - no token needed to
-set up. The trade-off is GitHub's public rate limit of 60 requests/hour per
-IP, which the error message below explains clearly if it's ever hit.
+Uses an optional GITHUB_TOKEN environment variable if set. Without it,
+GitHub allows only 60 API requests/hour per IP (shared across everyone
+hitting GitHub from the same server) - with a token, that jumps to 5000/hour.
 """
 import os
 import re
@@ -18,6 +18,13 @@ from models import RepoStatus
 GITHUB_URL_RE = re.compile(
     r"^https?://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(\.git)?/?$"
 )
+
+
+def _auth_headers():
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
 
 
 def parse_github_url(url: str):
@@ -54,16 +61,16 @@ def _describe_403(resp) -> str:
                 wait_text = f" It resets in about {minutes_left} minute(s)."
             except ValueError:
                 pass
-        return (
-            f"GitHub's rate limit for this app has been used up for now.{wait_text} "
-            f"(GitHub said: \"{github_message}\")"
-        )
+        has_token = bool(os.getenv("GITHUB_TOKEN"))
+        if has_token:
+            return f"GitHub's API rate limit has been used up for the current token.{wait_text} (GitHub said: \"{github_message}\")"
+        return f"GitHub's rate limit for this app has been used up for now.{wait_text} (GitHub said: \"{github_message}\")"
 
     if "secondary rate limit" in github_message.lower():
-        return f"GitHub temporarily blocked this app for making requests too quickly. Please wait a few minutes before trying again - retrying immediately extends this block. (GitHub said: \"{github_message}\")"
+        return f"GitHub temporarily blocked this app for making requests too quickly. Please wait a few minutes before trying again. (GitHub said: \"{github_message}\")"
 
     if github_message:
-        return f"GitHub rejected this request: \"{github_message}\"."
+        return f"GitHub rejected this request: \"{github_message}\". If you're using a GITHUB_TOKEN, check that it's still valid and hasn't expired."
 
     return "GitHub rejected this request (403 Forbidden) for an unspecified reason."
 
@@ -83,7 +90,7 @@ def check_repository(url: str) -> RepoStatus:
 
     api_url = f"https://api.github.com/repos/{owner}/{repo}"
     try:
-        resp = requests.get(api_url, timeout=10)
+        resp = requests.get(api_url, headers=_auth_headers(), timeout=10)
     except requests.RequestException as e:
         return RepoStatus(
             status="unreachable",
@@ -94,6 +101,12 @@ def check_repository(url: str) -> RepoStatus:
         return RepoStatus(
             status="not_found",
             message="Repository not found. Please check the GitHub URL.",
+        )
+
+    if resp.status_code == 401:
+        return RepoStatus(
+            status="unreachable",
+            message="GitHub rejected the configured GITHUB_TOKEN as invalid or expired. Generate a new token and update it in your environment variables.",
         )
 
     if resp.status_code == 403:
@@ -133,7 +146,7 @@ def download_repository(owner: str, repo: str, branch: str) -> str:
     zip_url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
     zip_path = os.path.join(tmp_dir, "repo.zip")
 
-    resp = requests.get(zip_url, stream=True, timeout=30)
+    resp = requests.get(zip_url, headers=_auth_headers(), stream=True, timeout=30)
     if resp.status_code != 200:
         raise RuntimeError(f"Could not download repository archive (status {resp.status_code}).")
 
