@@ -8,6 +8,7 @@ Uses plain, unauthenticated requests to the GitHub API - no token needed to
 set up. The trade-off is GitHub's public rate limit of 60 requests/hour per
 IP, which the error message below explains clearly if it's ever hit.
 """
+import os
 import re
 import shutil
 import tempfile
@@ -32,8 +33,7 @@ def parse_github_url(url: str):
 def _describe_403(resp) -> str:
     """
     Turns a GitHub 403 response into a specific, honest reason instead of a
-    generic message - a 403 from GitHub can mean a few different things
-    (rate limit, temporary block), and each needs a different next step.
+    generic message.
     """
     try:
         body = resp.json()
@@ -60,7 +60,7 @@ def _describe_403(resp) -> str:
         )
 
     if "secondary rate limit" in github_message.lower():
-        return f"GitHub temporarily blocked this app for making requests too quickly. Please wait a few minutes and try again. (GitHub said: \"{github_message}\")"
+        return f"GitHub temporarily blocked this app for making requests too quickly. Please wait a few minutes before trying again - retrying immediately extends this block. (GitHub said: \"{github_message}\")"
 
     if github_message:
         return f"GitHub rejected this request: \"{github_message}\"."
@@ -131,7 +131,7 @@ def download_repository(owner: str, repo: str, branch: str) -> str:
     """
     tmp_dir = tempfile.mkdtemp(prefix="repo_scan_")
     zip_url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
-    zip_path = f"{tmp_dir}/repo.zip"
+    zip_path = os.path.join(tmp_dir, "repo.zip")
 
     resp = requests.get(zip_url, stream=True, timeout=30)
     if resp.status_code != 200:
@@ -142,16 +142,14 @@ def download_repository(owner: str, repo: str, branch: str) -> str:
             f.write(chunk)
 
     shutil.unpack_archive(zip_path, tmp_dir)
-    import os
     os.remove(zip_path)
 
-    extracted = [d for d in os.listdir(tmp_dir) if os.path.isdir(f"{tmp_dir}/{d}")]
+    extracted = [d for d in os.listdir(tmp_dir) if os.path.isdir(os.path.join(tmp_dir, d))]
     if not extracted:
         raise RuntimeError("Downloaded archive was empty.")
-    return f"{tmp_dir}/{extracted[0]}"
+    return os.path.join(tmp_dir, extracted[0])
 
 
 def cleanup(path: str):
-    import os
     parent = os.path.dirname(path)
     shutil.rmtree(parent, ignore_errors=True)
