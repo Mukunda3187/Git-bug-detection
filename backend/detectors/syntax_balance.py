@@ -33,6 +33,31 @@ def _line_text(lines, ln):
     return lines[ln - 1].strip() if 0 < ln <= len(lines) else ""
 
 
+def _raw_bracket_parity_ok(source: str, config: LangConfig = JS_CONFIG) -> bool:
+    """
+    A deliberately dumb second opinion: strip real comments/strings/templates
+    (the one part of this that ISN'T ambiguous - JSX has no bearing on where a
+    comment or a string starts or ends), then just count raw ( ) [ ] { } with
+    zero understanding of JSX, generics, or anything else.
+
+    check_bracket_balance's JSX tracking is a heuristic and, as shown by three
+    separate real-world edge cases already found and fixed, will keep finding
+    new ones - no heuristic for "is this < JSX or something else" can ever be
+    complete without a real parser. This function can't have that problem: it
+    doesn't try to understand JSX at all. If the JSX-aware check thinks a
+    bracket is unclosed/mismatched but this dumb count says every bracket
+    pairs up exactly, that's a strong signal the JSX tracking lost the plot
+    somewhere, not that the file is actually broken - so the finding gets
+    suppressed rather than risk reporting a false positive.
+    """
+    masked = mask_non_code(source, config)
+    return (
+        masked.count("(") == masked.count(")")
+        and masked.count("[") == masked.count("]")
+        and masked.count("{") == masked.count("}")
+    )
+
+
 def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
     lines = source.splitlines()
     stack = []
@@ -275,6 +300,8 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
 
             elif c in BRACKET_CLOSERS:
                 if not stack:
+                    if _raw_bracket_parity_ok(source, config):
+                        return []
                     return [{
                         "line_start": line,
                         "line_end": line,
@@ -312,6 +339,8 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                         in_jsx_text = top.get("in_jsx_text_before", in_jsx_text)
 
                 else:
+                    if _raw_bracket_parity_ok(source, config):
+                        return []
                     return [{
                         "line_start": line,
                         "line_end": line,
@@ -334,6 +363,8 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
         i += 1
 
     if stack:
+        if _raw_bracket_parity_ok(source, config):
+            return []
         first_open = stack[0]
 
         return [{
