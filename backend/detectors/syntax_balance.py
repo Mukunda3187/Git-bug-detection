@@ -33,6 +33,200 @@ def _line_text(lines, ln):
     return lines[ln - 1].strip() if 0 < ln <= len(lines) else ""
 
 
+TERMINATOR_KEYWORDS = {"return", "throw"}
+# break/continue are deliberately excluded: their meaning depends on the
+# enclosing loop/switch, which this lightweight scanner doesn't track -
+# treating them as unconditional terminators risks false positives inside
+# switch/case fallthrough, which this project's whole approach avoids.
+
+
+def find_unreachable_statements(source: str, config: LangConfig):
+    """
+    Finds code that appears after an unconditional return/throw in the same
+    {...} block - this is provably dead code, not a pattern guess, since
+    there is no path that can reach it regardless of what any other file
+    does. Deliberately conservative:
+      - only return/throw count as terminators (see TERMINATOR_KEYWORDS)
+      - requires an explicit ';' to close the terminating statement, so
+        semicolon-free code (valid in JS via ASI) is simply not flagged
+        rather than risk a false positive from misreading statement bounds
+      - switch/case bodies are skipped entirely, since break-based
+        fallthrough between cases doesn't map to "same block" reachability
+      - only reports the first offending statement per block
+    Returns a list of finding dicts, or [] if nothing is found - never
+    raises, since a scanner bug here should never take down a whole scan.
+    """
+    findings = []
+    lines = source.splitlines()
+
+    mode = "code"
+    string_quote_char = None
+    line = 1
+    i, n = 0, len(source)
+
+    # One frame per open '{' - tracks whether this block has hit a
+    # terminator yet, whether we've already flagged something in it, and
+    # whether it's a switch body (skipped entirely).
+    frames = [{"terminated": False, "flagged": False, "is_switch": False}]
+
+    word_buf = ""
+    word_start_line = None
+    at_statement_start = True  # true right after ; { } or start of file
+    prev_significant_char = ""
+    REGEX_START_TRIGGERS = set("([{,;:=&|!?+-*%<>~^\n")
+
+    def flush_word():
+        nonlocal word_buf, word_start_line, at_statement_start
+        if word_buf:
+            if at_statement_start and word_buf in TERMINATOR_KEYWORDS and frames:
+                frames[-1]["_pending_terminator_line"] = word_start_line
+            elif word_buf == "switch" and frames:
+                frames[-1]["_next_brace_is_switch"] = True
+            at_statement_start = False
+        word_buf = ""
+        word_start_line = None
+
+    while i < n:
+        c = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+
+        if mode == "line_comment":
+            if c == "\n":
+                mode = "code"
+
+        elif mode == "block_comment":
+            if c == "*" and nxt == "/":
+                mode = "code"
+                i += 1
+
+        elif mode == "string":
+            if c == "\\":
+                i += 1
+            elif c == string_quote_char:
+                mode = "code"
+
+        elif mode == "template":
+            if config.template_escapes and c == "\\":
+                i += 1
+            elif c == config.template_quote:
+                mode = "code"
+            elif config.template_has_interpolation and c == "$" and nxt == "{":
+                frames.append({"terminated": False, "flagged": False, "is_switch": False})
+                mode = "code"
+                i += 1
+
+        else:
+            if c.isalnum() or c == "_":
+                if not word_buf:
+                    word_start_line = line
+                word_buf += c
+            else:
+                flush_word()
+
+                if c == "/" and nxt == "/":
+                    mode = "line_comment"
+                    i += 1
+
+                elif c == "/" and nxt == "*":
+                    mode = "block_comment"
+                    i += 1
+
+                elif (
+                    c == "/" and nxt not in ("/", "*")
+                    and (i == 0 or source[i - 1] != "<")
+                    and (not prev_significant_char or prev_significant_char in REGEX_START_TRIGGERS)
+                ):
+                    j = i + 1
+                    in_cc = False
+                    while j < n:
+                        cj = source[j]
+                        if cj == "\\":
+                            j += 2
+                            continue
+                        if cj == "[":
+                            in_cc = True
+                        elif cj == "]":
+                            in_cc = False
+                        elif cj == "/" and not in_cc:
+                            j += 1
+                            break
+                        elif cj == "\n":
+                            break
+                        j += 1
+                    while j < n and source[j].isalpha():
+                        j += 1
+                    skipped = source[i:j]
+                    line += skipped.count("\n")
+                    i = j
+                    prev_significant_char = "/"
+                    continue
+
+                elif config.template_quote and c == config.template_quote:
+                    mode = "template"
+
+                elif c in config.string_quotes:
+                    mode = "string"
+                    string_quote_char = c
+
+                elif c == "{":
+                    is_switch = frames[-1].pop("_next_brace_is_switch", False) if frames else False
+                    frames.append({"terminated": False, "flagged": False, "is_switch": is_switch})
+                    at_statement_start = True
+
+                elif c == "}":
+                    if frames:
+                        frames.pop()
+                    if not frames:
+                        frames.append({"terminated": False, "flagged": False, "is_switch": False})
+                    at_statement_start = False
+
+                elif c == ";":
+                    top = frames[-1] if frames else None
+                    if top is not None:
+                        pending_line = top.pop("_pending_terminator_line", None)
+                        if pending_line is not None:
+                            top["terminated"] = True
+                        elif top["terminated"] and not top["flagged"] and not top["is_switch"]:
+                            # A statement follows a terminator in this same block -
+                            # this is genuinely unreachable code.
+                            top["flagged"] = True
+                            findings.append({
+                                "line_start": line,
+                                "line_end": line,
+                                "rule": "unreachable_code",
+                                "error": "Unreachable code",
+                                "bug_type": "Unnecessary Code",
+                                "current_code": _line_text(lines, line),
+                                "cause": "This code comes right after a return or throw in the same block, "
+                                         "so it can never actually run.",
+                            })
+                    at_statement_start = True
+
+                elif c not in (" ", "\t", "\n", "\r"):
+                    if frames and frames[-1]["terminated"] and not frames[-1]["flagged"] and not frames[-1]["is_switch"] and at_statement_start:
+                        frames[-1]["flagged"] = True
+                        findings.append({
+                            "line_start": line,
+                            "line_end": line,
+                            "rule": "unreachable_code",
+                            "error": "Unreachable code",
+                            "bug_type": "Unnecessary Code",
+                            "current_code": _line_text(lines, line),
+                            "cause": "This code comes right after a return or throw in the same block, "
+                                     "so it can never actually run.",
+                        })
+                    at_statement_start = False
+
+            if c not in (" ", "\t"):
+                prev_significant_char = c
+
+        if c == "\n":
+            line += 1
+        i += 1
+
+    return findings
+
+
 def _raw_bracket_parity_ok(source: str, config: LangConfig = JS_CONFIG) -> bool:
     """
     A deliberately dumb second opinion: strip real comments/strings/templates
