@@ -4,7 +4,8 @@ Detector for Java, C, C++, C#, Go, and PHP.
 No compiler for any of these (javac, gcc/g++, the Go toolchain, php -l,
 a C# compiler) is installed in this Python-only backend, so - same
 approach as js_detector.py - this checks two things a pure-Python pass
-can check reliably:
+can check reliably, using ONE combined tokenizing pass
+(syntax_balance.check_bracket_balance):
 
 1. Structural syntax (brackets, strings, comments balance) - the class
    of error that stops a build cold - for all six languages.
@@ -16,8 +17,8 @@ can check reliably:
    on an explicit ';' to know where a statement ends. Running it on Go
    would either miss everything (harmless but pointless) or need a
    different, newline-aware statement-boundary rule this project hasn't
-   built yet - see syntax_balance.find_unreachable_statements for the
-   full reasoning on what is and isn't flagged.
+   built yet - see check_bracket_balance's docstring for the full
+   reasoning on what is and isn't flagged for the languages it does cover.
 
 Known, honest limitations (documented rather than silently wrong):
 - PHP's rare backtick shell-exec operator (`` `cmd` ``) and C#'s raw
@@ -29,7 +30,7 @@ Known, honest limitations (documented rather than silently wrong):
   real compiler - see the README section on the phased plan for adding
   compiler-backed checks next.
 """
-from .syntax_balance import check_bracket_balance, find_unreachable_statements, GO_CONFIG, C_FAMILY_CONFIG
+from .syntax_balance import check_bracket_balance, GO_CONFIG, C_FAMILY_CONFIG
 
 CONFIG_BY_EXTENSION = {
     ".java": C_FAMILY_CONFIG,
@@ -49,7 +50,8 @@ def detect(file_path: str, source: str):
     ext = file_path[file_path.rfind("."):] if "." in file_path else ""
     config = CONFIG_BY_EXTENSION.get(ext, C_FAMILY_CONFIG)
 
-    structural = check_bracket_balance(source, config)
+    structural, unreachable = check_bracket_balance(source, config)
+
     if structural:
         finding = dict(structural[0])
         finding["file"] = file_path
@@ -60,7 +62,7 @@ def detect(file_path: str, source: str):
         return []
 
     findings = []
-    for f in find_unreachable_statements(source, config):
+    for f in unreachable:
         f = dict(f)
         f["file"] = file_path
         f["function"] = None
