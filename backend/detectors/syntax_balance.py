@@ -33,199 +33,6 @@ def _line_text(lines, ln):
     return lines[ln - 1].strip() if 0 < ln <= len(lines) else ""
 
 
-TERMINATOR_KEYWORDS = {"return", "throw"}
-# break/continue are deliberately excluded: their meaning depends on the
-# enclosing loop/switch, which this lightweight scanner doesn't track -
-# treating them as unconditional terminators risks false positives inside
-# switch/case fallthrough, which this project's whole approach avoids.
-
-
-def find_unreachable_statements(source: str, config: LangConfig):
-    """
-    Finds code that appears after an unconditional return/throw in the same
-    {...} block - this is provably dead code, not a pattern guess, since
-    there is no path that can reach it regardless of what any other file
-    does. Deliberately conservative:
-      - only return/throw count as terminators (see TERMINATOR_KEYWORDS)
-      - requires an explicit ';' to close the terminating statement, so
-        semicolon-free code (valid in JS via ASI) is simply not flagged
-        rather than risk a false positive from misreading statement bounds
-      - switch/case bodies are skipped entirely, since break-based
-        fallthrough between cases doesn't map to "same block" reachability
-      - only reports the first offending statement per block
-    Returns a list of finding dicts, or [] if nothing is found - never
-    raises, since a scanner bug here should never take down a whole scan.
-    """
-    findings = []
-    lines = source.splitlines()
-
-    mode = "code"
-    string_quote_char = None
-    line = 1
-    i, n = 0, len(source)
-
-    # One frame per open '{' - tracks whether this block has hit a
-    # terminator yet, whether we've already flagged something in it, and
-    # whether it's a switch body (skipped entirely).
-    frames = [{"terminated": False, "flagged": False, "is_switch": False}]
-
-    word_buf = ""
-    word_start_line = None
-    at_statement_start = True  # true right after ; { } or start of file
-    prev_significant_char = ""
-    REGEX_START_TRIGGERS = set("([{,;:=&|!?+-*%<>~^\n")
-
-    def flush_word():
-        nonlocal word_buf, word_start_line, at_statement_start
-        if word_buf:
-            if at_statement_start and word_buf in TERMINATOR_KEYWORDS and frames:
-                frames[-1]["_pending_terminator_line"] = word_start_line
-            elif word_buf == "switch" and frames:
-                frames[-1]["_next_brace_is_switch"] = True
-            at_statement_start = False
-        word_buf = ""
-        word_start_line = None
-
-    while i < n:
-        c = source[i]
-        nxt = source[i + 1] if i + 1 < n else ""
-
-        if mode == "line_comment":
-            if c == "\n":
-                mode = "code"
-
-        elif mode == "block_comment":
-            if c == "*" and nxt == "/":
-                mode = "code"
-                i += 1
-
-        elif mode == "string":
-            if c == "\\":
-                i += 1
-            elif c == string_quote_char:
-                mode = "code"
-
-        elif mode == "template":
-            if config.template_escapes and c == "\\":
-                i += 1
-            elif c == config.template_quote:
-                mode = "code"
-            elif config.template_has_interpolation and c == "$" and nxt == "{":
-                frames.append({"terminated": False, "flagged": False, "is_switch": False})
-                mode = "code"
-                i += 1
-
-        else:
-            if c.isalnum() or c == "_":
-                if not word_buf:
-                    word_start_line = line
-                word_buf += c
-            else:
-                flush_word()
-
-                if c == "/" and nxt == "/":
-                    mode = "line_comment"
-                    i += 1
-
-                elif c == "/" and nxt == "*":
-                    mode = "block_comment"
-                    i += 1
-
-                elif (
-                    c == "/" and nxt not in ("/", "*")
-                    and (i == 0 or source[i - 1] != "<")
-                    and (not prev_significant_char or prev_significant_char in REGEX_START_TRIGGERS)
-                ):
-                    j = i + 1
-                    in_cc = False
-                    while j < n:
-                        cj = source[j]
-                        if cj == "\\":
-                            j += 2
-                            continue
-                        if cj == "[":
-                            in_cc = True
-                        elif cj == "]":
-                            in_cc = False
-                        elif cj == "/" and not in_cc:
-                            j += 1
-                            break
-                        elif cj == "\n":
-                            break
-                        j += 1
-                    while j < n and source[j].isalpha():
-                        j += 1
-                    skipped = source[i:j]
-                    line += skipped.count("\n")
-                    i = j
-                    prev_significant_char = "/"
-                    continue
-
-                elif config.template_quote and c == config.template_quote:
-                    mode = "template"
-
-                elif c in config.string_quotes:
-                    mode = "string"
-                    string_quote_char = c
-
-                elif c == "{":
-                    is_switch = frames[-1].pop("_next_brace_is_switch", False) if frames else False
-                    frames.append({"terminated": False, "flagged": False, "is_switch": is_switch})
-                    at_statement_start = True
-
-                elif c == "}":
-                    if frames:
-                        frames.pop()
-                    if not frames:
-                        frames.append({"terminated": False, "flagged": False, "is_switch": False})
-                    at_statement_start = False
-
-                elif c == ";":
-                    top = frames[-1] if frames else None
-                    if top is not None:
-                        pending_line = top.pop("_pending_terminator_line", None)
-                        if pending_line is not None:
-                            top["terminated"] = True
-                        elif top["terminated"] and not top["flagged"] and not top["is_switch"]:
-                            # A statement follows a terminator in this same block -
-                            # this is genuinely unreachable code.
-                            top["flagged"] = True
-                            findings.append({
-                                "line_start": line,
-                                "line_end": line,
-                                "rule": "unreachable_code",
-                                "error": "Unreachable code",
-                                "bug_type": "Unnecessary Code",
-                                "current_code": _line_text(lines, line),
-                                "cause": "This code comes right after a return or throw in the same block, "
-                                         "so it can never actually run.",
-                            })
-                    at_statement_start = True
-
-                elif c not in (" ", "\t", "\n", "\r"):
-                    if frames and frames[-1]["terminated"] and not frames[-1]["flagged"] and not frames[-1]["is_switch"] and at_statement_start:
-                        frames[-1]["flagged"] = True
-                        findings.append({
-                            "line_start": line,
-                            "line_end": line,
-                            "rule": "unreachable_code",
-                            "error": "Unreachable code",
-                            "bug_type": "Unnecessary Code",
-                            "current_code": _line_text(lines, line),
-                            "cause": "This code comes right after a return or throw in the same block, "
-                                     "so it can never actually run.",
-                        })
-                    at_statement_start = False
-
-            if c not in (" ", "\t"):
-                prev_significant_char = c
-
-        if c == "\n":
-            line += 1
-        i += 1
-
-    return findings
-
 
 def _raw_bracket_parity_ok(source: str, config: LangConfig = JS_CONFIG) -> bool:
     """
@@ -253,6 +60,24 @@ def _raw_bracket_parity_ok(source: str, config: LangConfig = JS_CONFIG) -> bool:
 
 
 def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
+    """
+    Returns a tuple: (structural_findings, unreachable_findings).
+
+    structural_findings: bracket/string/comment problems - at most one,
+    since these stop analysis immediately (a broken file can't be
+    reliably checked for anything past the first structural break).
+
+    unreachable_findings: code after an unconditional return/throw in the
+    same block - only meaningful (and only returned) when
+    structural_findings is empty, since unreachable-code tracking on a
+    structurally broken file is just noise on top of the real problem.
+
+    Both checks share ONE pass over the source so unreachable-code
+    tracking automatically benefits from the same hard-won JSX/regex/
+    string/comment handling used for bracket matching - text inside JSX
+    children, comments, strings, and regex literals is invisible to it
+    for exactly the same reason it's invisible to bracket matching.
+    """
     lines = source.splitlines()
     stack = []
 
@@ -275,6 +100,38 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
     # this is the same ambiguity every JS tokenizer has to resolve.
     prev_significant_char = ""
     REGEX_START_TRIGGERS = set("([{,;:=&|!?+-*%<>~^\n")
+
+    # Unreachable-code tracking. One frame per open '{' that represents a
+    # real statement block (not '(' or '[', and not a template ${...}
+    # expression, which holds an expression rather than statements).
+    # break/continue are deliberately NOT treated as terminators - their
+    # meaning depends on the enclosing loop/switch, which isn't tracked
+    # here, and treating them as unconditional would risk a false
+    # positive on switch/case fallthrough. switch bodies are skipped
+    # entirely for the same reason.
+    TERMINATOR_KEYWORDS = {"return", "throw"}
+    block_frames = [{"terminated": False, "flagged": False, "is_switch": False}]
+    unreachable_findings = []
+    word_buf = ""
+    word_start_line = None
+    word_is_stmt_start = False
+    at_statement_start = True
+    pending_switch_brace = False
+
+    def _flag_unreachable_if_needed():
+        top = block_frames[-1]
+        if top["terminated"] and not top["flagged"] and not top["is_switch"]:
+            top["flagged"] = True
+            unreachable_findings.append({
+                "line_start": line,
+                "line_end": line,
+                "rule": "unreachable_code",
+                "error": "Unreachable code",
+                "bug_type": "Unnecessary Code",
+                "current_code": _line_text(lines, line),
+                "cause": "This code comes right after a return or throw in the same block, "
+                         "so it can never actually run.",
+            })
 
     while i < n:
         c = source[i]
@@ -306,7 +163,7 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                     "bug_type": "Syntax Error",
                     "current_code": _line_text(lines, line),
                     "cause": "A quoted string starts here but does not have a matching closing quote.",
-                }]
+                }], []
 
         elif mode == "template":
             if config.template_escapes and c == "\\":
@@ -352,6 +209,34 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
 
                 i += 1
                 continue
+
+            is_comment_start = c == "/" and nxt in ("/", "*")
+            char_is_stmt_start = (
+                at_statement_start
+                and c not in (" ", "\t", "\n", "\r", "}")
+                and not is_comment_start
+            )
+            if char_is_stmt_start:
+                _flag_unreachable_if_needed()
+                at_statement_start = False
+
+            if c.isalnum() or c == "_":
+                if not word_buf:
+                    word_start_line = line
+                    word_is_stmt_start = char_is_stmt_start
+                word_buf += c
+                if c not in (" ", "\t"):
+                    prev_significant_char = c
+                col += 1
+                i += 1
+                continue
+            elif word_buf:
+                if word_is_stmt_start and word_buf in TERMINATOR_KEYWORDS:
+                    block_frames[-1]["_pending_terminator_line"] = word_start_line
+                elif word_buf == "switch":
+                    pending_switch_brace = True
+                word_buf = ""
+                word_start_line = None
 
             if c == "/" and nxt == "/":
                 mode = "line_comment"
@@ -418,6 +303,13 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
             elif c in config.string_quotes:
                 mode = "string"
                 string_quote_char = c
+
+            elif c == ";":
+                top = block_frames[-1]
+                pending_line = top.pop("_pending_terminator_line", None)
+                if pending_line is not None:
+                    top["terminated"] = True
+                at_statement_start = True
 
             elif c == "<" and nxt == "/" and not (
                 i > 0 and (source[i - 1].isalnum() or source[i - 1] in "_$")
@@ -491,11 +383,19 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                     "jsx_tag_depth_before": jsx_tag_depth,
                     "in_jsx_text_before": in_jsx_text,
                 })
+                if c == "{":
+                    block_frames.append({
+                        "terminated": False,
+                        "flagged": False,
+                        "is_switch": pending_switch_brace,
+                    })
+                    pending_switch_brace = False
+                    at_statement_start = True
 
             elif c in BRACKET_CLOSERS:
                 if not stack:
                     if _raw_bracket_parity_ok(source, config):
-                        return []
+                        return [], []
                     return [{
                         "line_start": line,
                         "line_end": line,
@@ -504,7 +404,7 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                         "bug_type": "Syntax Error",
                         "current_code": _line_text(lines, line),
                         "cause": f"There is a closing '{c}' here, but there is no matching opening bracket.",
-                    }]
+                    }], []
 
                 top = stack[-1]
 
@@ -531,10 +431,17 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                         # follows.
                         jsx_tag_depth = top.get("jsx_tag_depth_before", jsx_tag_depth)
                         in_jsx_text = top.get("in_jsx_text_before", in_jsx_text)
+                        if len(block_frames) > 1:
+                            block_frames.pop()
+                        # A block-statement's closing '}' ends that statement
+                        # in the ENCLOSING scope even with no ';' after it
+                        # (if/for/while/function bodies never need one) - the
+                        # next real token starts a fresh statement there.
+                        at_statement_start = True
 
                 else:
                     if _raw_bracket_parity_ok(source, config):
-                        return []
+                        return [], []
                     return [{
                         "line_start": line,
                         "line_end": line,
@@ -543,7 +450,7 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                         "bug_type": "Syntax Error",
                         "current_code": _line_text(lines, line),
                         "cause": f"The bracket opened on line {top['line']} needs '{MATCH[top['char']]}', but '{c}' was used instead.",
-                    }]
+                    }], []
 
             if c not in (" ", "\t"):
                 prev_significant_char = c
@@ -558,7 +465,7 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
 
     if stack:
         if _raw_bracket_parity_ok(source, config):
-            return []
+            return [], []
         first_open = stack[0]
 
         return [{
@@ -569,7 +476,7 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
             "bug_type": "Syntax Error",
             "current_code": _line_text(lines, first_open["line"]),
             "cause": f"This '{first_open['char']}' was opened here but was never closed.",
-        }]
+        }], []
 
     if mode == "string":
         return [{
@@ -580,7 +487,7 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
             "bug_type": "Syntax Error",
             "current_code": _line_text(lines, line),
             "cause": "A text string was opened but never closed.",
-        }]
+        }], []
 
     if mode == "template":
         return [{
@@ -591,7 +498,7 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
             "bug_type": "Syntax Error",
             "current_code": _line_text(lines, line),
             "cause": "A template string was opened but never closed.",
-        }]
+        }], []
 
     if mode == "block_comment":
         return [{
@@ -602,9 +509,9 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
             "bug_type": "Syntax Error",
             "current_code": _line_text(lines, line),
             "cause": "A comment was opened with /* but was never closed with */.",
-        }]
+        }], []
 
-    return []
+    return [], unreachable_findings
 
 
 def mask_non_code(source: str, config: LangConfig = JS_CONFIG) -> str:
