@@ -4,19 +4,23 @@ files. No Node.js, tsc, or any external binary is installed in this
 Python-only backend, so this does NOT try to be a full parser the way
 `ast` is for Python.
 
-Reports two things, both verifiable with certainty from source text alone:
+Reports two things, both verifiable with certainty from source text alone,
+using ONE combined pass over the source (syntax_balance.check_bracket_balance):
 
-1. Structural syntax errors (syntax_balance.check_bracket_balance):
-   unbalanced/mismatched brackets and unterminated strings/comments - the
-   exact class of error that shows up as "Unexpected token" in a
-   Vite/webpack/esbuild build log.
+1. Structural syntax errors: unbalanced/mismatched brackets and
+   unterminated strings/comments - the exact class of error that shows
+   up as "Unexpected token" in a Vite/webpack/esbuild build log.
 
-2. Unreachable code (syntax_balance.find_unreachable_statements): code
-   that appears after an unconditional return/throw in the same block.
-   Deliberately conservative - see that function's docstring for exactly
-   what it does and doesn't flag, and why (switch/case fallthrough and
-   semicolon-free ASI-style code are both left unflagged rather than risk
-   a false positive).
+2. Unreachable code: statements after an unconditional return/throw in
+   the same block. Deliberately conservative - see check_bracket_balance's
+   docstring for exactly what it does and doesn't flag, and why
+   (switch/case fallthrough and semicolon-free ASI-style code are both
+   left unflagged rather than risk a false positive). Only checked when
+   the file has no structural errors, and shares the same JSX/regex/
+   string/comment-aware tokenizer as the structural check - so text
+   inside JSX children, comments, strings, and regex literals is
+   invisible to it for exactly the same reason it's invisible to
+   bracket matching.
 
 Earlier versions of this file also flagged pattern-based candidates:
 loose equality (==), var instead of let/const, empty catch blocks, and
@@ -31,22 +35,20 @@ in with syntax errors that are unconditionally real, which made every
 finding equally suspect. Keeping the guaranteed ones and dropping the
 rest is what "no false positives" actually requires here.
 """
-from .syntax_balance import check_bracket_balance, find_unreachable_statements, JS_CONFIG
+from .syntax_balance import check_bracket_balance, JS_CONFIG
 
 
 def detect(file_path: str, source: str):
-    structural = check_bracket_balance(source, JS_CONFIG)
+    structural, unreachable = check_bracket_balance(source, JS_CONFIG)
+
     if structural:
         finding = dict(structural[0])
         finding["file"] = file_path
         finding["function"] = None
         return [finding]
 
-    # Only check for unreachable code once the file's brackets are known to
-    # balance - unreachable-code tracking on a structurally broken file
-    # would just be noise on top of the real problem.
     findings = []
-    for f in find_unreachable_statements(source, JS_CONFIG):
+    for f in unreachable:
         f = dict(f)
         f["file"] = file_path
         f["function"] = None
