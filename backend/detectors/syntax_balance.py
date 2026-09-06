@@ -117,6 +117,27 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
     word_is_stmt_start = False
     at_statement_start = True
     pending_switch_brace = False
+    # --- if/else termination merging (mirrors python_detector.py's AST-based
+    # merge: "if every branch of an if/else terminates, the if/else itself
+    # counts as a terminator for the block it's in"). Tracked with two small
+    # pieces of state rather than a real tree, since this tokenizer doesn't
+    # build one: role_for_next_brace tags the NEXT '{' as belonging to an
+    # "if" or "else" body (or nothing) as soon as the keyword is seen, and
+    # pending_if_terminated remembers whether the most recently closed
+    # "if"-tagged block terminated, so its immediately-following "else"
+    # block (if any) can be compared against it. Deliberately does NOT
+    # handle "else if" chains merging - only a plain if/else pair - to keep
+    # this addition small and easy to verify; a chain is conservatively
+    # left unmerged (a false negative, not a false positive).
+    role_for_next_brace = None
+    pending_if_terminated = None
+    # True only for the single gap between an "if"-block closing and
+    # whatever token comes right after it - NOT for the whole time an
+    # else-block's body is being processed. Without this being scoped so
+    # tightly, a 'return' *inside* the matched else-block is itself a
+    # fresh statement-start word that isn't "else", and would incorrectly
+    # cancel pending_if_terminated before the else-block even closes.
+    awaiting_else = False
 
     def _flag_unreachable_if_needed():
         top = block_frames[-1]
@@ -235,6 +256,40 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                     block_frames[-1]["_pending_terminator_line"] = word_start_line
                 elif word_buf == "switch":
                     pending_switch_brace = True
+
+                if word_buf == "if" and role_for_next_brace == "else":
+                    # "else if" - the "if" here is reached with
+                    # word_is_stmt_start=False (at_statement_start was already
+                    # consumed by "else"), so it would otherwise just leave
+                    # role_for_next_brace sitting at "else" from the previous
+                    # word - silently mislabeling this branch's block as a
+                    # final, unconditional "else" when it's actually still
+                    # conditional. Chain merging (3+ branches) is explicitly
+                    # out of scope for this checker (see module docstring) -
+                    # untag this block AND drop the pending match so it can't
+                    # later merge with some unrelated "else" further down.
+                    role_for_next_brace = None
+                    pending_if_terminated = None
+                    awaiting_else = False
+                elif word_is_stmt_start and word_buf == "if":
+                    role_for_next_brace = "if"
+                elif word_buf == "else":
+                    # "else" directly continues whatever if-chain just closed,
+                    # so it deliberately does NOT go through the word_is_stmt_start
+                    # check above - it's reached via at_statement_start being
+                    # reset by the previous block's '}', not a fresh statement.
+                    role_for_next_brace = "else"
+                    awaiting_else = False
+                elif word_is_stmt_start and awaiting_else:
+                    # The token right after an if-block's '}' wasn't "else",
+                    # so that if had no else after all - nothing to merge.
+                    # Scoped to awaiting_else (only true for this one gap) so
+                    # it does NOT fire again on every later statement, which
+                    # would wrongly cancel this the moment the matched
+                    # else-block's own body starts running real statements.
+                    pending_if_terminated = None
+                    awaiting_else = False
+
                 word_buf = ""
                 word_start_line = None
 
@@ -388,8 +443,10 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                         "terminated": False,
                         "flagged": False,
                         "is_switch": pending_switch_brace,
+                        "role": role_for_next_brace,
                     })
                     pending_switch_brace = False
+                    role_for_next_brace = None
                     at_statement_start = True
 
             elif c in BRACKET_CLOSERS:
@@ -432,7 +489,21 @@ def check_bracket_balance(source: str, config: LangConfig = JS_CONFIG):
                         jsx_tag_depth = top.get("jsx_tag_depth_before", jsx_tag_depth)
                         in_jsx_text = top.get("in_jsx_text_before", in_jsx_text)
                         if len(block_frames) > 1:
-                            block_frames.pop()
+                            closed_frame = block_frames.pop()
+                            role = closed_frame.get("role")
+                            if role == "if":
+                                # Always overwrites any stale value - see the
+                                # comment on pending_if_terminated's cancel
+                                # logic above for why that's correct even for
+                                # nested if/else pairs.
+                                pending_if_terminated = closed_frame["terminated"]
+                                awaiting_else = True
+                            elif role == "else":
+                                if pending_if_terminated is not None and (
+                                    pending_if_terminated and closed_frame["terminated"]
+                                ):
+                                    block_frames[-1]["terminated"] = True
+                                pending_if_terminated = None
                         # A block-statement's closing '}' ends that statement
                         # in the ENCLOSING scope even with no ';' after it
                         # (if/for/while/function bodies never need one) - the
