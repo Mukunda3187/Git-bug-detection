@@ -31,6 +31,46 @@ import ast
 TERMINATING_STATEMENTS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
 
 
+def _always_terminates(stmt):
+    """
+    True if executing this ONE statement is guaranteed to exit the
+    enclosing block, no matter what - either directly (a plain
+    return/raise/break/continue), or because every possible path through
+    it ends that way (an if/else where BOTH branches always terminate,
+    or a try/except where the try body AND every except handler always
+    terminate). This is what lets "if x: return a  else: return b" behave
+    like a single terminator for whatever code follows it.
+
+    Deliberately conservative: an if with no else is never treated as
+    terminating (the no-else path falls through), and a try's finally
+    block is ignored for this check - a finally that terminates would
+    make everything unreachable regardless of the try/except, which is
+    a much rarer pattern not worth the added complexity here.
+    """
+    if isinstance(stmt, TERMINATING_STATEMENTS):
+        return True
+
+    if isinstance(stmt, ast.If):
+        if not stmt.orelse:
+            return False  # no else branch - execution can fall through
+        return (
+            bool(stmt.body) and _always_terminates(stmt.body[-1])
+            and bool(stmt.orelse) and _always_terminates(stmt.orelse[-1])
+        )
+
+    if isinstance(stmt, ast.Try):
+        if not stmt.handlers:
+            return False
+        try_ok = bool(stmt.body) and _always_terminates(stmt.body[-1])
+        handlers_ok = all(
+            bool(h.body) and _always_terminates(h.body[-1])
+            for h in stmt.handlers
+        )
+        return try_ok and handlers_ok
+
+    return False
+
+
 def _get_source_segment(source_lines, node):
     start = node.lineno - 1
     end = getattr(node, "end_lineno", node.lineno) - 1
@@ -63,7 +103,7 @@ def _find_unreachable_code(body, file_path, source_lines, findings):
             })
             return  # one finding per block is enough - don't flag every subsequent line too
 
-        if isinstance(stmt, TERMINATING_STATEMENTS):
+        if _always_terminates(stmt):
             terminated = True
 
         # Recurse into nested bodies so unreachable code INSIDE an if/for/while/try
