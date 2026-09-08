@@ -23,7 +23,7 @@ from detectors.python_detector import detect as detect_python
 from detectors.js_detector import detect as detect_js
 from detectors.cfamily_detector import detect as detect_cfamily
 from rag.retriever import retrieve_similar_bugs
-from llm_client import analyze_finding
+from llm_client import analyze_finding, get_fallback_report
 
 app = FastAPI(title="RAG-Enhanced LLM for GitHub Bug Detection and Recovery")
 
@@ -51,8 +51,11 @@ DETECTORS_BY_EXTENSION = {
     ".go": detect_cfamily,
     ".php": detect_cfamily,
 }
-MAX_FILES_TO_SCAN = 25
 MAX_LLM_CALLS_PER_SCAN = 8
+# No cap on how many files get scanned - detection itself is fast, local
+# static analysis with no network calls, so there's no timeout risk from
+# scanning more files. The one genuinely slow, rate-limited step is the
+# LLM call per finding, which is why that alone still has a budget below.
 
 def _empty_summary(repo: str, message: str) -> ScanResult:
     return ScanResult(
@@ -108,7 +111,7 @@ def scan_repo(req: ScanRequest):
 
     try:
         files = find_source_files(repo_path)
-        files_to_scan = files[:MAX_FILES_TO_SCAN]
+        files_to_scan = files
         bug_reports = []
         llm_calls_used = 0
         bug_number = 0
@@ -133,13 +136,20 @@ def scan_repo(req: ScanRequest):
 
             for finding in findings:
                 if llm_calls_used >= MAX_LLM_CALLS_PER_SCAN:
-                    break
-                llm_calls_used += 1
-                retrieved = retrieve_similar_bugs(
-                    query_text=f"{finding.get('error')}\n{finding.get('current_code')}",
-                    top_k=3,
-                )
-                analysis = analyze_finding(finding, retrieved)
+                    # LLM budget used up for this scan - still show the bug with
+                    # real, specific fallback advice rather than dropping a
+                    # confirmed, 100%-certain finding entirely. No RAG lookup
+                    # either, since that's just extra context for the LLM call
+                    # we're intentionally skipping here.
+                    analysis = get_fallback_report(finding)
+                    retrieved = []
+                else:
+                    llm_calls_used += 1
+                    retrieved = retrieve_similar_bugs(
+                        query_text=f"{finding.get('error')}\n{finding.get('current_code')}",
+                        top_k=3,
+                    )
+                    analysis = analyze_finding(finding, retrieved)
 
                 # Surface the AI usage-limit message once per scan, at the top,
                 # instead of repeating a generic "fix it yourself" note per bug.
