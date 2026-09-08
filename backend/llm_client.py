@@ -251,6 +251,16 @@ def _fallback_report(finding: dict) -> dict:
         solution_intro = "Remove this code from the file."
         action = "Delete this 'debugger' statement before shipping."
 
+    elif rule == "unreachable_code":
+        solution_type = "remove"
+        solution_intro = "Remove this code from the file."
+        action = "Delete this code - it can never run, so it isn't doing anything."
+
+    elif rule in ("unclosed_bracket", "mismatched_bracket", "unexpected_closing_bracket"):
+        solution_type = "replace"
+        solution_intro = "There is a bracket that doesn't match up correctly - fix it by hand at the location shown."
+        action = "Check every '{', '(' and '[' near this line and make sure each one has a matching closing bracket in the right order."
+
     else:
         # Should not normally be reached - every known rule is handled above -
         # but keep a safe, honest fallback for any future/unknown rule.
@@ -272,6 +282,16 @@ def _fallback_report(finding: dict) -> dict:
         "explanation": "",
         "insufficient_evidence": True,
     }
+
+
+def get_fallback_report(finding: dict) -> dict:
+    """
+    Public entry point to the same real, rule-specific advice used when
+    the LLM is unavailable - lets a caller intentionally skip the API call
+    (e.g. once a per-scan call budget is used up) while still returning a
+    genuine, specific answer instead of dropping the finding entirely.
+    """
+    return _fallback_report(finding)
 
 
 def analyze_finding(finding: dict, retrieved: list) -> dict:
