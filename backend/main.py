@@ -61,7 +61,7 @@ def _empty_summary(repo: str, message: str) -> ScanResult:
     return ScanResult(
         summary=ScanSummary(
             repo=repo, files_scanned=0, bugs_found=0,
-            unnecessary_code_found=0, error_level="Less Errors",
+            confidence=100, error_level="Less Errors",
             scan_status=message,
         ),
         bugs=[],
@@ -82,6 +82,22 @@ def _compute_error_level(bug_reports):
         return "Medium Errors"
     else:
         return "More Errors"
+
+
+def _compute_confidence(bug_reports):
+    """
+    Percentage of found issues the system is fully confident about (i.e.
+    NOT flagged by the LLM as insufficient_evidence). Every detector only
+    reports 100%-certain findings in the first place (real syntax errors,
+    provably unreachable code) - this reflects how many of those the LLM
+    step was also able to confirm with a solid explanation, versus how
+    many it flagged as needing manual review. No bugs found at all means
+    nothing to be unsure about, so that's reported as 100%.
+    """
+    if not bug_reports:
+        return 100
+    confident_count = sum(1 for b in bug_reports if not b.insufficient_evidence)
+    return round(confident_count / len(bug_reports) * 100)
 
 
 @app.get("/api/health")
@@ -156,17 +172,19 @@ def scan_repo(req: ScanRequest):
                 if ai_notice is None and analysis.get("rate_limited"):
                     ai_notice = analysis.get("rate_limit_message")
 
-                # Keyed on bug_type (every detector sets this), not on one Python-specific
-                # rule name, so this stays correct as more language detectors are added.
-                is_unnecessary = finding.get("bug_type") == "Unnecessary Code"
                 bug_number += 1
+                reported_bug_type = analysis.get("bug_type", finding.get("bug_type", "Other"))
+                if reported_bug_type == "Unnecessary Code":
+                    # This detector only flags code that is provably dead
+                    # (unreachable after a return/throw) - it's a real bug,
+                    # just not shown as a separate category anymore.
+                    reported_bug_type = "Unreachable Code"
 
                 bug_reports.append(BugReport(
                     id=str(uuid.uuid4())[:8],
                     number=bug_number,
-                    kind="unnecessary_code" if is_unnecessary else "bug",
                     error=analysis.get("error", finding.get("error", "Possible issue")),
-                    bug_type=analysis.get("bug_type", finding.get("bug_type", "Other")),
+                    bug_type=reported_bug_type,
                     file=relative_path,
                     function=finding.get("function"),
                     line_start=finding.get("line_start"),
@@ -195,10 +213,7 @@ def scan_repo(req: ScanRequest):
                     insufficient_evidence=bool(analysis.get("insufficient_evidence", False)),
                 ))
 
-        unnecessary_code_found = sum(
-            1 for b in bug_reports if b.kind == "unnecessary_code"
-        )
-
+        confidence = _compute_confidence(bug_reports)
         error_level = _compute_error_level(bug_reports)
 
         return ScanResult(
@@ -206,7 +221,7 @@ def scan_repo(req: ScanRequest):
                 repo=f"{status.owner}/{status.name}",
                 files_scanned=len(files_to_scan),
                 bugs_found=len(bug_reports),
-                unnecessary_code_found=unnecessary_code_found,
+                confidence=confidence,
                 error_level=error_level,
                 scan_status="Completed",
                 ai_notice=ai_notice,
