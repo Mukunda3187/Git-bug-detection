@@ -179,6 +179,10 @@
   .error-level-pill.medium { color: var(--warn); border-color: var(--warn); }
   .error-level-pill.more { color: var(--crit); border-color: var(--crit); }
 
+  .num.confidence-high { color: var(--added); }
+  .num.confidence-medium { color: var(--warn); }
+  .num.confidence-low { color: var(--crit); }
+
   .bug-card {
     border: 1px solid var(--border);
     border-left-width: 3px;
@@ -188,7 +192,6 @@
     margin-bottom: 18px;
     overflow: hidden;
   }
-  .bug-card.kind-unnecessary_code { border-left-color: var(--warn); }
 
   .bug-head {
     padding: 14px 18px;
@@ -359,16 +362,14 @@ function renderSolutionBlock(bug) {
 }
 
 function renderBugCard(bug) {
-  const icon = bug.kind === "unnecessary_code" ? "🟡" : "🔴";
-
   const lineText = bug.line_note
     ? bug.line_note
     : (bug.line_start ? `Line${bug.line_end && bug.line_end !== bug.line_start ? "s" : ""} ${bug.line_start}${bug.line_end && bug.line_end !== bug.line_start ? "-" + bug.line_end : ""}` : "");
 
   return `
-    <div class="bug-card kind-${bug.kind}">
+    <div class="bug-card">
       <div class="bug-head">
-        <div class="bug-title">${icon} <span class="bug-number">Bug ${bug.number}</span></div>
+        <div class="bug-title">🔴 <span class="bug-number">Bug ${bug.number}</span></div>
       </div>
       <div class="bug-body">
         <div class="field-label">Location</div>
@@ -402,6 +403,12 @@ function errorLevelClass(level) {
   return "more";
 }
 
+function confidenceClass(confidence) {
+  if (confidence >= 80) return "confidence-high";
+  if (confidence >= 50) return "confidence-medium";
+  return "confidence-low";
+}
+
 function renderSummary(summary) {
   const holder = document.getElementById("summary-holder");
   if (summary.files_scanned === 0 && summary.bugs_found === 0 && summary.scan_status === "Completed") {
@@ -412,7 +419,7 @@ function renderSummary(summary) {
     <div class="summary-grid">
       <div class="summary-cell"><div class="num">${summary.files_scanned}</div><div class="label">Files scanned</div></div>
       <div class="summary-cell"><div class="num">${summary.bugs_found}</div><div class="label">Possible bugs</div></div>
-      <div class="summary-cell"><div class="num">${summary.unnecessary_code_found}</div><div class="label">Unnecessary code</div></div>
+      <div class="summary-cell"><div class="num ${confidenceClass(summary.confidence)}">${summary.confidence}%</div><div class="label">Confidence</div></div>
       <div class="summary-cell">
         <div class="error-level-pill ${errorLevelClass(summary.error_level)}">${escapeHtml(summary.error_level)}</div>
         <div class="label" style="margin-top:6px;">Error level</div>
