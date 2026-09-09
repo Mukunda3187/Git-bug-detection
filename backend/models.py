@@ -30,7 +30,6 @@ class RetrievedBug(BaseModel):
 class BugReport(BaseModel):
     id: str
     number: int                    # sequential display number: Bug 1, Bug 2, ...
-    kind: str = "bug"              # "bug" | "unnecessary_code"
     error: str                     # short title, e.g. "Possibly unused function"
     bug_type: str
     file: str
@@ -56,7 +55,7 @@ class ScanSummary(BaseModel):
     repo: str
     files_scanned: int
     bugs_found: int
-    unnecessary_code_found: int
+    confidence: int            # 0-100, how confident the system is in the findings shown
     error_level: str           # "Less Errors" | "Medium Errors" | "More Errors"
     scan_status: str
     ai_notice: Optional[str] = None   # shown when the AI hit a usage limit during this scan
