@@ -84,20 +84,34 @@ def _compute_error_level(bug_reports):
         return "More Errors"
 
 
+def _clamp_confidence(value) -> int:
+    """
+    Defensively coerces whatever came back from the LLM/fallback into a
+    valid 0-100 int, no matter which code path it took to get here -
+    the average in _compute_confidence would otherwise break on a stray
+    None or an out-of-range number from an unexpected response shape.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 70
+    return max(0, min(100, n))
+
+
 def _compute_confidence(bug_reports):
     """
-    Percentage of found issues the system is fully confident about (i.e.
-    NOT flagged by the LLM as insufficient_evidence). Every detector only
-    reports 100%-certain findings in the first place (real syntax errors,
-    provably unreachable code) - this reflects how many of those the LLM
-    step was also able to confirm with a solid explanation, versus how
-    many it flagged as needing manual review. No bugs found at all means
-    nothing to be unsure about, so that's reported as 100%.
+    Average of each individual bug's own confidence score (0-100, set by
+    the LLM per finding, or by a rule-specific fallback table when the LLM
+    isn't available - see llm_client.FALLBACK_CONFIDENCE_BY_RULE). This
+    gives a genuinely graded result instead of a blunt yes/no split -
+    a scan with mostly high-confidence fixes and one shaky guess lands
+    somewhere sensible in between, rather than being forced to 0% or 100%.
+    No bugs found at all means nothing to be unsure about, so that's
+    reported as 100%.
     """
     if not bug_reports:
         return 100
-    confident_count = sum(1 for b in bug_reports if not b.insufficient_evidence)
-    return round(confident_count / len(bug_reports) * 100)
+    return round(sum(b.confidence for b in bug_reports) / len(bug_reports))
 
 
 @app.get("/api/health")
@@ -200,6 +214,7 @@ def scan_repo(req: ScanRequest):
                     new_file_path=analysis.get("new_file_path"),
                     action=analysis.get("action", ""),
                     explanation=analysis.get("explanation"),
+                    confidence=_clamp_confidence(analysis.get("confidence")),
                     retrieved_bugs=[
                         RetrievedBug(
                             dataset_source=r["record"].get("dataset_source", "Unknown"),
