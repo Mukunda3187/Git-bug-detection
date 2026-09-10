@@ -47,6 +47,7 @@ class BugReport(BaseModel):
     new_file_path: Optional[str] = None  # for solution_type == "create_file"
     action: str = ""                     # final one-line action sentence
     explanation: Optional[str] = None
+    confidence: int = 70          # 0-100, how confident the system is in THIS specific finding's fix
     retrieved_bugs: List[RetrievedBug] = []
     insufficient_evidence: bool = False
 
