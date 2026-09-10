@@ -85,6 +85,14 @@ For each reported issue, provide a response with:
    - Ensure it's production-ready and handles edge cases
 4. **action**: One specific sentence describing what to do (e.g., "Replace line 42 with the corrected code" or "Add this try-except block after the variable assignment").
 5. **explanation**: Provide a brief technical explanation of why the fix works.
+6. **confidence**: An integer from 0 to 100 for THIS SPECIFIC finding, reflecting how confident you are that
+   (a) this is genuinely a real, correctly-diagnosed problem given the code and context shown, and
+   (b) the fix you're proposing actually resolves it correctly and completely.
+   Use the full range honestly - a solid, unambiguous fix for a clear-cut issue deserves 90-100.
+   A fix you're reasonably sure about but that depends on context you can't fully see deserves 60-85.
+   Anything you're genuinely unsure about, where the retrieved historical evidence is thin or the fix
+   is a best guess, deserves 30-55. Do not default to a single "safe" number every time - vary it
+   honestly based on the actual evidence for this specific finding.
 
 CRITICAL RULES:
 - If solution_type is "replace", replacement_code MUST NEVER be null or empty. Always provide working code.
@@ -106,6 +114,7 @@ Reply with ONLY a JSON object, no markdown fences or extra text:
   "new_file_path": string or null,
   "action": string,
   "explanation": string,
+  "confidence": integer from 0 to 100,
   "insufficient_evidence": boolean
 }"""
 
@@ -139,6 +148,38 @@ def _build_user_message(finding: dict, retrieved: list) -> str:
 
 **Your Task:**
 Analyze this candidate and provide a complete, production-ready fix. Ensure replacement_code is never empty for "replace" solutions."""
+
+
+# How confident the FALLBACK path (no live LLM call) can honestly be in
+# its own suggested fix, per rule. This varies deliberately - a rule with
+# an exact, verified string-substitution fix (like eq_none: "== None" -> "is None")
+# deserves a much higher number than one with only generic advice and no
+# computed replacement (like empty_catch_block, which just says "add a
+# console.error"). This is about confidence in the FIX, not confidence
+# that the underlying finding is real - every finding these detectors
+# produce is already a 100%-certain fact (a real syntax error, or
+# provably unreachable code), independent of this fallback quality score.
+FALLBACK_CONFIDENCE_BY_RULE = {
+    "possibly_unused_function": 60,
+    "bare_except": 85,
+    "mutable_default_arg": 55,
+    "eq_none": 90,
+    "possible_division_by_zero": 50,
+    "syntax_error": 70,
+    "unclosed_bracket": 65,
+    "mismatched_bracket": 65,
+    "unexpected_closing_bracket": 65,
+    "unterminated_string": 75,
+    "unterminated_template_literal": 75,
+    "unterminated_comment": 75,
+    "loose_equality": 90,
+    "var_declaration": 85,
+    "empty_catch_block": 55,
+    "leftover_console_statement": 90,
+    "leftover_debugger_statement": 90,
+    "unreachable_code": 95,  # deleting provably-dead code is always a safe, correct fix
+}
+DEFAULT_FALLBACK_CONFIDENCE = 40
 
 
 def _fallback_report(finding: dict) -> dict:
@@ -280,6 +321,7 @@ def _fallback_report(finding: dict) -> dict:
         "new_file_path": None,
         "action": action,
         "explanation": "",
+        "confidence": FALLBACK_CONFIDENCE_BY_RULE.get(rule, DEFAULT_FALLBACK_CONFIDENCE),
         "insufficient_evidence": True,
     }
 
@@ -365,12 +407,21 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
                     )
 
                     result = json.loads(cleaned)
-                    
+
                     # Validate that replacement_code is not empty for "replace" solutions
                     if result.get("solution_type") == "replace" and not result.get("replacement_code"):
                         print(f"[llm_client] Gemini returned empty replacement_code for replace solution. Using fallback.")
                         return _fallback_report(finding)
-                    
+
+                    # Gemini occasionally omits confidence despite the instruction, or
+                    # returns something outside 0-100 - never let a missing/bad number
+                    # here break the scan-wide average computed in main.py.
+                    confidence = result.get("confidence")
+                    if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
+                        result["confidence"] = 70
+                    else:
+                        result["confidence"] = int(confidence)
+
                     return result
 
                 except (json.JSONDecodeError, ValueError) as e:
