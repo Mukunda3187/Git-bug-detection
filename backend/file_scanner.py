@@ -1,6 +1,15 @@
 """
 Walks the downloaded repository and returns a list of source files worth
 analyzing. Keeps ignored folders in one config list so it's easy to tweak.
+
+Only excludes things that are NOT the developer's own code: version
+control internals, third-party dependencies, and generated build output.
+Scanning those would waste time finding "bugs" in code the developer
+didn't write and can't meaningfully fix (it just gets overwritten on the
+next install/build), while genuinely missing real problems in the
+developer's own files. Everything else the developer actually committed -
+including things like database migrations - gets scanned, since it's
+real, versioned code that can have real bugs.
 """
 import os
 
@@ -9,12 +18,20 @@ SUPPORTED_EXTENSIONS = {
 }
 
 IGNORED_FOLDERS = {
-    ".git", "node_modules", "__pycache__", "venv", ".venv", "env",
-    "dist", "build", "target", "vendor", ".idea", ".vscode",
-    "coverage", ".pytest_cache", "migrations",
+    ".git",             # version control internals, not source code
+    "node_modules",     # third-party JS dependencies
+    "vendor",           # third-party dependencies (Go, PHP, etc.)
+    "__pycache__",      # compiled Python bytecode cache
+    "venv", ".venv", "env",  # Python virtual environments (not the developer's code)
+    "dist", "build", "target",  # generated build output
+    ".idea", ".vscode",  # editor/IDE settings, not source
+    "coverage", ".pytest_cache",  # generated test-tooling output
 }
 
-MAX_FILE_SIZE_BYTES = 500_000  # skip anything unusually large (likely generated/minified)
+# A generous ceiling mainly to protect against something that's clearly not
+# meant to be read as source (a huge minified bundle, a data file with a
+# misleading extension) rather than to skip legitimately large source files.
+MAX_FILE_SIZE_BYTES = 5_000_000
 
 
 def find_source_files(root_path: str):
