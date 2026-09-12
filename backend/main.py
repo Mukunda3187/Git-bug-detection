@@ -165,20 +165,19 @@ def scan_repo(req: ScanRequest):
                 continue
 
             for finding in findings:
+                retrieved = retrieve_similar_bugs(
+                    query_text=f"{finding.get('error')}\n{finding.get('current_code')}",
+                    top_k=3,
+                )
                 if llm_calls_used >= MAX_LLM_CALLS_PER_SCAN:
                     # LLM budget used up for this scan - still show the bug with
                     # real, specific fallback advice rather than dropping a
-                    # confirmed, 100%-certain finding entirely. No RAG lookup
-                    # either, since that's just extra context for the LLM call
-                    # we're intentionally skipping here.
+                    # confirmed, 100%-certain finding entirely. RAG lookup still
+                    # runs above - it's a fast, local, unlimited operation with
+                    # no connection to the Gemini call budget being managed here.
                     analysis = get_fallback_report(finding)
-                    retrieved = []
                 else:
                     llm_calls_used += 1
-                    retrieved = retrieve_similar_bugs(
-                        query_text=f"{finding.get('error')}\n{finding.get('current_code')}",
-                        top_k=3,
-                    )
                     analysis = analyze_finding(finding, retrieved)
 
                 # Surface the AI usage-limit message once per scan, at the top,
