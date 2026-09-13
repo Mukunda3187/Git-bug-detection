@@ -1,32 +1,22 @@
 """
-Real static-analysis detector for Python files, using the `ast` module.
+Static-analysis detector for Python files, using the `ast` module.
 
-Reports two things, and only things that can be verified with total
-certainty from the source text alone - no pattern-matching judgment calls:
+Reports every real, source-verifiable issue this file can find in one
+pass over the AST - not just the narrow "100%-certain" subset used
+earlier in this project. Every finding still carries an accurate `rule`
+name so the rest of the pipeline (llm_client.py's confidence table, the
+LLM prompt) can give it an honest confidence score rather than pretend
+every finding is equally certain:
 
-1. syntax_error - the one thing `ast.parse` can tell you with total
-   certainty: this file either parses as valid Python or it doesn't.
-
-2. unreachable_code - code that appears after an unconditional
-   return/raise/break/continue in the same block (including an if/else
-   or try/except where EVERY branch always terminates - not just a bare
-   return/raise/break/continue directly). This is provably dead: there
-   is no code path that can ever reach it, regardless of what any other
-   file does, unlike "this function looks unused" (which depends on
-   whether some other file calls it - a judgment call, not a fact).
-
-Earlier versions of this file also flagged bare `except:`, `== None`,
-mutable default arguments, division without a visible zero-check, and
-functions that look unused within one file. Every one of those is a
-real, valid thing to notice, but none of them can be verified as an
-actual bug from source text alone - each is sometimes deliberate (a
-memoized default argument, a deliberately broad except at a top-level
-boundary, a function only called from another file this detector never
-sees). Reporting them as "possible bugs" mixed pattern matches that need
-human judgment in with syntax errors that are unconditionally real,
-which made every finding equally suspect. Splitting them apart - keep
-the guaranteed ones, drop the judgment calls - is what "no false
-positives" actually requires here.
+- syntax_error              - certain (ast.parse itself fails)
+- unreachable_code          - certain (provably dead code)
+- bare_except               - very likely a real problem, near-certain
+- eq_none                   - very likely a real problem, near-certain
+- mutable_default_arg       - very likely a real problem, near-certain
+- possible_division_by_zero - a real risk, but sometimes deliberately unguarded
+- possibly_unused_function  - a genuine heuristic guess (this file alone
+                               can't know if another file imports and
+                               calls it) - reported with lower confidence
 """
 import ast
 
@@ -36,25 +26,17 @@ TERMINATING_STATEMENTS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
 def _always_terminates(stmt):
     """
     True if executing this ONE statement is guaranteed to exit the
-    enclosing block, no matter what - either directly (a plain
-    return/raise/break/continue), or because every possible path through
-    it ends that way (an if/else where BOTH branches always terminate,
-    or a try/except where the try body AND every except handler always
-    terminate). This is what lets "if x: return a  else: return b" behave
-    like a single terminator for whatever code follows it.
-
-    Deliberately conservative: an if with no else is never treated as
-    terminating (the no-else path falls through), and a try's finally
-    block is ignored for this check - a finally that terminates would
-    make everything unreachable regardless of the try/except, which is
-    a much rarer pattern not worth the added complexity here.
+    enclosing block - either directly (a plain return/raise/break/
+    continue), or because every possible path through it ends that way
+    (an if/else where BOTH branches always terminate, or a try/except
+    where the try body AND every handler always terminate).
     """
     if isinstance(stmt, TERMINATING_STATEMENTS):
         return True
 
     if isinstance(stmt, ast.If):
         if not stmt.orelse:
-            return False  # no else branch - execution can fall through
+            return False
         return (
             bool(stmt.body) and _always_terminates(stmt.body[-1])
             and bool(stmt.orelse) and _always_terminates(stmt.orelse[-1])
@@ -80,14 +62,6 @@ def _get_source_segment(source_lines, node):
 
 
 def _find_unreachable_code(body, file_path, source_lines, findings):
-    """
-    Walks a list of statements (a function body, an if-branch, a loop
-    body, etc.). The moment a return/raise/break/continue is seen, every
-    statement after it in THIS SAME block is unreachable - report the
-    first one and stop (no point flagging every line after it too).
-    Still recurses into nested blocks that come BEFORE the terminator,
-    since those can have their own unreachable code independently.
-    """
     terminated = False
     for stmt in body:
         if terminated:
@@ -103,13 +77,11 @@ def _find_unreachable_code(body, file_path, source_lines, findings):
                 "cause": "This code comes right after a return, raise, break, or continue "
                          "in the same block, so it can never actually run.",
             })
-            return  # one finding per block is enough - don't flag every subsequent line too
+            return
 
         if _always_terminates(stmt):
             terminated = True
 
-        # Recurse into nested bodies so unreachable code INSIDE an if/for/while/try
-        # (that itself comes before any terminator at this level) still gets caught.
         for field in ("body", "orelse", "finalbody"):
             nested = getattr(stmt, field, None)
             if nested:
@@ -138,13 +110,113 @@ def detect(file_path: str, source: str):
 
     source_lines = source.splitlines()
     findings = []
+    defined_functions = {}
+    called_names = set()
 
     class Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.current_function = None
+
         def visit_FunctionDef(self, node):
+            defined_functions[node.name] = node
             _find_unreachable_code(node.body, file_path, source_lines, findings)
+
+            prev = self.current_function
+            self.current_function = node.name
+
+            for default in node.args.defaults:
+                if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                    findings.append({
+                        "file": file_path,
+                        "function": node.name,
+                        "line_start": node.lineno,
+                        "line_end": node.lineno,
+                        "rule": "mutable_default_arg",
+                        "error": "Mutable default argument",
+                        "bug_type": "Logic Error",
+                        "current_code": _get_source_segment(source_lines, node),
+                        "cause": "Using a mutable object (list/dict/set) as a default argument means it "
+                                 "is shared across every call, which usually isn't what was intended.",
+                    })
+
             self.generic_visit(node)
+            self.current_function = prev
 
         visit_AsyncFunctionDef = visit_FunctionDef
 
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Name):
+                called_names.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                called_names.add(node.func.attr)
+            self.generic_visit(node)
+
+        def visit_ExceptHandler(self, node):
+            if node.type is None:
+                findings.append({
+                    "file": file_path,
+                    "function": self.current_function,
+                    "line_start": node.lineno,
+                    "line_end": getattr(node, "end_lineno", node.lineno),
+                    "rule": "bare_except",
+                    "error": "Bare except clause",
+                    "bug_type": "Logic Error",
+                    "current_code": _get_source_segment(source_lines, node),
+                    "cause": "A bare 'except:' silently catches every exception, including ones that "
+                             "usually indicate a real bug (like KeyboardInterrupt or SystemExit).",
+                })
+            self.generic_visit(node)
+
+        def visit_Compare(self, node):
+            for op, comparator in zip(node.ops, node.comparators):
+                if isinstance(op, (ast.Eq, ast.NotEq)) and isinstance(comparator, ast.Constant) and comparator.value is None:
+                    findings.append({
+                        "file": file_path,
+                        "function": self.current_function,
+                        "line_start": node.lineno,
+                        "line_end": getattr(node, "end_lineno", node.lineno),
+                        "rule": "eq_none",
+                        "error": "Comparison to None using == / !=",
+                        "bug_type": "Logic Error",
+                        "current_code": _get_source_segment(source_lines, node),
+                        "cause": "Comparing to None with == or != usually works, but 'is'/'is not' is "
+                                 "the correct way since it can't be fooled by a custom __eq__.",
+                    })
+            self.generic_visit(node)
+
+        def visit_BinOp(self, node):
+            if isinstance(node.op, (ast.Div, ast.FloorDiv)) and not isinstance(node.right, ast.Constant):
+                findings.append({
+                    "file": file_path,
+                    "function": self.current_function,
+                    "line_start": node.lineno,
+                    "line_end": getattr(node, "end_lineno", node.lineno),
+                    "rule": "possible_division_by_zero",
+                    "error": "Possible Division by Zero",
+                    "bug_type": "Runtime Error",
+                    "current_code": _get_source_segment(source_lines, node),
+                    "cause": "The denominator is a variable or expression with no visible check that "
+                             "it isn't zero before this division happens.",
+                })
+            self.generic_visit(node)
+
     Visitor().visit(tree)
+
+    for name, node in defined_functions.items():
+        if name.startswith("_") or name in ("main", "__init__"):
+            continue
+        if name not in called_names:
+            findings.append({
+                "file": file_path,
+                "function": name,
+                "line_start": node.lineno,
+                "line_end": node.lineno,
+                "rule": "possibly_unused_function",
+                "error": "Possibly unused function",
+                "bug_type": "Unnecessary Code",
+                "current_code": _get_source_segment(source_lines, node)[:200],
+                "cause": f"'{name}' is not called anywhere else in this file. It may be used from "
+                         f"another file (this detector only sees one file at a time), or it may be dead code.",
+            })
+
     return findings
