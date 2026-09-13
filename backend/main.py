@@ -187,10 +187,12 @@ def scan_repo(req: ScanRequest):
 
                 bug_number += 1
                 reported_bug_type = analysis.get("bug_type", finding.get("bug_type", "Other"))
-                if reported_bug_type == "Unnecessary Code":
-                    # This detector only flags code that is provably dead
-                    # (unreachable after a return/throw) - it's a real bug,
-                    # just not shown as a separate category anymore.
+                if finding.get("rule") == "unreachable_code":
+                    # Only rename for the specific check that's actually about
+                    # dead/unreachable code - "possibly_unused_function" also
+                    # uses the "Unnecessary Code" bug_type but is a different,
+                    # separate concern (a function that might not be called
+                    # anywhere), so it must keep its own accurate label.
                     reported_bug_type = "Unreachable Code"
 
                 bug_reports.append(BugReport(
