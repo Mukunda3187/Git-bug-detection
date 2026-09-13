@@ -177,6 +177,7 @@ FALLBACK_CONFIDENCE_BY_RULE = {
     "empty_catch_block": 55,
     "leftover_console_statement": 90,
     "leftover_debugger_statement": 90,
+    "leftover_debug_print": 85,
     "unreachable_code": 95,  # deleting provably-dead code is always a safe, correct fix
 }
 DEFAULT_FALLBACK_CONFIDENCE = 40
@@ -291,6 +292,11 @@ def _fallback_report(finding: dict) -> dict:
         solution_type = "remove"
         solution_intro = "Remove this code from the file."
         action = "Delete this 'debugger' statement before shipping."
+
+    elif rule == "leftover_debug_print":
+        solution_type = "remove"
+        solution_intro = "Remove this code from the file."
+        action = "Delete this print statement before shipping, unless it's intentional program output."
 
     elif rule == "unreachable_code":
         solution_type = "remove"
