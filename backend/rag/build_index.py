@@ -28,7 +28,20 @@ INDEX_DIR = os.path.join(os.path.dirname(__file__), "index")
 
 
 def load_all_records():
-    """Load and validate all records from normalized datasets."""
+    """
+    Load and validate all records from normalized datasets.
+
+    Only `buggy_code` is required - it's the one field every normalizer
+    always fills in. `bug_description` is treated as optional: the real
+    normalize_bugs2fix.py and normalize_runbugrun.py scripts intentionally
+    leave it as None (CodeXGLUE/RunBugRun don't provide a natural-language
+    description), so requiring it here used to silently discard every
+    single record those two normalizers ever produced - the bundled
+    sample.jsonl (which does have descriptions) was the only dataset that
+    could ever make it into the index. When bug_description is missing we
+    synthesize a short one from bug_type/error/language instead of
+    dropping a perfectly usable record.
+    """
     records = []
     for path in glob.glob(os.path.join(DATASETS_DIR, "*.jsonl")):
         with open(path, "r", encoding="utf-8") as f:
@@ -38,14 +51,34 @@ def load_all_records():
                     continue
                 try:
                     record = json.loads(line)
-                    if not record.get("bug_description") or not record.get("buggy_code"):
-                        print(f"[build_index] Skipping malformed record in {os.path.basename(path)}:{line_num} - missing bug_description or buggy_code")
+                    if not record.get("buggy_code"):
+                        print(f"[build_index] Skipping malformed record in {os.path.basename(path)}:{line_num} - missing buggy_code")
                         continue
+                    if not record.get("bug_description"):
+                        record["bug_description"] = _synthesize_description(record)
                     records.append(record)
                 except json.JSONDecodeError as e:
                     print(f"[build_index] Skipping invalid JSON in {os.path.basename(path)}:{line_num}: {e}")
                     continue
     return records
+
+
+def _synthesize_description(record: dict) -> str:
+    """
+    Builds a short, honest fallback description for records whose source
+    dataset didn't provide one, so they still carry a non-empty
+    bug_description into the index instead of being dropped.
+    """
+    bug_type = record.get("bug_type")
+    error = record.get("error")
+    language = record.get("language") or "code"
+    if bug_type and error:
+        return f"A {bug_type.lower()} in {language} code: {error}"
+    if bug_type:
+        return f"A {bug_type.lower()} found in {language} code."
+    if error:
+        return f"{language} code that raises: {error}"
+    return f"A bug fixed in {language} code (see the before/after code for details)."
 
 
 def embedding_text(record: dict) -> str:
