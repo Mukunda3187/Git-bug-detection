@@ -14,17 +14,19 @@ GitHub URL -> Validate -> Download repo -> Scan files -> Detect candidates
 ## What's real vs. what needs one extra step
 
 Everything in this project runs and has been tested — the AST-based bug
-detector, the FastAPI backend, the FAISS retrieval mechanics, the frontend,
+detector, the FastAPI backend, the TF-IDF retrieval mechanics, the frontend,
 and the no-API-key fallback path. Two things need internet access on
 **your** machine (not available while this was built) before your first
 real run:
 
-1. **Downloading the embedding model** (`all-MiniLM-L6-v2`, ~90MB, from
-   Hugging Face) — happens automatically the first time you run the app.
-2. **Downloading the three real datasets** — a bundled 8-entry sample
+1. **Downloading the three real datasets** — a bundled 8-entry sample
    dataset (`datasets/normalized/sample.jsonl`) is included so the RAG
-   pipeline works out of the box. Run the scripts in step 4 below to swap
+   pipeline works out of the box. Run the scripts in step 3 below to swap
    in the real datasets before your demo.
+2. **Getting a Gemini API key** (see step 2 below) — without one, the app
+   still runs end-to-end, it just shows a transparent, rule-based fallback
+   explanation/fix instead of an LLM-generated one (clearly labeled in the
+   UI).
 
 ## 1. Install dependencies
 
@@ -37,8 +39,13 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# then open .env and paste your Anthropic API key
+# then open .env and paste your Google Gemini API key
 ```
+
+Get a free key from **https://aistudio.google.com/** — the app reads it
+from the `GEMINI_API_KEY` environment variable (you can also set
+`GEMINI_API_KEY_1` through `GEMINI_API_KEY_10` to rotate across multiple
+keys if you hit rate limits).
 
 Without a key, the app still runs — it just shows the raw static-analysis
 finding without LLM-generated explanations/fixes (clearly labeled in the
@@ -75,9 +82,9 @@ cd backend
 python -m rag.build_index
 ```
 
-This downloads the embedding model on first run, embeds every record, and
-writes `backend/rag/index/faiss.index` + `metadata.json`. Re-run this any
-time you change the normalized datasets. (If you skip this step, the
+This fits a TF-IDF vectorizer over every record, and
+writes `backend/rag/index/vectorizer.joblib` + `metadata.json`. Re-run this
+any time you change the normalized datasets. (If you skip this step, the
 backend builds it automatically on first scan request — but doing it
 ahead of time means your demo doesn't stall on the first click.)
 
@@ -113,13 +120,16 @@ project/
 │   ├── models.py                # Shared Pydantic schemas
 │   ├── github_handler.py        # URL validation + repo download
 │   ├── file_scanner.py          # Recursive source file discovery
-│   ├── llm_client.py            # Calls the LLM with RAG context
+│   ├── llm_client.py            # Calls the LLM (Gemini) with RAG context
 │   ├── detectors/
-│   │   └── python_detector.py   # Real AST-based bug detector
+│   │   ├── python_detector.py   # Real AST-based bug detector (Python)
+│   │   ├── js_detector.py       # Structural + heuristic checks (JS/JSX/TS/TSX)
+│   │   ├── cfamily_detector.py  # Structural + heuristic checks (Java/C/C++/C#/Go/PHP)
+│   │   └── syntax_balance.py    # Shared bracket/string/comment balance engine
 │   ├── rag/
-│   │   ├── build_index.py       # Builds the FAISS index
+│   │   ├── build_index.py       # Builds the TF-IDF index
 │   │   ├── retriever.py         # Similarity search at scan time
-│   │   └── index/                # Generated - faiss.index + metadata.json
+│   │   └── index/                # Generated - vectorizer.joblib + metadata.json
 │   ├── requirements.txt
 │   └── .env.example
 ├── frontend/
@@ -136,13 +146,17 @@ project/
 
 ## Honest limitations (say these in your viva, don't hide them)
 
-- Only Python has a real static-analysis detector in this build (the
-  file scanner recognizes JS/TS/Java/C/C++/C#/Go/PHP files for the
-  "scan the whole repo" requirement, but `detectors/` currently only has
-  `python_detector.py`). Adding another language means writing a new
-  detector file — the plumbing in `main.py` already supports it via the
-  `DETECTORS_BY_EXTENSION` dict.
-- The detector uses real AST analysis for a fixed set of patterns
+- Python has a real AST-based static-analysis detector; JavaScript/JSX/
+  TypeScript/TSX and Java/C/C++/C#/Go/PHP have a structural syntax-balance
+  checker (unclosed/mismatched brackets, unterminated strings/comments,
+  unreachable code) plus a handful of precise pattern-based heuristics
+  (loose equality, `var`, empty catch blocks, leftover debug statements) —
+  see the docstrings in `detectors/js_detector.py` and
+  `detectors/cfamily_detector.py` for exactly what is and isn't covered.
+  None of these are full parsers or compilers, so they can't catch
+  language-specific type errors, undeclared variables, or anything that
+  needs real semantic analysis.
+- The Python detector uses real AST analysis for a fixed set of patterns
   (division by zero, bare except, mutable default args, `== None`,
   possibly-unused functions). It is not a general-purpose bug finder —
   no static analyzer is. This matches the abstract's own point: report
@@ -150,6 +164,13 @@ project/
 - "Possibly unused function" is a same-file heuristic — it can't see
   whether another file imports and calls that function, so it's
   reported at lower confidence for exactly that reason.
+- The RAG retriever uses TF-IDF (scikit-learn), not neural embeddings —
+  see `rag/build_index.py`'s docstring for why (lighter, faster, fully
+  offline, no PyTorch/Hugging Face download needed on a constrained host).
+  This is a real trade-off: TF-IDF matches on shared vocabulary, not
+  semantic meaning, so retrieval quality depends more on wording overlap
+  between the candidate finding and the knowledge base than a neural
+  embedding model would need.
 - The RAG knowledge base quality depends entirely on which datasets you
   build it from. The bundled sample has 8 hand-written entries just to
   prove the pipeline works — build the real datasets (step 3) before
