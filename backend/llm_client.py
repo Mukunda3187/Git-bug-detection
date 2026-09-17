@@ -16,6 +16,7 @@ already found.
 import json
 import math
 import os
+import re
 
 import requests
 
@@ -182,6 +183,89 @@ FALLBACK_CONFIDENCE_BY_RULE = {
 }
 DEFAULT_FALLBACK_CONFIDENCE = 40
 
+# Matches a single-line-signature mutable default like "bucket=[]", "cfg={}",
+# or "seen=set()" - covers the common case the fallback path can fix safely
+# without a real parser (multi-line signatures are left alone, see below).
+MUTABLE_DEFAULT_RE = re.compile(r"(\w+)\s*=\s*(\[\]|\{\}|set\(\))")
+
+# Matches an empty catch block, with or without a captured error variable,
+# e.g. "catch (err) {}", "catch (Exception e) {}", or "catch {}".
+EMPTY_CATCH_WITH_PARAM_RE = re.compile(r"catch\s*\(([^)]*)\)\s*\{\s*\}")
+EMPTY_CATCH_NO_PARAM_RE = re.compile(r"catch\s*\{\s*\}")
+
+CATCH_LOG_STATEMENT_BY_EXTENSION = {
+    ".js": "console.error({var});", ".jsx": "console.error({var});",
+    ".ts": "console.error({var});", ".tsx": "console.error({var});",
+    ".java": "{var}.printStackTrace();",
+    ".cs": "Console.WriteLine({var});",
+    ".cpp": "std::cerr << {var}.what() << std::endl;",
+    ".php": "error_log({var}->getMessage());",
+}
+
+
+def _fix_mutable_default_arg(current_code: str):
+    """
+    Mechanically rewrites a one-line function signature with a mutable
+    default argument into the safe None-default pattern, e.g.:
+        def add_item(item, bucket=[]):        ->  def add_item(item, bucket=None):
+            bucket.append(item)                        if bucket is None:
+                                                            bucket = []
+                                                        bucket.append(item)
+    Returns None (never a half-applied guess) when the default can't be
+    confidently located, so the caller can fall back to plain-text advice
+    instead of claiming code is shown when it isn't.
+    """
+    lines = current_code.splitlines()
+    if not lines:
+        return None
+
+    match = MUTABLE_DEFAULT_RE.search(lines[0])
+    if not match:
+        return None
+
+    param_name, literal = match.group(1), match.group(2)
+    default_value = {"[]": "[]", "{}": "{}", "set()": "set()"}[literal]
+    new_signature = lines[0][:match.start()] + f"{param_name}=None" + lines[0][match.end():]
+
+    body_lines = lines[1:]
+    indent = "    "
+    if body_lines:
+        stripped = body_lines[0].lstrip()
+        indent = body_lines[0][:len(body_lines[0]) - len(stripped)] or indent
+
+    guard = [f"{indent}if {param_name} is None:", f"{indent}    {param_name} = {default_value}"]
+    return "\n".join([new_signature] + guard + body_lines)
+
+
+def _fix_empty_catch(current_code: str, file_path: str):
+    """
+    Mechanically rewrites a one-line empty catch block into one that logs
+    the error, using a log statement appropriate to the file's language
+    (inferred from its extension) and re-using whatever variable name the
+    catch clause already captured. Returns None if no empty catch pattern
+    is found, rather than guessing.
+    """
+    ext = os.path.splitext(file_path or "")[1]
+    log_template = CATCH_LOG_STATEMENT_BY_EXTENSION.get(ext)
+    if not log_template:
+        return None
+
+    match = EMPTY_CATCH_WITH_PARAM_RE.search(current_code)
+    if match:
+        param_str = match.group(1).strip()
+        var_match = re.search(r"(\$?\w+)\s*$", param_str)
+        var_name = var_match.group(1) if var_match else "e"
+        log_stmt = log_template.format(var=var_name)
+        return current_code[:match.start()] + f"catch ({param_str}) {{ {log_stmt} }}" + current_code[match.end():]
+
+    match = EMPTY_CATCH_NO_PARAM_RE.search(current_code)
+    if match:
+        var_name = "err" if ext in (".js", ".jsx", ".ts", ".tsx") else "e"
+        log_stmt = log_template.format(var=var_name)
+        return current_code[:match.start()] + f"catch ({var_name}) {{ {log_stmt} }}" + current_code[match.end():]
+
+    return None
+
 
 def _fallback_report(finding: dict) -> dict:
     """Used when no LLM reasoning is available - either no API key is configured, or the
@@ -219,9 +303,18 @@ def _fallback_report(finding: dict) -> dict:
         action = "Replace the bare 'except:' with 'except Exception as e:' so real errors aren't silently hidden."
 
     elif rule == "mutable_default_arg":
-        solution_type = "replace"
-        solution_intro = "Replace the given code with the new code shown below."
-        action = "Change the default value to None, then create a new list/dict inside the function body."
+        replacement_code = _fix_mutable_default_arg(current_code)
+        if replacement_code:
+            solution_type = "replace"
+            solution_intro = "Replace the given code with the new code shown below."
+            action = "Change the default value to None, then create a new list/dict/set inside the function body."
+        else:
+            # Couldn't mechanically locate the mutable default in the captured
+            # snippet (e.g. a multi-line signature) - never claim code is
+            # "shown below" and then show nothing.
+            solution_type = "add"
+            solution_intro = "This function uses a mutable default argument, which is unsafe."
+            action = "Change the default value to None, then add 'if <param> is None: <param> = []' (or {}/set()) as the first line of the function body."
 
     elif rule == "eq_none":
         solution_type = "replace"
@@ -279,9 +372,15 @@ def _fallback_report(finding: dict) -> dict:
         action = "Change 'var' to 'let' (or 'const' if this value is never reassigned)."
 
     elif rule == "empty_catch_block":
-        solution_type = "replace"
-        solution_intro = "Replace the given code with the new code shown below."
-        action = "Add at least a console.error(err) inside the catch block so failures aren't silently swallowed."
+        replacement_code = _fix_empty_catch(current_code, finding.get("file", ""))
+        if replacement_code:
+            solution_type = "replace"
+            solution_intro = "Replace the given code with the new code shown below."
+            action = "Log or handle the caught error instead of silently swallowing it."
+        else:
+            solution_type = "add"
+            solution_intro = "This catch block does nothing, so failures are silently swallowed."
+            action = "Add at least a log statement (e.g. console.error(err)) inside the catch block."
 
     elif rule == "leftover_console_statement":
         solution_type = "remove"
