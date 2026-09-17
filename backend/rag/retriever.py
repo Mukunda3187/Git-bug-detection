@@ -1,7 +1,9 @@
 """
 Loads the RAG index and metadata. Supports both:
-1. FAISS + semantic embeddings (if sentence-transformers available)
-2. TF-IDF fallback (lightweight, works everywhere)
+1. FAISS + semantic embeddings (if sentence-transformers AND faiss are
+   installed - both are optional extras, not in requirements.txt)
+2. TF-IDF fallback (lightweight, works everywhere - this is what actually
+   runs by default, see build_index.py for why)
 
 If the index hasn't been built yet, this module builds it automatically
 from whatever is in datasets/normalized/.
@@ -20,8 +22,14 @@ _model = None
 _vectorizer = None
 _use_semantic = False
 
-# Semantic embeddings are disabled on Render.
-# We use the lightweight TF-IDF retriever instead.
+# Semantic embeddings are disabled by default (they need sentence-transformers
+# + faiss, which aren't in requirements.txt, and are unreliable on a
+# free-tier host - see build_index.py's docstring). The lightweight TF-IDF
+# retriever is used instead. Flip this to True only after adding both
+# packages to requirements.txt - both SentenceTransformer and faiss are
+# imported lazily inside _load()/_retrieve_semantic() below precisely so
+# this flag is safe to toggle without a NameError if the packages are
+# actually installed.
 _SEMANTIC_AVAILABLE = False
 
 
