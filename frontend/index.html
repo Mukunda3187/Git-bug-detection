@@ -323,7 +323,18 @@
     color: var(--text-dim);
     font-size: 11px;
     margin-top: 50px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    line-height: 1.7;
   }
+
+  footer strong { color: var(--text); }
+
+  footer a {
+    color: var(--retrieval);
+    text-decoration: none;
+  }
+  footer a:hover { text-decoration: underline; }
 
   @media (max-width: 640px) {
     .summary-grid { grid-template-columns: repeat(3, 1fr); }
@@ -350,6 +361,12 @@
 
   <div id="summary-holder"></div>
   <div id="results-holder"></div>
+
+  <footer>
+    <strong>⚠ Check before editing code.</strong> Every finding here comes from static analysis plus an LLM guess — it can be wrong, incomplete, or miss context only you have. Review each suggested fix yourself before applying it, especially anything marked "not fully sure" above.
+    <br>
+    RAG-Enhanced LLM for GitHub Bug Detection and Recovery — a mini project, not a substitute for code review.
+  </footer>
 
 </div>
 
