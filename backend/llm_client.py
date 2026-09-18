@@ -84,7 +84,12 @@ For each reported issue, provide a response with:
    - Keep variable names and structure identical
    - Only modify the problematic part
    - Ensure it's production-ready and handles edge cases
-4. **action**: One specific sentence describing what to do (e.g., "Replace line 42 with the corrected code" or "Add this try-except block after the variable assignment").
+4. **solution**: ONE clear, complete, specific passage (2-4 sentences) that fully explains the fix -
+   what exactly to change or do, in concrete terms tied to this exact code (line numbers, variable
+   names, the exact characters involved), not generic advice that could apply to any bug of this
+   type. This is the ONLY place the person reads for "what do I do" - do not split this into a vague
+   intro plus a separate action elsewhere; say everything they need in this one passage. If the fix
+   is a code replacement, describe what changed and why, since the code itself is also shown separately.
 5. **explanation**: Provide a brief technical explanation of why the fix works.
 6. **confidence**: An integer from 0 to 100 for THIS SPECIFIC finding, reflecting how confident you are that
    (a) this is genuinely a real, correctly-diagnosed problem given the code and context shown, and
@@ -109,11 +114,10 @@ Reply with ONLY a JSON object, no markdown fences or extra text:
   "cause": string,
   "why_occurs": string,
   "solution_type": one of ["replace","add","remove","create_file"],
-  "solution_intro": string,
+  "solution": string,
   "replacement_code": string or null,
   "add_location": string or null,
   "new_file_path": string or null,
-  "action": string,
   "explanation": string,
   "confidence": integer from 0 to 100,
   "insufficient_evidence": boolean
@@ -182,6 +186,16 @@ FALLBACK_CONFIDENCE_BY_RULE = {
     "unreachable_code": 95,  # deleting provably-dead code is always a safe, correct fix
 }
 DEFAULT_FALLBACK_CONFIDENCE = 40
+
+# Pulls the exact character(s) the detector already identified out of its
+# "error" string, so the fallback solution can name them specifically
+# ("add the missing '}'") instead of falling back to generic advice
+# ("check every bracket near this line") when the detector already knows
+# precisely which bracket and which problem this is.
+UNCLOSED_CHAR_RE = re.compile(r"Unclosed '(.)'")
+MISMATCHED_CHARS_RE = re.compile(r"found '(.)', expected '(.)'")
+UNEXPECTED_CHAR_RE = re.compile(r"Unexpected '(.)'")
+BRACKET_CLOSER = {"(": ")", "[": "]", "{": "}"}
 
 # Matches a single-line-signature mutable default like "bucket=[]", "cfg={}",
 # or "seen=set()" - covers the common case the fallback path can fix safely
@@ -273,146 +287,158 @@ def _fallback_report(finding: dict) -> dict:
     shown directly to the end user - technical failure details are logged to the server
     console instead (see analyze_finding), never shown in the UI.
 
-    Every rule every detector can produce gets a real, specific template here -
-    no rule should ever fall through to a generic "review and fix it" message.
+    Every rule every detector can produce gets a real, specific template here - no rule
+    should ever fall through to a generic "review and fix it" message. Each one sets a
+    single `solution` string that stands completely on its own (what's wrong here,
+    specifically, and exactly what to do about it) rather than the old split between a
+    generic intro sentence and a separate action sentence - for the three bracket rules
+    in particular, that generic intro used to be the same wording no matter which
+    specific bracket or which specific problem the detector had already identified, even
+    though that exact detail (which character, unclosed vs mismatched vs unexpected) was
+    sitting right there in the detector's own `error` string. This pulls it out and names
+    it directly instead of leaving the person to re-derive it from the code themselves.
     """
     rule = finding.get("rule", "")
     bug_type = finding.get("bug_type", "Other")
     current_code = finding.get("current_code", "") or ""
+    error_text = finding.get("error", "") or ""
     cause_from_detector = finding.get("cause", "")
 
     # Defaults - overridden below per rule. solution_type "replace" needs
     # replacement_code; "remove" and "add" generally don't need it filled in
     # for a deterministic fallback since there's nothing left to guess.
     solution_type = "replace"
-    solution_intro = ""
-    action = ""
+    solution = ""
     replacement_code = None
     add_location = None
     cause = cause_from_detector
 
     if rule == "possibly_unused_function":
         solution_type = "remove"
-        solution_intro = "Remove this code from the file."
-        action = "Delete this unused function."
+        solution = "Delete this function. It isn't called anywhere else in this file, so removing it has no effect on behavior - if it turns out to be used from another file this detector can't see, undo the deletion instead of guessing."
 
     elif rule == "bare_except":
         solution_type = "replace"
-        solution_intro = "Replace the given code with the new code shown below."
         replacement_code = current_code.replace("except:", "except Exception as e:", 1)
-        action = "Replace the bare 'except:' with 'except Exception as e:' so real errors aren't silently hidden."
+        solution = "Replace the bare 'except:' with 'except Exception as e:', as shown below. A bare except also catches things like KeyboardInterrupt and SystemExit, which should almost never be silently swallowed - naming Exception avoids that while still catching ordinary errors."
 
     elif rule == "mutable_default_arg":
         replacement_code = _fix_mutable_default_arg(current_code)
         if replacement_code:
             solution_type = "replace"
-            solution_intro = "Replace the given code with the new code shown below."
-            action = "Change the default value to None, then create a new list/dict/set inside the function body."
+            solution = "Replace this signature with the version below: change the default to None, then create a fresh list/dict/set inside the function body on first use. The current version reuses the SAME object across every call, so items added in one call silently show up in the next."
         else:
             # Couldn't mechanically locate the mutable default in the captured
             # snippet (e.g. a multi-line signature) - never claim code is
             # "shown below" and then show nothing.
             solution_type = "add"
-            solution_intro = "This function uses a mutable default argument, which is unsafe."
-            action = "Change the default value to None, then add 'if <param> is None: <param> = []' (or {}/set()) as the first line of the function body."
+            solution = "Change the default value to None, then add 'if <param> is None: <param> = []' (or {} / set(), matching whatever the original default was) as the first line inside the function body. This function's mutable default is currently shared across every call to it, which usually isn't intended."
 
     elif rule == "eq_none":
         solution_type = "replace"
-        solution_intro = "Replace the given code with the new code shown below."
         replacement_code = current_code.replace("== None", "is None").replace("!= None", "is not None")
-        action = "Use 'is None' / 'is not None' instead of '==' / '!=' when comparing to None."
+        solution = "Replace '==' / '!=' with 'is' / 'is not' when comparing to None, as shown below. 'is' checks identity directly and can't be fooled by a custom __eq__ method, which is why it's the correct way to check for None in Python."
 
     elif rule == "possible_division_by_zero":
         solution_type = "add"
-        solution_intro = "Add a check for zero before this line, as shown below."
         add_location = "Add this check on the line right before the division."
         replacement_code = "if denominator != 0:  # replace 'denominator' with your actual variable name"
-        action = "Add a zero-check before dividing, so the program doesn't crash if the value is zero."
+        solution = "Add a check that the denominator isn't zero before this line runs (see the line to add below), and decide what should happen when it is - skip the calculation, return a default value, or raise a clear error instead of letting the program crash with a ZeroDivisionError."
 
     elif rule == "syntax_error":
         solution_type = "replace"
-        solution_intro = "There is a Python syntax error on this line that needs to be fixed by hand."
         cause = f"Python's own parser could not read this code. The exact reason it gave was: \"{cause_from_detector}\"."
-        action = f"Look closely at this line and fix the syntax issue Python reported: {cause_from_detector}."
+        solution = f"Edit this line to fix the specific problem Python's parser reported: {cause_from_detector}. The file won't run at all until this is fixed, since Python can't even finish reading it - after editing, re-run the file (or 'python -m py_compile <file>') to confirm it now parses cleanly."
 
-    elif rule in ("unclosed_bracket", "mismatched_bracket", "unexpected_closing_bracket"):
+    elif rule == "unclosed_bracket":
         solution_type = "replace"
-        solution_intro = "There is a bracket that doesn't match up correctly - fix it by hand at the location shown."
-        action = "Check every '{', '(' and '[' near this line and make sure each one has a matching closing bracket in the right order."
+        m = UNCLOSED_CHAR_RE.search(error_text)
+        opener = m.group(1) if m else "{"
+        closer = BRACKET_CLOSER.get(opener, "}")
+        solution = (
+            f"A '{opener}' was opened here but is never closed anywhere in the rest of the file. "
+            f"Add the missing '{closer}' at the point where this block, function call, or expression "
+            f"is meant to end - if you're not sure exactly where, work outward from this line counting "
+            f"'{opener}' and '{closer}' until you find the spot where one is missing."
+        )
+
+    elif rule == "mismatched_bracket":
+        solution_type = "replace"
+        m = MISMATCHED_CHARS_RE.search(error_text)
+        found, expected = (m.group(1), m.group(2)) if m else ("?", "?")
+        solution = (
+            f"This should be a closing '{expected}' to match the bracket opened earlier, but '{found}' "
+            f"appears instead. Either replace it with '{expected}', or - if '{found}' is actually correct "
+            f"here - check whether an earlier bracket in this block was closed at the wrong spot, since "
+            f"that would make this one line up with the wrong opener."
+        )
+
+    elif rule == "unexpected_closing_bracket":
+        solution_type = "replace"
+        m = UNEXPECTED_CHAR_RE.search(error_text)
+        closer = m.group(1) if m else "}"
+        solution = (
+            f"This '{closer}' has no matching opening bracket anywhere before it in the file. Either "
+            f"delete this extra '{closer}', or - if it's meant to close something real - add the missing "
+            f"opening bracket earlier in the code where that block, call, or expression actually starts."
+        )
 
     elif rule == "unterminated_string":
         solution_type = "replace"
-        solution_intro = "A text string on this line is missing its closing quote."
-        action = "Add the missing closing quote (matching the one that opened the string) at the end of the text."
+        solution = "Add the missing closing quote at the end of this string - it needs to match whichever quote character (' or \") opened it. A string can't span multiple lines unless it's a template literal (backticks) or a triple-quoted string, so a missing quote here usually means the string was meant to end on this same line."
 
     elif rule == "unterminated_template_literal":
         solution_type = "replace"
-        solution_intro = "A template string (using backticks) on this line is missing its closing backtick."
-        action = "Add the missing closing backtick ( ` ) to complete the template string."
+        solution = "Add the missing closing backtick (`) to complete this template string. Every backtick that opens a template literal needs exactly one matching backtick to close it - count the backticks on this line and nearby lines to find where one was left out."
 
     elif rule == "unterminated_comment":
         solution_type = "replace"
-        solution_intro = "A block comment was opened here but never closed."
-        action = "Add the missing */ to close this comment block."
+        solution = "Add the missing */ to close this comment block. Until it's closed, every line after it in the file is silently treated as part of the comment, which can hide real code from the compiler without any warning - so check that nothing important got swallowed once this is fixed."
 
     elif rule == "loose_equality":
         solution_type = "replace"
-        solution_intro = "Replace the given code with the new code shown below."
         if "!=" in current_code:
             replacement_code = current_code.replace("!=", "!==")
-            action = "Change '!=' to '!==' so values are compared without unexpected type conversion."
+            solution = "Change '!=' to '!==', as shown below. '!=' compares values after converting them to a common type first, which can make surprisingly different values look equal (e.g. 0 != \"0\" is false) - '!==' compares type and value together with no conversion."
         else:
             replacement_code = current_code.replace("==", "===")
-            action = "Change '==' to '===' so values are compared without unexpected type conversion."
+            solution = "Change '==' to '===', as shown below. '==' compares values after converting them to a common type first, which can make surprisingly different values look equal (e.g. 0 == \"0\" is true) - '===' compares type and value together with no conversion."
 
     elif rule == "var_declaration":
         solution_type = "replace"
-        solution_intro = "Replace the given code with the new code shown below."
         replacement_code = current_code.replace("var ", "let ", 1)
-        action = "Change 'var' to 'let' (or 'const' if this value is never reassigned)."
+        solution = "Change 'var' to 'let' (or 'const' if this value is never reassigned), as shown below. 'var' is function-scoped and hoisted, which can let a variable leak out of the block it looks like it belongs to - 'let'/'const' are block-scoped and avoid that entire class of bug."
 
     elif rule == "empty_catch_block":
         replacement_code = _fix_empty_catch(current_code, finding.get("file", ""))
         if replacement_code:
             solution_type = "replace"
-            solution_intro = "Replace the given code with the new code shown below."
-            action = "Log or handle the caught error instead of silently swallowing it."
+            solution = "Replace this with the version below, which logs the caught error instead of silently discarding it. Right now, if this code ever throws, the failure disappears with no log, no fallback, and no way to know it happened."
         else:
             solution_type = "add"
-            solution_intro = "This catch block does nothing, so failures are silently swallowed."
-            action = "Add at least a log statement (e.g. console.error(err)) inside the catch block."
+            solution = "Add at least a log statement (e.g. console.error(err), or the equivalent for this language) inside the catch block. Right now this catch block does nothing, so if the wrapped code ever throws, the failure is silently discarded with no trace of it happening."
 
     elif rule == "leftover_console_statement":
         solution_type = "remove"
-        solution_intro = "Remove this code from the file."
-        action = "Delete this console.log/debug statement before shipping."
+        solution = "Delete this console.log/debug statement before shipping. It's harmless in production but usually isn't meant to ship, and can leak internal data into the browser console - if it's intentional logging rather than a debugging leftover, it's fine to leave as-is."
 
     elif rule == "leftover_debugger_statement":
         solution_type = "remove"
-        solution_intro = "Remove this code from the file."
-        action = "Delete this 'debugger' statement before shipping."
+        solution = "Delete this 'debugger' statement before shipping. It pauses execution in any browser with developer tools open, which is almost always leftover from debugging rather than something meant to run in production."
 
     elif rule == "leftover_debug_print":
         solution_type = "remove"
-        solution_intro = "Remove this code from the file."
-        action = "Delete this print statement before shipping, unless it's intentional program output."
+        solution = "Delete this print statement before shipping, unless it's intentional program output (e.g. a CLI tool's actual result) rather than a debugging leftover - if you're not sure which it is, check whether removing it would change what the program is supposed to display to a real user."
 
     elif rule == "unreachable_code":
         solution_type = "remove"
-        solution_intro = "Remove this code from the file."
-        action = "Delete this code - it can never run, so it isn't doing anything."
-
-    elif rule in ("unclosed_bracket", "mismatched_bracket", "unexpected_closing_bracket"):
-        solution_type = "replace"
-        solution_intro = "There is a bracket that doesn't match up correctly - fix it by hand at the location shown."
-        action = "Check every '{', '(' and '[' near this line and make sure each one has a matching closing bracket in the right order."
+        solution = "Delete this code. It sits right after a return, throw, or a branch that always exits, so it can never actually execute - removing it has no effect on the program's behavior, since it never ran in the first place."
 
     else:
         # Should not normally be reached - every known rule is handled above -
         # but keep a safe, honest fallback for any future/unknown rule.
         solution_type = "replace"
-        solution_intro = "We could not prepare an automatic fix for this one right now - please look at the code below and fix it yourself."
-        action = "Review this code and fix it yourself."
+        solution = "We couldn't prepare an automatic fix for this one - review the code below and apply the fix yourself, using the cause above as a starting point."
 
     return {
         "error": finding.get("error", "Possible issue"),
@@ -420,11 +446,10 @@ def _fallback_report(finding: dict) -> dict:
         "cause": cause or "Something in this code looks like it could cause a problem.",
         "why_occurs": "",
         "solution_type": solution_type,
-        "solution_intro": solution_intro,
+        "solution": solution,
         "replacement_code": replacement_code,
         "add_location": add_location,
         "new_file_path": None,
-        "action": action,
         "explanation": "",
         "confidence": FALLBACK_CONFIDENCE_BY_RULE.get(rule, DEFAULT_FALLBACK_CONFIDENCE),
         "insufficient_evidence": True,
@@ -516,6 +541,13 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
                     # Validate that replacement_code is not empty for "replace" solutions
                     if result.get("solution_type") == "replace" and not result.get("replacement_code"):
                         print(f"[llm_client] Gemini returned empty replacement_code for replace solution. Using fallback.")
+                        return _fallback_report(finding)
+
+                    # A missing/empty solution would mean the one thing the person
+                    # actually opens this report to read is blank - never let that
+                    # reach the frontend silently.
+                    if not (result.get("solution") or "").strip():
+                        print(f"[llm_client] Gemini returned an empty solution field. Using fallback.")
                         return _fallback_report(finding)
 
                     # Gemini occasionally omits confidence despite the instruction, or
