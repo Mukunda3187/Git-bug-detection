@@ -40,12 +40,16 @@ class BugReport(BaseModel):
     cause: str
     why_occurs: Optional[str] = None
     solution_type: str = "replace"    # "replace" | "add" | "remove" | "create_file"
-    solution_intro: str = ""          # required first sentence, e.g. "Replace the given code with the new code shown below."
+    solution: str = ""                # the complete, specific fix explanation - what's wrong at this
+                                       # exact spot and what to do about it, in one clear passage.
+                                       # (Merged from what used to be two separate fields - a generic
+                                       # "solution_intro" sentence plus a separate "action" sentence -
+                                       # into one, so every finding gets a single precise answer
+                                       # instead of two sentences that often repeated each other.)
     current_code: str
     replacement_code: Optional[str] = None
     add_location: Optional[str] = None   # human description of where to add code, for solution_type == "add"
     new_file_path: Optional[str] = None  # for solution_type == "create_file"
-    action: str = ""                     # final one-line action sentence
     explanation: Optional[str] = None
     confidence: int = 70          # 0-100, how confident the system is in THIS specific finding's fix
     retrieved_bugs: List[RetrievedBug] = []
