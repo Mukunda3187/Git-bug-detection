@@ -411,7 +411,7 @@ function renderCodeBlock(code, cssClass) {
 }
 
 function renderSolutionBlock(bug) {
-  const intro = bug.solution_intro ? `<div class="cause-text">${escapeHtml(bug.solution_intro)}</div>` : "";
+  const intro = bug.solution ? `<div class="cause-text">${escapeHtml(bug.solution)}</div>` : "";
 
   if (bug.solution_type === "add") {
     return `
@@ -470,9 +470,6 @@ function renderBugCard(bug) {
 
         <div class="field-label">Solution</div>
         ${renderSolutionBlock(bug)}
-
-        <div class="field-label">What To Do</div>
-        <div class="explanation-text">${escapeHtml(bug.action)}</div>
 
         ${bug.insufficient_evidence ? `
           <div class="simple-note">We are not fully sure this is a real problem, so please check it yourself before making any changes.</div>
