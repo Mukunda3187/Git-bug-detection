@@ -208,12 +208,11 @@ def scan_repo(req: ScanRequest):
                     cause=analysis.get("cause", finding.get("cause", "")),
                     why_occurs=analysis.get("why_occurs"),
                     solution_type=analysis.get("solution_type", "replace"),
-                    solution_intro=analysis.get("solution_intro", ""),
+                    solution=analysis.get("solution", ""),
                     current_code=finding.get("current_code", ""),
                     replacement_code=analysis.get("replacement_code"),
                     add_location=analysis.get("add_location"),
                     new_file_path=analysis.get("new_file_path"),
-                    action=analysis.get("action", ""),
                     explanation=analysis.get("explanation"),
                     confidence=_clamp_confidence(analysis.get("confidence")),
                     retrieved_bugs=[
