@@ -351,7 +351,6 @@
     }
     .bug-card:hover { border-color: rgba(255, 255, 255, 0.16); }
     .bug-card.type-syntax { border-top-color: var(--removed); }
-    .bug-card.type-unnecessary { border-top-color: var(--warn); }
 
     .bug-head {
       padding: 16px 20px;
@@ -388,7 +387,6 @@
       white-space: nowrap;
     }
     .badge.type-syntax { color: #fda4af; border-color: var(--removed-border); background: var(--removed-bg); }
-    .badge.type-unnecessary { color: #fde68a; border-color: var(--warn-border); background: var(--warn-bg); }
     .badge.confidence-high { color: #a7f3d0; border-color: var(--added-border); background: var(--added-bg); }
     .badge.confidence-medium { color: #fde68a; border-color: var(--warn-border); background: var(--warn-bg); }
     .badge.confidence-low { color: #fda4af; border-color: var(--removed-border); background: var(--removed-bg); }
@@ -548,7 +546,6 @@
     <span class="sample-pill" onclick="setSample('https://github.com/psf/requests')">psf/requests</span>
     <span class="sample-pill" onclick="setSample('https://github.com/fastapi/fastapi')">fastapi/fastapi</span>
   </div>
-  
   <div class="hint">Works on any public GitHub repo. Private repos need auth this build doesn't set up.</div>
 
   <div id="status-line"></div>
@@ -651,21 +648,20 @@ function toggleHistory(id) {
   if (toggle) toggle.textContent = isHidden ? "▴ See less" : "▾ See more — similar bug in our dataset";
 }
 
-// bug_type is real data (e.g. "Syntax Error", "Unnecessary Code", "Logic Error", "Other") -
-// this maps it to a CSS suffix used for both the card's top border and its badge color.
-// Anything not explicitly "syntax"-like or "unnecessary" falls back to the neutral accent
-// color rather than guessing at a severity this API doesn't actually report.
+// This site identifies bugs, full stop - it doesn't sort findings into "real
+// bugs" vs a separate "unnecessary code" bucket. bug_type (e.g. "Syntax
+// Error", "Logic Error") only decides visual emphasis for the most certain
+// case (a real syntax error, i.e. this file won't even run) - everything
+// else gets the same neutral "this is a bug" treatment.
 function typeClass(bugType) {
   const t = (bugType || "").toLowerCase();
   if (t.includes("syntax")) return "type-syntax";
-  if (t.includes("unnecessary")) return "type-unnecessary";
   return "";
 }
 
 function typeIcon(bugType) {
   const t = (bugType || "").toLowerCase();
   if (t.includes("syntax")) return "🔴";
-  if (t.includes("unnecessary")) return "🟡";
   return "🟠";
 }
 
