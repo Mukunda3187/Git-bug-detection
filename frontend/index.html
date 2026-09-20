@@ -1,358 +1,545 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Git Bug Scanner</title>
-<link rel="icon" type="image/png" href="/icon.png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #0c0f13;
-    --panel: #12161c;
-    --panel-raised: #171c23;
-    --border: #232a33;
-    --text: #dfe4ea;
-    --text-dim: #8891a0;
-    --added: #3fb950;
-    --added-bg: rgba(63, 185, 80, 0.10);
-    --removed: #f85149;
-    --removed-bg: rgba(248, 81, 73, 0.10);
-    --warn: #d29922;
-    --retrieval: #a371f7;
-    --crit: #ff6b6b;
-    --radius: 6px;
-  }
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RAG Bug Scanner — AI Static Analysis</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #07090e;
+      --panel: rgba(16, 21, 31, 0.7);
+      --panel-solid: #0e131d;
+      --panel-raised: rgba(23, 30, 44, 0.85);
+      --border: rgba(255, 255, 255, 0.08);
+      --border-focus: rgba(167, 139, 250, 0.5);
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
 
-  * { box-sizing: border-box; }
+      --accent: #8b5cf6;
+      --accent-glow: rgba(139, 92, 246, 0.35);
+      --accent-light: #c4b5fd;
 
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'JetBrains Mono', monospace;
-    line-height: 1.5;
-  }
+      --added: #10b981;
+      --added-bg: rgba(16, 185, 129, 0.08);
+      --added-border: rgba(16, 185, 129, 0.25);
 
-  h1, h2, h3, .display {
-    font-family: 'Space Grotesk', sans-serif;
-  }
+      --removed: #f43f5e;
+      --removed-bg: rgba(244, 63, 94, 0.08);
+      --removed-border: rgba(244, 63, 94, 0.25);
 
-  .shell {
-    max-width: 980px;
-    margin: 0 auto;
-    padding: 40px 20px 100px;
-  }
+      --warn: #f59e0b;
+      --warn-bg: rgba(245, 158, 11, 0.08);
+      --warn-border: rgba(245, 158, 11, 0.25);
 
-  header.top {
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 28px;
-    margin-bottom: 32px;
-  }
+      --radius: 12px;
+      --radius-sm: 8px;
+      --radius-pill: 9999px;
+    }
 
-  .eyebrow {
-    color: var(--retrieval);
-    font-size: 12px;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    margin-bottom: 10px;
-  }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
-  header.top h1 {
-    font-size: 28px;
-    font-weight: 700;
-    margin: 0 0 8px;
-    letter-spacing: -0.01em;
-  }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+      line-height: 1.6;
+      min-height: 100vh;
+      position: relative;
+      overflow-x: hidden;
+    }
 
-  header.top p {
-    color: var(--text-dim);
-    margin: 0;
-    font-size: 14px;
-    max-width: 620px;
-  }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background-image:
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(139, 92, 246, 0.18), transparent 70%),
+        radial-gradient(circle at 80% 80%, rgba(59, 130, 246, 0.08), transparent 50%),
+        linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+      background-size: 100% 100%, 100% 100%, 36px 36px, 36px 36px;
+      pointer-events: none;
+      z-index: 0;
+    }
 
-  .scan-box {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 8px;
-  }
+    .shell {
+      position: relative;
+      z-index: 1;
+      max-width: 1060px;
+      margin: 0 auto;
+      padding: 60px 24px 120px;
+    }
 
-  input[type="text"] {
-    flex: 1;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 13px 14px;
-    border-radius: var(--radius);
-    font-family: inherit;
-    font-size: 14px;
-  }
+    header.top {
+      text-align: center;
+      margin-bottom: 44px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
 
-  input[type="text"]:focus {
-    outline: none;
-    border-color: var(--retrieval);
-  }
+    .eyebrow-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(139, 92, 246, 0.1);
+      border: 1px solid rgba(139, 92, 246, 0.3);
+      padding: 6px 14px;
+      border-radius: var(--radius-pill);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent-light);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 18px;
+      backdrop-filter: blur(8px);
+    }
 
-  button.scan-btn {
-    background: var(--retrieval);
-    color: #0c0f13;
-    border: none;
-    font-weight: 600;
-    padding: 0 22px;
-    border-radius: var(--radius);
-    font-family: 'Space Grotesk', sans-serif;
-    font-size: 14px;
-    cursor: pointer;
-    transition: opacity 0.15s ease;
-  }
+    .eyebrow-badge .pulse-dot {
+      width: 7px;
+      height: 7px;
+      background: var(--accent-light);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--accent);
+      animation: pulse 2s infinite ease-in-out;
+    }
 
-  button.scan-btn:hover { opacity: 0.88; }
-  button.scan-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.4; transform: scale(0.9); }
+      50% { opacity: 1; transform: scale(1.15); }
+    }
 
-  .hint {
-    color: var(--text-dim);
-    font-size: 12px;
-  }
+    header.top h1 {
+      font-size: clamp(32px, 5vw, 48px);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+      margin-bottom: 16px;
+      background: linear-gradient(180deg, #ffffff 30%, #94a3b8 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
 
-  #status-line {
-    margin-top: 22px;
-    font-size: 13px;
-    color: var(--text-dim);
-    min-height: 20px;
-  }
+    header.top p {
+      color: var(--text-muted);
+      font-size: 16px;
+      max-width: 640px;
+      line-height: 1.6;
+    }
 
-  #status-line .active { color: var(--retrieval); }
+    .scan-card {
+      background: var(--panel);
+      backdrop-filter: blur(16px);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 10px;
+      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05);
+      transition: border-color 0.2s, box-shadow 0.2s;
+      margin-bottom: 14px;
+    }
 
-  .status-banner {
-    padding: 14px 16px;
-    border-radius: var(--radius);
-    font-size: 13px;
-    margin-top: 20px;
-    border: 1px solid var(--border);
-  }
-  .status-banner.error { border-color: var(--removed); color: var(--removed); background: var(--removed-bg); }
-  .status-banner.ok { border-color: var(--added); color: var(--added); background: var(--added-bg); }
-  .status-banner.warn { border-color: var(--warn); color: var(--warn); background: rgba(210,153,34,0.08); }
+    .scan-card:focus-within {
+      border-color: var(--border-focus);
+      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.5), 0 0 20px var(--accent-glow);
+    }
 
-  .summary-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 1px;
-    background: var(--border);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    overflow: hidden;
-    margin: 28px 0;
-  }
+    .scan-box {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
 
-  .summary-cell {
-    background: var(--panel);
-    padding: 16px 14px;
-    text-align: center;
-  }
+    .input-icon-wrap {
+      position: relative;
+      flex: 1;
+      display: flex;
+      align-items: center;
+    }
 
-  .summary-cell .num {
-    font-family: 'Space Grotesk', sans-serif;
-    font-size: 24px;
-    font-weight: 700;
-  }
+    .input-icon-wrap svg {
+      position: absolute;
+      left: 16px;
+      width: 18px;
+      height: 18px;
+      color: var(--text-dim);
+      pointer-events: none;
+    }
 
-  .summary-cell .label {
-    font-size: 11px;
-    color: var(--text-dim);
-    margin-top: 4px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-  }
+    input[type="text"] {
+      width: 100%;
+      background: transparent;
+      border: none;
+      color: var(--text);
+      padding: 14px 16px 14px 46px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 14px;
+    }
 
-  .error-level-pill {
-    display: inline-block;
-    margin-top: 4px;
-    font-size: 12px;
-    padding: 2px 10px;
-    border-radius: 999px;
-    border: 1px solid var(--border);
-  }
-  .error-level-pill.less { color: var(--added); border-color: var(--added); }
-  .error-level-pill.medium { color: var(--warn); border-color: var(--warn); }
-  .error-level-pill.more { color: var(--crit); border-color: var(--crit); }
+    input[type="text"]:focus { outline: none; }
+    input[type="text"]::placeholder { color: var(--text-dim); }
 
-  .num.confidence-high { color: var(--added); }
-  .num.confidence-medium { color: var(--warn); }
-  .num.confidence-low { color: var(--crit); }
+    button.scan-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: linear-gradient(135deg, #9333ea, #7c3aed);
+      color: #ffffff;
+      border: none;
+      font-weight: 600;
+      padding: 14px 26px;
+      border-radius: var(--radius);
+      font-family: inherit;
+      font-size: 14px;
+      cursor: pointer;
+      box-shadow: 0 4px 16px var(--accent-glow);
+      transition: all 0.2s ease;
+      white-space: nowrap;
+    }
 
-  .bug-card {
-    border: 1px solid var(--border);
-    border-left-width: 3px;
-    border-left-color: var(--retrieval);
-    border-radius: var(--radius);
-    background: var(--panel);
-    margin-bottom: 18px;
-    overflow: hidden;
-  }
+    button.scan-btn:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 22px rgba(147, 51, 234, 0.5);
+    }
+    button.scan-btn:active:not(:disabled) { transform: translateY(0); }
+    button.scan-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 
-  .bug-head {
-    padding: 14px 18px;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel-raised);
-  }
+    .quick-samples {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 14px;
+      padding: 0 6px;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
 
-  .bug-title {
-    font-family: 'Space Grotesk', sans-serif;
-    font-weight: 600;
-    font-size: 15px;
-  }
-  .bug-title .bug-number { color: var(--retrieval); }
+    .sample-pill {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 3px 10px;
+      border-radius: var(--radius-pill);
+      cursor: pointer;
+      font-family: 'JetBrains Mono', monospace;
+      transition: all 0.15s ease;
+    }
+    .sample-pill:hover {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
 
-  .bug-body { padding: 18px; }
+    .hint {
+      text-align: center;
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-top: 10px;
+    }
 
-  .field-label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-dim);
-    margin: 16px 0 6px;
-  }
-  .field-label:first-child { margin-top: 0; }
+    #status-line {
+      margin: 22px 0 10px;
+      min-height: 24px;
+      display: flex;
+      justify-content: center;
+    }
 
-  .location-line {
-    font-size: 13px;
-    color: var(--text);
-  }
-  .location-line .dim { color: var(--text-dim); }
+    .scanning-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 18px;
+      background: rgba(139, 92, 246, 0.08);
+      border: 1px solid rgba(139, 92, 246, 0.25);
+      border-radius: var(--radius-pill);
+      font-size: 13px;
+      color: var(--accent-light);
+      font-family: 'JetBrains Mono', monospace;
+    }
 
-  .cause-text, .explanation-text {
-    font-size: 13px;
-    color: var(--text);
-    font-family: 'Space Grotesk', sans-serif;
-  }
+    .radar-spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(167, 139, 250, 0.2);
+      border-top-color: var(--accent-light);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
-  pre.code-block {
-    margin: 0;
-    padding: 12px 14px;
-    border-radius: var(--radius);
-    font-size: 13px;
-    overflow-x: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-    border: 1px solid var(--border);
-  }
-  pre.code-block.removed { background: var(--removed-bg); border-color: rgba(248,81,73,0.3); }
-  pre.code-block.added { background: var(--added-bg); border-color: rgba(63,185,80,0.3); }
-  pre.code-block .ln { color: var(--text-dim); user-select: none; margin-right: 8px; }
+    .status-banner {
+      padding: 14px 18px;
+      border-radius: var(--radius);
+      font-size: 13px;
+      margin-top: 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border: 1px solid transparent;
+      animation: fadeIn 0.25s ease;
+    }
+    .status-banner.error { border-color: var(--removed-border); color: #fda4af; background: var(--removed-bg); }
+    .status-banner.ok { border-color: var(--added-border); color: #6ee7b7; background: var(--added-bg); }
+    .status-banner.warn { border-color: var(--warn-border); color: #fde68a; background: var(--warn-bg); }
 
-  .simple-note {
-    margin-top: 14px;
-    font-size: 12px;
-    color: var(--text-dim);
-    font-style: italic;
-  }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin: 32px 0;
+      animation: fadeIn 0.3s ease;
+    }
 
-  .see-more-toggle {
-    margin-top: 16px;
-    font-size: 12px;
-    color: var(--retrieval);
-    cursor: pointer;
-    user-select: none;
-    display: inline-block;
-  }
-  .see-more-toggle:hover { text-decoration: underline; }
+    .summary-cell {
+      background: var(--panel);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 14px;
+      text-align: center;
+      transition: transform 0.2s, border-color 0.2s;
+    }
+    .summary-cell:hover { transform: translateY(-2px); border-color: rgba(255, 255, 255, 0.15); }
 
-  .historical-bugs {
-    margin-top: 10px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
+    .summary-cell .num {
+      font-size: 30px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+      color: var(--text);
+    }
 
-  .history-item {
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--retrieval);
-    border-radius: var(--radius);
-    background: var(--panel-raised);
-    padding: 10px 12px;
-    font-size: 12px;
-  }
+    .summary-cell .label {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 600;
+    }
 
-  .history-top {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 4px;
-  }
+    .num.confidence-high { color: var(--added); text-shadow: 0 0 16px rgba(16, 185, 129, 0.3); }
+    .num.confidence-medium { color: var(--warn); text-shadow: 0 0 16px rgba(245, 158, 11, 0.3); }
+    .num.confidence-low { color: var(--removed); text-shadow: 0 0 16px rgba(244, 63, 94, 0.4); }
 
-  .history-source {
-    font-family: 'Space Grotesk', sans-serif;
-    font-weight: 600;
-    color: var(--retrieval);
-  }
+    .error-level-pill {
+      display: inline-block;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 4px 12px;
+      border-radius: var(--radius-pill);
+      border: 1px solid var(--border);
+    }
+    .error-level-pill.less { color: var(--added); border-color: var(--added-border); background: var(--added-bg); }
+    .error-level-pill.medium { color: var(--warn); border-color: var(--warn-border); background: var(--warn-bg); }
+    .error-level-pill.more { color: var(--removed); border-color: var(--removed-border); background: var(--removed-bg); }
 
-  .history-sim {
-    color: var(--text-dim);
-  }
+    .bug-card {
+      border: 1px solid var(--border);
+      border-top: 3px solid var(--accent);
+      border-radius: var(--radius);
+      background: var(--panel-solid);
+      margin-bottom: 22px;
+      overflow: hidden;
+      box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.5);
+      transition: border-color 0.2s;
+      animation: fadeIn 0.35s ease;
+    }
+    .bug-card:hover { border-color: rgba(255, 255, 255, 0.16); }
+    .bug-card.type-syntax { border-top-color: var(--removed); }
+    .bug-card.type-unnecessary { border-top-color: var(--warn); }
 
-  .history-type {
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    font-size: 10px;
-    margin-bottom: 4px;
-  }
+    .bug-head {
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      background: var(--panel-raised);
+      border-bottom: 1px solid var(--border);
+    }
 
-  .history-desc {
-    color: var(--text);
-    margin-bottom: 4px;
-  }
+    .bug-title {
+      font-weight: 700;
+      font-size: 16px;
+      letter-spacing: -0.01em;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .bug-title .bug-number { color: var(--text-dim); font-weight: 600; }
 
-  .history-solution {
-    color: var(--text-dim);
-  }
-  .history-solution b { color: var(--text); }
+    .badge-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
-  .empty-state {
-    text-align: center;
-    padding: 60px 20px;
-    color: var(--text-dim);
-    font-size: 14px;
-  }
+    .badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: var(--radius-pill);
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text-muted);
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+    }
+    .badge.type-syntax { color: #fda4af; border-color: var(--removed-border); background: var(--removed-bg); }
+    .badge.type-unnecessary { color: #fde68a; border-color: var(--warn-border); background: var(--warn-bg); }
+    .badge.confidence-high { color: #a7f3d0; border-color: var(--added-border); background: var(--added-bg); }
+    .badge.confidence-medium { color: #fde68a; border-color: var(--warn-border); background: var(--warn-bg); }
+    .badge.confidence-low { color: #fda4af; border-color: var(--removed-border); background: var(--removed-bg); }
 
-  footer {
-    text-align: center;
-    color: var(--text-dim);
-    font-size: 11px;
-    margin-top: 50px;
-    padding-top: 20px;
-    border-top: 1px solid var(--border);
-    line-height: 1.7;
-  }
+    .bug-body { padding: 22px; display: flex; flex-direction: column; gap: 14px; }
 
-  footer strong { color: var(--text); }
+    .field-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+    }
 
-  footer a {
-    color: var(--retrieval);
-    text-decoration: none;
-  }
-  footer a:hover { text-decoration: underline; }
+    .location-line {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border);
+      padding: 8px 12px;
+      border-radius: var(--radius-sm);
+    }
 
-  @media (max-width: 640px) {
-    .summary-grid { grid-template-columns: repeat(3, 1fr); }
-    .scan-box { flex-direction: column; }
-  }
-</style>
+    .cause-text, .explanation-text { font-size: 14px; color: var(--text-muted); line-height: 1.6; }
+
+    pre.code-block {
+      margin: 0;
+      padding: 14px 16px;
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      font-family: 'JetBrains Mono', monospace;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.5;
+    }
+    pre.code-block.removed { background: var(--removed-bg); border: 1px solid var(--removed-border); color: #ffe4e6; }
+    pre.code-block.added { background: var(--added-bg); border: 1px solid var(--added-border); color: #d1fae5; }
+
+    .simple-note {
+      padding: 12px 14px;
+      border-radius: var(--radius-sm);
+      background: var(--warn-bg);
+      border: 1px solid var(--warn-border);
+      color: #fde68a;
+      font-size: 12px;
+      font-style: italic;
+    }
+
+    .see-more-toggle {
+      font-size: 12px;
+      color: var(--accent-light);
+      cursor: pointer;
+      user-select: none;
+      width: fit-content;
+    }
+    .see-more-toggle:hover { text-decoration: underline; }
+
+    .historical-bugs { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+
+    .history-item {
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      font-size: 12px;
+    }
+    .history-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 4px;
+    }
+    .history-source { color: var(--accent-light); font-weight: 700; }
+    .history-sim {
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--accent-light);
+      font-weight: 600;
+      white-space: nowrap;
+      background: rgba(139, 92, 246, 0.1);
+      padding: 2px 8px;
+      border-radius: var(--radius-pill);
+      border: 1px solid rgba(139, 92, 246, 0.3);
+    }
+    .history-type { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+    .history-desc { color: var(--text-muted); margin-bottom: 6px; }
+    .history-solution { color: var(--text-muted); }
+    .history-solution b { color: var(--text); }
+
+    .empty-state {
+      text-align: center;
+      padding: 80px 20px;
+      color: var(--text-dim);
+      font-size: 14px;
+      background: var(--panel);
+      border: 1px dashed var(--border);
+      border-radius: var(--radius);
+      margin-top: 24px;
+    }
+
+    footer {
+      text-align: center;
+      color: var(--text-dim);
+      font-size: 12px;
+      margin-top: 70px;
+      border-top: 1px solid var(--border);
+      padding-top: 24px;
+      line-height: 1.7;
+    }
+    footer strong { color: var(--text-muted); }
+    footer .pipeline-note { margin-top: 10px; opacity: 0.7; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 768px) {
+      .summary-grid { grid-template-columns: repeat(2, 1fr); }
+      .scan-box { flex-direction: column; align-items: stretch; }
+      .input-icon-wrap { width: 100%; }
+      button.scan-btn { justify-content: center; width: 100%; }
+    }
+  </style>
 </head>
 <body>
+
 <div class="shell">
   <header class="top">
-    <div class="eyebrow">RAG + LLM Static Analysis</div>
+    <div class="eyebrow-badge">
+      <span class="pulse-dot"></span>
+      RAG + LLM Static Analysis
+    </div>
     <h1>GitHub Bug Detection &amp; Recovery</h1>
     <p>Scan your GitHub repository to find bugs, understand their cause, and get the right fix.</p>
   </header>
 
-  <div class="scan-box">
-    <input type="text" id="repo-url" placeholder="https://github.com/owner/repository" />
-    <button class="scan-btn" id="scan-btn" onclick="scanRepo()">Scan repo</button>
+  <div class="scan-card">
+    <div class="scan-box">
+      <div class="input-icon-wrap">
+        <svg fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg>
+        <input type="text" id="repo-url" placeholder="https://github.com/owner/repository" />
+      </div>
+      <button class="scan-btn" id="scan-btn" onclick="scanRepo()">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        Scan repo
+      </button>
+    </div>
   </div>
   <div class="hint">Works on any public GitHub repo. Private repos need auth this build doesn't set up.</div>
 
@@ -365,7 +552,6 @@
   <footer>
     <strong>⚠ Check before editing code.</strong> Every finding here comes from static analysis plus an LLM guess — it can be wrong, incomplete, or miss context only you have. Review each suggested fix yourself before applying it, especially anything marked "not fully sure" above.
   </footer>
-
 </div>
 
 <script>
@@ -382,19 +568,30 @@ const progressSteps = [
 
 let progressTimer = null;
 
+function setSample(url) {
+  document.getElementById("repo-url").value = url;
+}
+
 function startFakeProgress() {
   const line = document.getElementById("status-line");
   let i = 0;
-  line.innerHTML = `<span class="active">${progressSteps[0]}</span>`;
+  line.innerHTML = `
+    <div class="scanning-indicator">
+      <div class="radar-spinner"></div>
+      <span class="step-text">${progressSteps[0]}</span>
+    </div>
+  `;
   progressTimer = setInterval(() => {
     i = (i + 1) % progressSteps.length;
-    line.innerHTML = `<span class="active">${progressSteps[i]}</span>`;
+    const txt = line.querySelector(".step-text");
+    if (txt) txt.textContent = progressSteps[i];
   }, 1400);
 }
 
 function stopProgress(finalText) {
   clearInterval(progressTimer);
-  document.getElementById("status-line").textContent = finalText || "";
+  const line = document.getElementById("status-line");
+  line.innerHTML = finalText ? `<span style="color: var(--text-dim); font-size: 13px;">${escapeHtml(finalText)}</span>` : "";
 }
 
 function escapeHtml(str) {
@@ -446,51 +643,96 @@ function toggleHistory(id) {
   if (toggle) toggle.textContent = isHidden ? "▴ See less" : "▾ See more — similar bug in our dataset";
 }
 
+// bug_type is real data (e.g. "Syntax Error", "Unnecessary Code", "Logic Error", "Other") -
+// this maps it to a CSS suffix used for both the card's top border and its badge color.
+// Anything not explicitly "syntax"-like or "unnecessary" falls back to the neutral accent
+// color rather than guessing at a severity this API doesn't actually report.
+function typeClass(bugType) {
+  const t = (bugType || "").toLowerCase();
+  if (t.includes("syntax")) return "type-syntax";
+  if (t.includes("unnecessary")) return "type-unnecessary";
+  return "";
+}
+
+function typeIcon(bugType) {
+  const t = (bugType || "").toLowerCase();
+  if (t.includes("syntax")) return "🔴";
+  if (t.includes("unnecessary")) return "🟡";
+  return "🟠";
+}
+
+function confidenceClass(confidence) {
+  if (confidence >= 80) return "confidence-high";
+  if (confidence >= 50) return "confidence-medium";
+  return "confidence-low";
+}
+
 function renderBugCard(bug) {
   const lineText = bug.line_note
     ? bug.line_note
     : (bug.line_start ? `Line${bug.line_end && bug.line_end !== bug.line_start ? "s" : ""} ${bug.line_start}${bug.line_end && bug.line_end !== bug.line_start ? "-" + bug.line_end : ""}` : "");
 
+  const cClass = confidenceClass(bug.confidence);
+  const tClass = typeClass(bug.bug_type);
+
+  const retrievedSection = (bug.retrieved_bugs && bug.retrieved_bugs.length > 0) ? `
+    <div class="see-more-toggle" id="toggle-${bug.id}" onclick="toggleHistory('${bug.id}')">▾ See more — similar bug in our dataset</div>
+    <div class="historical-bugs" id="history-${bug.id}" style="display:none;">
+      ${bug.retrieved_bugs.map(r => `
+        <div class="history-item">
+          <div class="history-top">
+            <span class="history-source">${escapeHtml(r.dataset_source)}</span>
+            <span class="history-sim">${r.similarity}% similar</span>
+          </div>
+          ${r.bug_type ? `<div class="history-type">${escapeHtml(r.bug_type)}</div>` : ""}
+          ${r.bug_description ? `<div class="history-desc">${escapeHtml(r.bug_description)}</div>` : ""}
+          ${r.solution ? `<div class="history-solution"><b>How it was fixed:</b> ${escapeHtml(r.solution)}</div>` : ""}
+        </div>
+      `).join("")}
+    </div>
+  ` : "";
+
   return `
-    <div class="bug-card">
+    <div class="bug-card ${tClass}">
       <div class="bug-head">
-        <div class="bug-title">🔴 <span class="bug-number">Bug ${bug.number}</span></div>
+        <div class="bug-title">
+          <span>${typeIcon(bug.bug_type)}</span>
+          <span class="bug-number">Bug ${bug.number}</span>
+          <span>${escapeHtml(bug.error)}</span>
+        </div>
+        <div class="badge-row">
+          <span class="badge ${tClass}">${escapeHtml(bug.bug_type)}</span>
+          <span class="badge ${cClass}">${bug.confidence}% confidence</span>
+        </div>
       </div>
       <div class="bug-body">
-        <div class="field-label">Location</div>
-        <div class="location-line">${escapeHtml(bug.file)} ${lineText ? "&nbsp;—&nbsp; " + escapeHtml(lineText) : ""}</div>
+        <div>
+          <div class="field-label">Location</div>
+          <div class="location-line">${escapeHtml(bug.file)} ${lineText ? "&nbsp;—&nbsp; " + escapeHtml(lineText) : ""}</div>
+        </div>
 
-        <div class="field-label">Cause</div>
-        <div class="cause-text">${escapeHtml(bug.cause)}</div>
+        <div>
+          <div class="field-label">Cause</div>
+          <div class="cause-text">${escapeHtml(bug.cause)}</div>
+        </div>
 
         ${bug.current_code ? `
-          <div class="field-label">Error Code</div>
-          ${renderCodeBlock(bug.current_code, "removed")}
+          <div>
+            <div class="field-label">Error Code</div>
+            ${renderCodeBlock(bug.current_code, "removed")}
+          </div>
         ` : ""}
 
-        <div class="field-label">Solution</div>
-        ${renderSolutionBlock(bug)}
+        <div>
+          <div class="field-label">Solution</div>
+          ${renderSolutionBlock(bug)}
+        </div>
 
         ${bug.insufficient_evidence ? `
           <div class="simple-note">We are not fully sure this is a real problem, so please check it yourself before making any changes.</div>
         ` : ""}
 
-        ${bug.retrieved_bugs && bug.retrieved_bugs.length > 0 ? `
-          <div class="see-more-toggle" id="toggle-${bug.id}" onclick="toggleHistory('${bug.id}')">▾ See more — similar bug in our dataset</div>
-          <div class="historical-bugs" id="history-${bug.id}" style="display:none;">
-            ${bug.retrieved_bugs.map(r => `
-              <div class="history-item">
-                <div class="history-top">
-                  <span class="history-source">${escapeHtml(r.dataset_source)}</span>
-                  <span class="history-sim">${r.similarity}% similar</span>
-                </div>
-                ${r.bug_type ? `<div class="history-type">${escapeHtml(r.bug_type)}</div>` : ""}
-                ${r.bug_description ? `<div class="history-desc">${escapeHtml(r.bug_description)}</div>` : ""}
-                ${r.solution ? `<div class="history-solution"><b>How it was fixed:</b> ${escapeHtml(r.solution)}</div>` : ""}
-              </div>
-            `).join("")}
-          </div>
-        ` : ""}
+        ${retrievedSection}
       </div>
     </div>
   `;
@@ -502,12 +744,6 @@ function errorLevelClass(level) {
   return "more";
 }
 
-function confidenceClass(confidence) {
-  if (confidence >= 80) return "confidence-high";
-  if (confidence >= 50) return "confidence-medium";
-  return "confidence-low";
-}
-
 function renderSummary(summary) {
   const holder = document.getElementById("summary-holder");
   if (summary.files_scanned === 0 && summary.bugs_found === 0 && summary.scan_status === "Completed") {
@@ -516,12 +752,21 @@ function renderSummary(summary) {
   }
   holder.innerHTML = `
     <div class="summary-grid">
-      <div class="summary-cell"><div class="num">${summary.files_scanned}</div><div class="label">Files scanned</div></div>
-      <div class="summary-cell"><div class="num">${summary.bugs_found}</div><div class="label">Possible bugs</div></div>
-      <div class="summary-cell"><div class="num ${confidenceClass(summary.confidence)}">${summary.confidence}%</div><div class="label">Confidence</div></div>
+      <div class="summary-cell">
+        <div class="num">${summary.files_scanned}</div>
+        <div class="label">Files scanned</div>
+      </div>
+      <div class="summary-cell">
+        <div class="num">${summary.bugs_found}</div>
+        <div class="label">Possible bugs</div>
+      </div>
+      <div class="summary-cell">
+        <div class="num ${confidenceClass(summary.confidence)}">${summary.confidence}%</div>
+        <div class="label">Confidence</div>
+      </div>
       <div class="summary-cell">
         <div class="error-level-pill ${errorLevelClass(summary.error_level)}">${escapeHtml(summary.error_level)}</div>
-        <div class="label" style="margin-top:6px;">Error level</div>
+        <div class="label" style="margin-top:8px;">Error level</div>
       </div>
     </div>
   `;
@@ -553,13 +798,13 @@ async function scanRepo() {
       body: JSON.stringify({ repo_url: url }),
     });
 
-   if (!resp.ok) {
-  stopProgress("");
-  let detail = "";
-  try { detail = await resp.text(); } catch (e) {}
-  bannerHolder.innerHTML = `<div class="status-banner error">Server error (HTTP ${resp.status}). ${escapeHtml(detail.slice(0, 300))}</div>`;
-  return;
-}
+    if (!resp.ok) {
+      stopProgress("");
+      let detail = "";
+      try { detail = await resp.text(); } catch (e) {}
+      bannerHolder.innerHTML = `<div class="status-banner error">Server error (HTTP ${resp.status}). ${escapeHtml(detail.slice(0, 300))}</div>`;
+      return;
+    }
 
     const data = await resp.json();
     stopProgress("Analysis completed.");
@@ -583,9 +828,9 @@ async function scanRepo() {
       resultsHolder.innerHTML = data.bugs.map(renderBugCard).join("");
     }
   } catch (err) {
-  stopProgress("");
-  bannerHolder.innerHTML = `<div class="status-banner error">Request failed: ${escapeHtml(String(err))}</div>`;
-} finally {
+    stopProgress("");
+    bannerHolder.innerHTML = `<div class="status-banner error">Request failed: ${escapeHtml(String(err))}</div>`;
+  } finally {
     btn.disabled = false;
   }
 }
