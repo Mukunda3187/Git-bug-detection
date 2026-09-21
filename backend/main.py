@@ -8,6 +8,7 @@ GitHub URL -> validate -> download -> scan files -> detect candidates
 """
 import os
 import uuid
+import concurrent.futures
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -56,6 +57,17 @@ MAX_LLM_CALLS_PER_SCAN = 8
 # static analysis with no network calls, so there's no timeout risk from
 # scanning more files. The one genuinely slow, rate-limited step is the
 # LLM call per finding, which is why that alone still has a budget below.
+
+MAX_PARALLEL_WORKERS = 6
+# How many findings get analyzed (LLM call or fallback) at once instead of
+# one at a time. Each analysis is dominated by waiting on a network response
+# (or, for the fallback path, is fast local work) - not CPU - so threads are
+# the right tool here, and this is what actually fixes a slow scan: the old
+# sequential loop paid the full latency of each Gemini call back-to-back, so
+# 8 findings at ~2-8s each could add up to well over a minute even on a good
+# run, and far worse if a key was rate-limited. Running them concurrently
+# means the wall-clock cost is roughly the SLOWEST single call, not the sum
+# of all of them.
 
 def _empty_summary(repo: str, message: str) -> ScanResult:
     return ScanResult(
@@ -142,11 +154,18 @@ def scan_repo(req: ScanRequest):
     try:
         files = find_source_files(repo_path)
         files_to_scan = files
-        bug_reports = []
-        llm_calls_used = 0
-        bug_number = 0
-        ai_notice = None
 
+        # Pass 1 (fast, local, sequential): run every detector and collect every
+        # finding, with its RAG matches already attached, in file order. This
+        # part was never the slow part - pure static analysis over local text is
+        # fast even across hundreds of files - so it stays a plain loop. RAG
+        # retrieval stays here too, sequential, even though it's not the slow
+        # part either: retriever.py lazily loads its index on first use with no
+        # lock around that check, so calling it from multiple threads at once
+        # (e.g. several findings' first-ever retrieval racing on a cold start)
+        # risks more than one thread trying to build/write the index
+        # concurrently. Keeping it here avoids that entirely.
+        pending = []  # list of (finding, relative_path, retrieved)
         for full_path in files_to_scan:
             ext = os.path.splitext(full_path)[1]
             detector = DETECTORS_BY_EXTENSION.get(ext)
@@ -169,64 +188,89 @@ def scan_repo(req: ScanRequest):
                     query_text=f"{finding.get('error')}\n{finding.get('current_code')}",
                     top_k=3,
                 )
-                if llm_calls_used >= MAX_LLM_CALLS_PER_SCAN:
-                    # LLM budget used up for this scan - still show the bug with
-                    # real, specific fallback advice rather than dropping a
-                    # confirmed, 100%-certain finding entirely. RAG lookup still
-                    # runs above - it's a fast, local, unlimited operation with
-                    # no connection to the Gemini call budget being managed here.
-                    analysis = get_fallback_report(finding)
-                else:
-                    llm_calls_used += 1
-                    analysis = analyze_finding(finding, retrieved)
+                pending.append((finding, relative_path, retrieved))
 
-                # Surface the AI usage-limit message once per scan, at the top,
-                # instead of repeating a generic "fix it yourself" note per bug.
-                if ai_notice is None and analysis.get("rate_limited"):
-                    ai_notice = analysis.get("rate_limit_message")
+        # Pass 2 (the actually slow part): analyze each finding - a real LLM
+        # call for the first MAX_LLM_CALLS_PER_SCAN of them (same file-order
+        # priority as before), a fast local fallback for the rest - but now
+        # concurrently instead of one finding at a time. See MAX_PARALLEL_WORKERS
+        # above for why this is the fix for a slow scan on a repo with many
+        # findings. Only touches analyze_finding (an independent HTTP call per
+        # thread - requests.post is safe to call concurrently like this) and
+        # the pure-function fallback, so there's no shared state to race on here.
+        def _analyze_one(idx, finding, relative_path, retrieved):
+            if idx < MAX_LLM_CALLS_PER_SCAN:
+                analysis = analyze_finding(finding, retrieved)
+            else:
+                analysis = get_fallback_report(finding)
+            return finding, relative_path, retrieved, analysis
 
-                bug_number += 1
-                reported_bug_type = analysis.get("bug_type", finding.get("bug_type", "Other"))
-                if finding.get("rule") == "unreachable_code":
-                    # Only rename for the specific check that's actually about
-                    # dead/unreachable code - "possibly_unused_function" also
-                    # uses the "Unnecessary Code" bug_type but is a different,
-                    # separate concern (a function that might not be called
-                    # anywhere), so it must keep its own accurate label.
-                    reported_bug_type = "Unreachable Code"
+        # Indexed so that results[i] always corresponds to pending[i], however
+        # the threads finish - bug numbering below stays in the exact same file
+        # order as the old sequential loop, not completion order.
+        results = [None] * len(pending)
+        if pending:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as pool:
+                future_to_index = {
+                    pool.submit(_analyze_one, idx, finding, relative_path, retrieved): idx
+                    for idx, (finding, relative_path, retrieved) in enumerate(pending)
+                }
+                for future in concurrent.futures.as_completed(future_to_index):
+                    idx = future_to_index[future]
+                    results[idx] = future.result()
 
-                bug_reports.append(BugReport(
-                    id=str(uuid.uuid4())[:8],
-                    number=bug_number,
-                    error=analysis.get("error", finding.get("error", "Possible issue")),
-                    bug_type=reported_bug_type,
-                    file=relative_path,
-                    function=finding.get("function"),
-                    line_start=finding.get("line_start"),
-                    line_end=finding.get("line_end"),
-                    line_note=None if finding.get("line_start") else "Exact line could not be determined.",
-                    cause=analysis.get("cause", finding.get("cause", "")),
-                    why_occurs=analysis.get("why_occurs"),
-                    solution_type=analysis.get("solution_type", "replace"),
-                    solution=analysis.get("solution", ""),
-                    current_code=finding.get("current_code", ""),
-                    replacement_code=analysis.get("replacement_code"),
-                    add_location=analysis.get("add_location"),
-                    new_file_path=analysis.get("new_file_path"),
-                    explanation=analysis.get("explanation"),
-                    confidence=_clamp_confidence(analysis.get("confidence")),
-                    retrieved_bugs=[
-                        RetrievedBug(
-                            dataset_source=r["record"].get("dataset_source", "Unknown"),
-                            bug_type=r["record"].get("bug_type"),
-                            bug_description=r["record"].get("bug_description"),
-                            solution=r["record"].get("solution"),
-                            similarity=round(r["similarity"] * 100, 1),
-                        )
-                        for r in retrieved
-                    ],
-                    insufficient_evidence=bool(analysis.get("insufficient_evidence", False)),
-                ))
+        bug_reports = []
+        bug_number = 0
+        ai_notice = None
+
+        for finding, relative_path, retrieved, analysis in results:
+            # Surface the AI usage-limit message once per scan, at the top,
+            # instead of repeating a generic "fix it yourself" note per bug.
+            if ai_notice is None and analysis.get("rate_limited"):
+                ai_notice = analysis.get("rate_limit_message")
+
+            bug_number += 1
+            reported_bug_type = analysis.get("bug_type", finding.get("bug_type", "Other"))
+            if finding.get("rule") == "unreachable_code":
+                # Only rename for the specific check that's actually about
+                # dead/unreachable code - "possibly_unused_function" also
+                # uses the "Unnecessary Code" bug_type but is a different,
+                # separate concern (a function that might not be called
+                # anywhere), so it must keep its own accurate label.
+                reported_bug_type = "Unreachable Code"
+
+            bug_reports.append(BugReport(
+                id=str(uuid.uuid4())[:8],
+                number=bug_number,
+                error=analysis.get("error", finding.get("error", "Possible issue")),
+                bug_type=reported_bug_type,
+                file=relative_path,
+                function=finding.get("function"),
+                line_start=finding.get("line_start"),
+                line_end=finding.get("line_end"),
+                line_note=None if finding.get("line_start") else "Exact line could not be determined.",
+                cause=analysis.get("cause", finding.get("cause", "")),
+                why_occurs=analysis.get("why_occurs"),
+                solution_type=analysis.get("solution_type", "replace"),
+                solution=analysis.get("solution", ""),
+                current_code=finding.get("current_code", ""),
+                replacement_code=analysis.get("replacement_code"),
+                add_location=analysis.get("add_location"),
+                new_file_path=analysis.get("new_file_path"),
+                explanation=analysis.get("explanation"),
+                confidence=_clamp_confidence(analysis.get("confidence")),
+                retrieved_bugs=[
+                    RetrievedBug(
+                        dataset_source=r["record"].get("dataset_source", "Unknown"),
+                        bug_type=r["record"].get("bug_type"),
+                        bug_description=r["record"].get("bug_description"),
+                        solution=r["record"].get("solution"),
+                        similarity=round(r["similarity"] * 100, 1),
+                    )
+                    for r in retrieved
+                ],
+                insufficient_evidence=bool(analysis.get("insufficient_evidence", False)),
+            ))
 
         confidence = _compute_confidence(bug_reports)
         error_level = _compute_error_level(bug_reports)
