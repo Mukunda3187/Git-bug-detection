@@ -171,32 +171,166 @@ def scan_repo(req: ScanRequest):
         # aggregate across hundreds of files, and running them concurrently
         # instead of one at a time shrinks that the same way Stage 2 already
         # shrinks the network-bound analysis step.
-        def _scan_one_file(full_path):
+                def _scan_one_file(full_path):
+            """
+            Stage 1:
+            - Discover/read every readable text file.
+            - Run fast local detectors for supported languages.
+            - Put unknown text files into an LLM queue.
+            - Binary files are discovered but are not sent to Gemini.
+            """
             ext = os.path.splitext(full_path)[1].lower()
+            relative_path = os.path.relpath(full_path, repo_path)
 
             source = read_file_safely(full_path)
-            if not source:
-                return []
 
-            relative_path = os.path.relpath(full_path, repo_path)
+            if not source:
+                return {
+                    "findings": [],
+                    "llm_candidate": None,
+                }
 
             try:
                 detector = DETECTORS_BY_EXTENSION.get(ext)
 
                 if detector:
                     findings = detector(relative_path, source)
-                else:
-                    findings = analyze_file(relative_path, source)
+
+                    return {
+                        "findings": [
+                            (finding, relative_path)
+                            for finding in findings
+                        ],
+                        "llm_candidate": None,
+                    }
+
+                # Unknown extension but readable text:
+                # queue it for controlled Gemini analysis later.
+                return {
+                    "findings": [],
+                    "llm_candidate": (relative_path, source),
+                }
 
             except Exception as e:
                 print(f"[scan] Failed to analyze {relative_path}: {e}")
-                return []
 
-            return [(finding, relative_path) for finding in findings]
+                return {
+                    "findings": [],
+                    "llm_candidate": None,
+                }
 
         # Indexed so file_findings[i] always corresponds to files[i], however
         # the threads finish - keeps finding order (and therefore bug
         # numbering later) tied to file order, not scan-completion order.
+                # ------------------------------------------------------------
+        # STAGE 1: SCAN EVERY FILE
+        # ------------------------------------------------------------
+
+        file_results = [None] * len(files)
+
+        if files:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=MAX_FILE_SCAN_WORKERS
+            ) as pool:
+
+                future_to_index = {
+                    pool.submit(_scan_one_file, path): idx
+                    for idx, path in enumerate(files)
+                }
+
+                for future in concurrent.futures.as_completed(
+                    future_to_index
+                ):
+                    idx = future_to_index[future]
+
+                    try:
+                        file_results[idx] = future.result()
+                    except Exception as e:
+                        print(
+                            f"[scan] Worker failed for "
+                            f"{files[idx]}: {e}"
+                        )
+
+                        file_results[idx] = {
+                            "findings": [],
+                            "llm_candidate": None,
+                        }
+
+        # Local-detector findings.
+        pending = []
+
+        # Readable files without a specialized detector.
+        llm_file_candidates = []
+
+        for result in file_results:
+            if not result:
+                continue
+
+            pending.extend(result["findings"])
+
+            if result["llm_candidate"]:
+                llm_file_candidates.append(
+                    result["llm_candidate"]
+                )
+
+        # ------------------------------------------------------------
+        # STAGE 1B: ANALYZE UNKNOWN TEXT FILES WITH GEMINI
+        #
+        # This is separate from the normal finding-analysis budget.
+        # Only 2 files are sent to Gemini at the same time so a large
+        # repository does not create hundreds of simultaneous requests.
+        # Every readable unsupported text file is still attempted.
+        # ------------------------------------------------------------
+
+        MAX_FILE_LLM_WORKERS = 2
+
+        def _analyze_unknown_file(file_data):
+            relative_path, source = file_data
+
+            try:
+                findings = analyze_file(
+                    relative_path,
+                    source,
+                )
+
+                return [
+                    (finding, relative_path)
+                    for finding in findings
+                ]
+
+            except Exception as e:
+                print(
+                    f"[scan] LLM file analysis failed for "
+                    f"{relative_path}: {e}"
+                )
+                return []
+
+        if llm_file_candidates:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=MAX_FILE_LLM_WORKERS
+            ) as pool:
+
+                future_to_file = {
+                    pool.submit(
+                        _analyze_unknown_file,
+                        file_data,
+                    ): file_data[0]
+                    for file_data in llm_file_candidates
+                }
+
+                for future in concurrent.futures.as_completed(
+                    future_to_file
+                ):
+                    relative_path = future_to_file[future]
+
+                    try:
+                        pending.extend(future.result())
+                    except Exception as e:
+                        print(
+                            f"[scan] Failed processing "
+                            f"{relative_path}: {e}"
+                        )
+                        
         file_findings = [None] * len(files)
         if files:
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_FILE_SCAN_WORKERS) as pool:
