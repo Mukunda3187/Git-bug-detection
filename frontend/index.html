@@ -352,6 +352,11 @@
     }
     .bug-card:hover { border-color: rgba(255, 255, 255, 0.16); }
     .bug-card.type-syntax { border-top-color: var(--removed); }
+    .bug-card.type-unnecessary { border-top-color: var(--warn); }
+    .bug-card.type-runtime { border-top-color: var(--accent); }
+
+    .badge.type-unnecessary { color: #fde68a; border-color: var(--warn-border); background: var(--warn-bg); }
+    .badge.type-runtime { color: var(--accent-light); border-color: rgba(139, 92, 246, 0.35); background: rgba(139, 92, 246, 0.10); }
 
     .bug-head {
       padding: 16px 20px;
@@ -656,13 +661,31 @@ function toggleHistory(id) {
 // else gets the same neutral "this is a bug" treatment.
 function typeClass(bugType) {
   const t = (bugType || "").toLowerCase();
+
   if (t.includes("syntax")) return "type-syntax";
+  if (
+    t.includes("unnecessary") ||
+    t.includes("dead code") ||
+    t.includes("unused code") ||
+    t.includes("redundant")
+  ) return "type-unnecessary";
+  if (t.includes("runtime")) return "type-runtime";
+
   return "";
 }
 
 function typeIcon(bugType) {
   const t = (bugType || "").toLowerCase();
+
   if (t.includes("syntax")) return "🔴";
+  if (
+    t.includes("unnecessary") ||
+    t.includes("dead code") ||
+    t.includes("unused code") ||
+    t.includes("redundant")
+  ) return "🟡";
+  if (t.includes("runtime")) return "🟣";
+
   return "🟠";
 }
 
