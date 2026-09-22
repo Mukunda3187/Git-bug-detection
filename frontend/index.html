@@ -355,8 +355,23 @@
     .bug-card.type-unnecessary { border-top-color: var(--warn); }
     .bug-card.type-runtime { border-top-color: var(--accent); }
 
-    .badge.type-unnecessary { color: #fde68a; border-color: var(--warn-border); background: var(--warn-bg); }
-    .badge.type-runtime { color: var(--accent-light); border-color: rgba(139, 92, 246, 0.35); background: rgba(139, 92, 246, 0.10); }
+    .badge.type-syntax {
+      color: #fda4af;
+      border-color: var(--removed-border);
+      background: var(--removed-bg);
+    }
+
+    .badge.type-unnecessary {
+      color: #fde68a;
+      border-color: var(--warn-border);
+      background: var(--warn-bg);
+    }
+
+    .badge.type-runtime {
+      color: var(--accent-light);
+      border-color: rgba(139, 92, 246, 0.35);
+      background: rgba(139, 92, 246, 0.10);
+    }
 
     .bug-head {
       padding: 16px 20px;
@@ -654,21 +669,23 @@ function toggleHistory(id) {
   if (toggle) toggle.textContent = isHidden ? "▴ See less" : "▾ See more — similar bug in our dataset";
 }
 
-// This site identifies bugs, full stop - it doesn't sort findings into "real
-// bugs" vs a separate "unnecessary code" bucket. bug_type (e.g. "Syntax
-// Error", "Logic Error") only decides visual emphasis for the most certain
-// case (a real syntax error, i.e. this file won't even run) - everything
-// else gets the same neutral "this is a bug" treatment.
+// Bug type controls the visual category:
+// Syntax Error = red, Unnecessary/Dead/Unused/Redundant Code = yellow,
+// Runtime Error = purple. Other bug types keep the neutral theme color.
 function typeClass(bugType) {
   const t = (bugType || "").toLowerCase();
 
   if (t.includes("syntax")) return "type-syntax";
+
   if (
     t.includes("unnecessary") ||
     t.includes("dead code") ||
     t.includes("unused code") ||
     t.includes("redundant")
-  ) return "type-unnecessary";
+  ) {
+    return "type-unnecessary";
+  }
+
   if (t.includes("runtime")) return "type-runtime";
 
   return "";
@@ -678,12 +695,16 @@ function typeIcon(bugType) {
   const t = (bugType || "").toLowerCase();
 
   if (t.includes("syntax")) return "🔴";
+
   if (
     t.includes("unnecessary") ||
     t.includes("dead code") ||
     t.includes("unused code") ||
     t.includes("redundant")
-  ) return "🟡";
+  ) {
+    return "🟡";
+  }
+
   if (t.includes("runtime")) return "🟣";
 
   return "🟠";
