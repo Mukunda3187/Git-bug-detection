@@ -463,6 +463,175 @@ def _fallback_report(finding: dict) -> dict:
     }
 
 
+
+def analyze_file(file_path: str, source: str) -> list:
+    """
+    Analyze a readable text file directly with Gemini when there is no
+    specialized detector for its extension.
+
+    This is intentionally separate from analyze_finding(): analyze_finding()
+    receives one detector finding plus RAG context, while this function asks
+    Gemini to inspect the whole file and return candidate findings that can
+    then enter the normal RAG + report pipeline in main.py.
+
+    Returns an empty list when no API key is available, the file is empty, the
+    model call fails, or Gemini returns invalid JSON. This keeps the normal
+    detector/fallback pipeline safe instead of inventing a finding.
+    """
+    if not source or not source.strip():
+        return []
+
+    api_keys = []
+
+    # Reuse the same multi-key configuration as analyze_finding().
+    for i in range(1, 11):
+        key = os.getenv(f"GEMINI_API_KEY_{i}")
+        if key and key.strip():
+            api_keys.append(key.strip())
+
+    old_key = os.getenv("GEMINI_API_KEY")
+    if old_key and old_key.strip() and old_key.strip() not in api_keys:
+        api_keys.append(old_key.strip())
+
+    if not api_keys:
+        return []
+
+    api_keys = api_keys[:MAX_KEYS_TO_TRY_PER_CALL]
+
+    file_prompt = f"""You are reviewing a source/configuration/text file for real software bugs.
+
+File: {file_path}
+
+Analyze the complete file below. Report ONLY issues that are reasonably supported
+by the code/text itself. Do not invent bugs just because a style preference is
+not followed. If there are no clear issues, return an empty JSON array.
+
+For every real or strongly supported issue, return an object with exactly these
+fields:
+- error: short description of the bug
+- bug_type: one of Runtime Error, Logic Error, Syntax Error, Type Error,
+  Dependency Error, Security Issue, Performance Issue, API Error,
+  Unnecessary Code, Other
+- cause: why the issue occurs
+- line_start: 1-based starting line number
+- line_end: 1-based ending line number
+- current_code: the smallest relevant code/text snippet
+- function: function/class/component name if applicable, otherwise null
+
+Rules:
+- Use 1-based line numbers.
+- Only report issues you can point to in the supplied file.
+- Do not report vague possibilities without evidence.
+- Do not include markdown fences or explanations outside the JSON array.
+
+Return ONLY a JSON array.
+
+FILE CONTENT:
+--------------------
+{source}
+--------------------
+"""
+
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": "You are a precise software bug detector. Return valid JSON only."}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": file_prompt}],
+            }
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.1,
+            "maxOutputTokens": 2500,
+            "topP": 0.9,
+            "topK": 40,
+        },
+    }
+
+    last_error = None
+
+    for key_number, api_key in enumerate(api_keys, start=1):
+        try:
+            resp = requests.post(
+                GEMINI_URL,
+                params={"key": api_key},
+                json=payload,
+                timeout=GEMINI_REQUEST_TIMEOUT_SECONDS,
+            )
+
+            if resp.status_code != 200:
+                last_error = (
+                    f"Gemini file-analysis key {key_number} returned "
+                    f"HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+                continue
+
+            data = resp.json()
+            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            cleaned = (
+                raw_text.strip()
+                .removeprefix("```json")
+                .removeprefix("```")
+                .removesuffix("```")
+                .strip()
+            )
+
+            result = json.loads(cleaned)
+            if not isinstance(result, list):
+                print("[llm_client] Gemini file analysis did not return a JSON array.")
+                return []
+
+            findings = []
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+
+                error = str(item.get("error") or "").strip()
+                if not error:
+                    continue
+
+                bug_type = str(item.get("bug_type") or "Other").strip()
+                allowed_types = {
+                    "Runtime Error", "Logic Error", "Syntax Error", "Type Error",
+                    "Dependency Error", "Security Issue", "Performance Issue",
+                    "API Error", "Unnecessary Code", "Other",
+                }
+                if bug_type not in allowed_types:
+                    bug_type = "Other"
+
+                line_start = item.get("line_start")
+                line_end = item.get("line_end")
+                try:
+                    line_start = int(line_start) if line_start is not None else None
+                    line_end = int(line_end) if line_end is not None else line_start
+                except (TypeError, ValueError):
+                    line_start = None
+                    line_end = None
+
+                findings.append({
+                    "error": error,
+                    "bug_type": bug_type,
+                    "cause": str(item.get("cause") or "").strip(),
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "current_code": str(item.get("current_code") or "").strip(),
+                    "function": item.get("function"),
+                    "rule": "llm_file_analysis",
+                    "file": file_path,
+                })
+
+            return findings
+
+        except Exception as e:
+            last_error = f"Gemini file analysis key {key_number} failed: {e}"
+
+    if last_error:
+        print(f"[llm_client] File analysis failed: {last_error}")
+    return []
+
 def get_fallback_report(finding: dict) -> dict:
     """
     Public entry point to the same real, rule-specific advice used when
