@@ -161,29 +161,17 @@ def scan_repo(req: ScanRequest):
     try:
         files = find_source_files(repo_path)
 
-        # Stage 1 (parallel file scanning): reading a file and running its
-        # detector against it are both safe to do concurrently across
-        # different files - confirmed no detector module keeps any shared,
-        # mutable state between calls (they're pure functions over the
-        # `source` string each one receives). For a repo with many files,
-        # this is the second real lever on wall-clock time, alongside the
-        # Stage 2 pool below: local disk reads still take real time in
-        # aggregate across hundreds of files, and running them concurrently
-        # instead of one at a time shrinks that the same way Stage 2 already
-        # shrinks the network-bound analysis step.
-                def _scan_one_file(full_path):
-            """
-            Stage 1:
-            - Discover/read every readable text file.
-            - Run fast local detectors for supported languages.
-            - Put unknown text files into an LLM queue.
-            - Binary files are discovered but are not sent to Gemini.
-            """
+        # ------------------------------------------------------------
+        # STAGE 1: SCAN EVERY FILE
+        # ------------------------------------------------------------
+        # Known programming languages use the fast local detectors.
+        # Other readable text files are queued for controlled LLM analysis.
+        # Binary/unreadable files are safely ignored by read_file_safely().
+        def _scan_one_file(full_path):
             ext = os.path.splitext(full_path)[1].lower()
             relative_path = os.path.relpath(full_path, repo_path)
 
             source = read_file_safely(full_path)
-
             if not source:
                 return {
                     "findings": [],
@@ -195,7 +183,6 @@ def scan_repo(req: ScanRequest):
 
                 if detector:
                     findings = detector(relative_path, source)
-
                     return {
                         "findings": [
                             (finding, relative_path)
@@ -204,8 +191,8 @@ def scan_repo(req: ScanRequest):
                         "llm_candidate": None,
                     }
 
-                # Unknown extension but readable text:
-                # queue it for controlled Gemini analysis later.
+                # Readable text file without a specialized detector.
+                # It will be analyzed by Gemini in the controlled pool below.
                 return {
                     "findings": [],
                     "llm_candidate": (relative_path, source),
@@ -213,53 +200,36 @@ def scan_repo(req: ScanRequest):
 
             except Exception as e:
                 print(f"[scan] Failed to analyze {relative_path}: {e}")
-
                 return {
                     "findings": [],
                     "llm_candidate": None,
                 }
 
-        # Indexed so file_findings[i] always corresponds to files[i], however
-        # the threads finish - keeps finding order (and therefore bug
-        # numbering later) tied to file order, not scan-completion order.
-                # ------------------------------------------------------------
-        # STAGE 1: SCAN EVERY FILE
-        # ------------------------------------------------------------
-
+        # Keep the results indexed so final bug numbering follows repository
+        # file order rather than thread completion order.
         file_results = [None] * len(files)
 
         if files:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=MAX_FILE_SCAN_WORKERS
             ) as pool:
-
                 future_to_index = {
                     pool.submit(_scan_one_file, path): idx
                     for idx, path in enumerate(files)
                 }
 
-                for future in concurrent.futures.as_completed(
-                    future_to_index
-                ):
+                for future in concurrent.futures.as_completed(future_to_index):
                     idx = future_to_index[future]
-
                     try:
                         file_results[idx] = future.result()
                     except Exception as e:
-                        print(
-                            f"[scan] Worker failed for "
-                            f"{files[idx]}: {e}"
-                        )
-
+                        print(f"[scan] File worker failed: {e}")
                         file_results[idx] = {
                             "findings": [],
                             "llm_candidate": None,
                         }
 
-        # Local-detector findings.
         pending = []
-
-        # Readable files without a specialized detector.
         llm_file_candidates = []
 
         for result in file_results:
@@ -268,36 +238,27 @@ def scan_repo(req: ScanRequest):
 
             pending.extend(result["findings"])
 
-            if result["llm_candidate"]:
-                llm_file_candidates.append(
-                    result["llm_candidate"]
-                )
+            candidate = result.get("llm_candidate")
+            if candidate:
+                llm_file_candidates.append(candidate)
 
         # ------------------------------------------------------------
-        # STAGE 1B: ANALYZE UNKNOWN TEXT FILES WITH GEMINI
-        #
-        # This is separate from the normal finding-analysis budget.
-        # Only 2 files are sent to Gemini at the same time so a large
-        # repository does not create hundreds of simultaneous requests.
-        # Every readable unsupported text file is still attempted.
+        # STAGE 1B: LLM ANALYSIS FOR OTHER READABLE TEXT FILES
         # ------------------------------------------------------------
-
+        # Every readable unsupported text file is attempted. Only a small
+        # number run concurrently so a large repository does not create a
+        # huge burst of Gemini requests.
         MAX_FILE_LLM_WORKERS = 2
 
         def _analyze_unknown_file(file_data):
             relative_path, source = file_data
 
             try:
-                findings = analyze_file(
-                    relative_path,
-                    source,
-                )
-
+                findings = analyze_file(relative_path, source)
                 return [
                     (finding, relative_path)
                     for finding in findings
                 ]
-
             except Exception as e:
                 print(
                     f"[scan] LLM file analysis failed for "
@@ -309,20 +270,13 @@ def scan_repo(req: ScanRequest):
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=MAX_FILE_LLM_WORKERS
             ) as pool:
-
                 future_to_file = {
-                    pool.submit(
-                        _analyze_unknown_file,
-                        file_data,
-                    ): file_data[0]
+                    pool.submit(_analyze_unknown_file, file_data): file_data[0]
                     for file_data in llm_file_candidates
                 }
 
-                for future in concurrent.futures.as_completed(
-                    future_to_file
-                ):
+                for future in concurrent.futures.as_completed(future_to_file):
                     relative_path = future_to_file[future]
-
                     try:
                         pending.extend(future.result())
                     except Exception as e:
@@ -330,86 +284,90 @@ def scan_repo(req: ScanRequest):
                             f"[scan] Failed processing "
                             f"{relative_path}: {e}"
                         )
-                        
-        file_findings = [None] * len(files)
-        if files:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_FILE_SCAN_WORKERS) as pool:
-                future_to_index = {
-                    pool.submit(_scan_one_file, path): idx
-                    for idx, path in enumerate(files)
-                }
-                for future in concurrent.futures.as_completed(future_to_index):
-                    idx = future_to_index[future]
-                    file_findings[idx] = future.result()
 
-        pending = [item for findings in file_findings for item in findings]  # (finding, relative_path)
-
-        # Stage 2 (the slow part): RAG lookup + analysis (real LLM call for the
-        # first MAX_LLM_CALLS_PER_SCAN findings, fast local fallback for the
-        # rest) - all concurrent instead of one finding at a time. RAG lookup
-        # now lives in this same parallel stage (it didn't before - see
-        # rag/retriever.py's _load_lock for the fix that made this safe: that
-        # module used to load its index lazily with no lock, so calling it
-        # from multiple threads at once risked a race on a cold start).
-        # analyze_finding's own HTTP call is independently safe to run
-        # concurrently like this (requests.post doesn't share state across
-        # calls), and the fallback path is a pure function - so there's
-        # nothing left in this stage that needs to stay sequential.
+        # ------------------------------------------------------------
+        # STAGE 2: RAG LOOKUP + DETAILED LLM ANALYSIS
+        # ------------------------------------------------------------
+        # Only the first MAX_LLM_CALLS_PER_SCAN findings use the detailed
+        # Gemini verification call. Remaining findings use the existing
+        # local fallback report.
         def _analyze_one(idx, finding, relative_path):
             retrieved = retrieve_similar_bugs(
                 query_text=f"{finding.get('error')}\n{finding.get('current_code')}",
                 top_k=3,
             )
+
             if idx < MAX_LLM_CALLS_PER_SCAN:
                 analysis = analyze_finding(finding, retrieved)
             else:
                 analysis = get_fallback_report(finding)
+
             return finding, relative_path, retrieved, analysis
 
-        # Indexed so that results[i] always corresponds to pending[i], however
-        # the threads finish - bug numbering below stays in the exact same file
-        # order as the old sequential loop, not completion order.
         results = [None] * len(pending)
+
         if pending:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as pool:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=MAX_PARALLEL_WORKERS
+            ) as pool:
                 future_to_index = {
-                    pool.submit(_analyze_one, idx, finding, relative_path): idx
-                    for idx, (finding, relative_path) in enumerate(pending)
+                    pool.submit(
+                        _analyze_one,
+                        idx,
+                        finding,
+                        relative_path,
+                    ): idx
+                    for idx, (finding, relative_path)
+                    in enumerate(pending)
                 }
+
                 for future in concurrent.futures.as_completed(future_to_index):
                     idx = future_to_index[future]
-                    results[idx] = future.result()
+                    try:
+                        results[idx] = future.result()
+                    except Exception as e:
+                        print(f"[scan] Analysis worker failed: {e}")
+                        results[idx] = None
 
         bug_reports = []
         bug_number = 0
         ai_notice = None
 
-        for finding, relative_path, retrieved, analysis in results:
-            # Surface the AI usage-limit message once per scan, at the top,
-            # instead of repeating a generic "fix it yourself" note per bug.
+        for result in results:
+            if not result:
+                continue
+
+            finding, relative_path, retrieved, analysis = result
+
             if ai_notice is None and analysis.get("rate_limited"):
                 ai_notice = analysis.get("rate_limit_message")
 
             bug_number += 1
-            reported_bug_type = analysis.get("bug_type", finding.get("bug_type", "Other"))
+            reported_bug_type = analysis.get(
+                "bug_type",
+                finding.get("bug_type", "Other"),
+            )
+
             if finding.get("rule") == "unreachable_code":
-                # Only rename for the specific check that's actually about
-                # dead/unreachable code - "possibly_unused_function" also
-                # uses the "Unnecessary Code" bug_type but is a different,
-                # separate concern (a function that might not be called
-                # anywhere), so it must keep its own accurate label.
                 reported_bug_type = "Unreachable Code"
 
             bug_reports.append(BugReport(
                 id=str(uuid.uuid4())[:8],
                 number=bug_number,
-                error=analysis.get("error", finding.get("error", "Possible issue")),
+                error=analysis.get(
+                    "error",
+                    finding.get("error", "Possible issue"),
+                ),
                 bug_type=reported_bug_type,
                 file=relative_path,
                 function=finding.get("function"),
                 line_start=finding.get("line_start"),
                 line_end=finding.get("line_end"),
-                line_note=None if finding.get("line_start") else "Exact line could not be determined.",
+                line_note=(
+                    None
+                    if finding.get("line_start")
+                    else "Exact line could not be determined."
+                ),
                 cause=analysis.get("cause", finding.get("cause", "")),
                 why_occurs=analysis.get("why_occurs"),
                 solution_type=analysis.get("solution_type", "replace"),
@@ -422,7 +380,9 @@ def scan_repo(req: ScanRequest):
                 confidence=_clamp_confidence(analysis.get("confidence")),
                 retrieved_bugs=[
                     RetrievedBug(
-                        dataset_source=r["record"].get("dataset_source", "Unknown"),
+                        dataset_source=r["record"].get(
+                            "dataset_source", "Unknown"
+                        ),
                         bug_type=r["record"].get("bug_type"),
                         bug_description=r["record"].get("bug_description"),
                         solution=r["record"].get("solution"),
@@ -430,7 +390,9 @@ def scan_repo(req: ScanRequest):
                     )
                     for r in retrieved
                 ],
-                insufficient_evidence=bool(analysis.get("insufficient_evidence", False)),
+                insufficient_evidence=bool(
+                    analysis.get("insufficient_evidence", False)
+                ),
             ))
 
         confidence = _compute_confidence(bug_reports)
