@@ -69,6 +69,13 @@ MAX_PARALLEL_WORKERS = 6
 # means the wall-clock cost is roughly the SLOWEST single call, not the sum
 # of all of them.
 
+MAX_FILE_SCAN_WORKERS = 12
+# How many files get read-and-detected at once. Higher than
+# MAX_PARALLEL_WORKERS above on purpose: this stage isn't rate-limited by an
+# external API the way Gemini calls are, it's just local disk reads plus
+# fast in-process static analysis, so it can safely support more concurrency
+# without risking hitting anyone's rate limit.
+
 def _empty_summary(repo: str, message: str) -> ScanResult:
     return ScanResult(
         summary=ScanSummary(
@@ -153,52 +160,64 @@ def scan_repo(req: ScanRequest):
 
     try:
         files = find_source_files(repo_path)
-        files_to_scan = files
 
-        # Pass 1 (fast, local, sequential): run every detector and collect every
-        # finding, with its RAG matches already attached, in file order. This
-        # part was never the slow part - pure static analysis over local text is
-        # fast even across hundreds of files - so it stays a plain loop. RAG
-        # retrieval stays here too, sequential, even though it's not the slow
-        # part either: retriever.py lazily loads its index on first use with no
-        # lock around that check, so calling it from multiple threads at once
-        # (e.g. several findings' first-ever retrieval racing on a cold start)
-        # risks more than one thread trying to build/write the index
-        # concurrently. Keeping it here avoids that entirely.
-        pending = []  # list of (finding, relative_path, retrieved)
-        for full_path in files_to_scan:
+        # Stage 1 (parallel file scanning): reading a file and running its
+        # detector against it are both safe to do concurrently across
+        # different files - confirmed no detector module keeps any shared,
+        # mutable state between calls (they're pure functions over the
+        # `source` string each one receives). For a repo with many files,
+        # this is the second real lever on wall-clock time, alongside the
+        # Stage 2 pool below: local disk reads still take real time in
+        # aggregate across hundreds of files, and running them concurrently
+        # instead of one at a time shrinks that the same way Stage 2 already
+        # shrinks the network-bound analysis step.
+        def _scan_one_file(full_path):
             ext = os.path.splitext(full_path)[1]
             detector = DETECTORS_BY_EXTENSION.get(ext)
             if not detector:
-                continue
-
+                return []
             source = read_file_safely(full_path)
             if not source:
-                continue
-
+                return []
             relative_path = os.path.relpath(full_path, repo_path)
-
             try:
                 findings = detector(relative_path, source)
             except Exception:
-                continue
+                return []
+            return [(finding, relative_path) for finding in findings]
 
-            for finding in findings:
-                retrieved = retrieve_similar_bugs(
-                    query_text=f"{finding.get('error')}\n{finding.get('current_code')}",
-                    top_k=3,
-                )
-                pending.append((finding, relative_path, retrieved))
+        # Indexed so file_findings[i] always corresponds to files[i], however
+        # the threads finish - keeps finding order (and therefore bug
+        # numbering later) tied to file order, not scan-completion order.
+        file_findings = [None] * len(files)
+        if files:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_FILE_SCAN_WORKERS) as pool:
+                future_to_index = {
+                    pool.submit(_scan_one_file, path): idx
+                    for idx, path in enumerate(files)
+                }
+                for future in concurrent.futures.as_completed(future_to_index):
+                    idx = future_to_index[future]
+                    file_findings[idx] = future.result()
 
-        # Pass 2 (the actually slow part): analyze each finding - a real LLM
-        # call for the first MAX_LLM_CALLS_PER_SCAN of them (same file-order
-        # priority as before), a fast local fallback for the rest - but now
-        # concurrently instead of one finding at a time. See MAX_PARALLEL_WORKERS
-        # above for why this is the fix for a slow scan on a repo with many
-        # findings. Only touches analyze_finding (an independent HTTP call per
-        # thread - requests.post is safe to call concurrently like this) and
-        # the pure-function fallback, so there's no shared state to race on here.
-        def _analyze_one(idx, finding, relative_path, retrieved):
+        pending = [item for findings in file_findings for item in findings]  # (finding, relative_path)
+
+        # Stage 2 (the slow part): RAG lookup + analysis (real LLM call for the
+        # first MAX_LLM_CALLS_PER_SCAN findings, fast local fallback for the
+        # rest) - all concurrent instead of one finding at a time. RAG lookup
+        # now lives in this same parallel stage (it didn't before - see
+        # rag/retriever.py's _load_lock for the fix that made this safe: that
+        # module used to load its index lazily with no lock, so calling it
+        # from multiple threads at once risked a race on a cold start).
+        # analyze_finding's own HTTP call is independently safe to run
+        # concurrently like this (requests.post doesn't share state across
+        # calls), and the fallback path is a pure function - so there's
+        # nothing left in this stage that needs to stay sequential.
+        def _analyze_one(idx, finding, relative_path):
+            retrieved = retrieve_similar_bugs(
+                query_text=f"{finding.get('error')}\n{finding.get('current_code')}",
+                top_k=3,
+            )
             if idx < MAX_LLM_CALLS_PER_SCAN:
                 analysis = analyze_finding(finding, retrieved)
             else:
@@ -212,8 +231,8 @@ def scan_repo(req: ScanRequest):
         if pending:
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as pool:
                 future_to_index = {
-                    pool.submit(_analyze_one, idx, finding, relative_path, retrieved): idx
-                    for idx, (finding, relative_path, retrieved) in enumerate(pending)
+                    pool.submit(_analyze_one, idx, finding, relative_path): idx
+                    for idx, (finding, relative_path) in enumerate(pending)
                 }
                 for future in concurrent.futures.as_completed(future_to_index):
                     idx = future_to_index[future]
@@ -278,7 +297,7 @@ def scan_repo(req: ScanRequest):
         return ScanResult(
             summary=ScanSummary(
                 repo=f"{status.owner}/{status.name}",
-                files_scanned=len(files_to_scan),
+                files_scanned=len(files),
                 bugs_found=len(bug_reports),
                 confidence=confidence,
                 error_level=error_level,
