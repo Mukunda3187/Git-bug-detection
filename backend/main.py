@@ -171,7 +171,7 @@ def scan_repo(req: ScanRequest):
         # aggregate across hundreds of files, and running them concurrently
         # instead of one at a time shrinks that the same way Stage 2 already
         # shrinks the network-bound analysis step.
-        def _scan_one_file(full_path):
+    def _scan_one_file(full_path):
     ext = os.path.splitext(full_path)[1].lower()
 
     source = read_file_safely(full_path)
