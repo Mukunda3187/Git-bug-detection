@@ -171,28 +171,28 @@ def scan_repo(req: ScanRequest):
         # aggregate across hundreds of files, and running them concurrently
         # instead of one at a time shrinks that the same way Stage 2 already
         # shrinks the network-bound analysis step.
-    def _scan_one_file(full_path):
-    ext = os.path.splitext(full_path)[1].lower()
+        def _scan_one_file(full_path):
+            ext = os.path.splitext(full_path)[1].lower()
 
-    source = read_file_safely(full_path)
-    if not source:
-        return []
+            source = read_file_safely(full_path)
+            if not source:
+                return []
 
-    relative_path = os.path.relpath(full_path, repo_path)
+            relative_path = os.path.relpath(full_path, repo_path)
 
-    try:
-        detector = DETECTORS_BY_EXTENSION.get(ext)
+            try:
+                detector = DETECTORS_BY_EXTENSION.get(ext)
 
-        if detector:
-            findings = detector(relative_path, source)
-        else:
-            findings = analyze_file(relative_path, source)
+                if detector:
+                    findings = detector(relative_path, source)
+                else:
+                    findings = analyze_file(relative_path, source)
 
-    except Exception as e:
-        print(f"[scan] Failed to analyze {relative_path}: {e}")
-        return []
+            except Exception as e:
+                print(f"[scan] Failed to analyze {relative_path}: {e}")
+                return []
 
-    return [(finding, relative_path) for finding in findings]
+            return [(finding, relative_path) for finding in findings]
 
         # Indexed so file_findings[i] always corresponds to files[i], however
         # the threads finish - keeps finding order (and therefore bug
