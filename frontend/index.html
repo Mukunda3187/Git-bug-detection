@@ -435,6 +435,37 @@
 
     .cause-text, .explanation-text { font-size: 15px; color: var(--text-muted); line-height: 1.6; }
 
+    .solution-code-label {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+      color: var(--added);
+      margin-bottom: 6px;
+    }
+
+    .solution-note {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-left: 2px solid var(--accent);
+      background: rgba(139, 92, 246, 0.06);
+      color: var(--text-muted);
+      font-size: 14px;
+      line-height: 1.55;
+      white-space: pre-line;
+    }
+
+    .solution-action {
+      margin-top: 8px;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    .solution-file {
+      margin-bottom: 8px;
+      color: var(--accent-light);
+    }
+
     pre.code-block {
       margin: 0;
       padding: 14px 16px;
@@ -634,29 +665,41 @@ function renderCodeBlock(code, cssClass) {
 }
 
 function renderSolutionBlock(bug) {
-  const intro = bug.solution ? `<div class="cause-text">${escapeHtml(bug.solution)}</div>` : "";
+  const solutionText = bug.solution
+    ? `<div class="solution-note">${escapeHtml(bug.solution)}</div>`
+    : "";
+
+  const code = bug.replacement_code
+    ? renderCodeBlock(bug.replacement_code, "added")
+    : "";
 
   if (bug.solution_type === "add") {
     return `
-      ${intro}
-      ${bug.add_location ? `<div class="cause-text" style="margin-top:8px;">${escapeHtml(bug.add_location)}</div>` : ""}
-      ${bug.replacement_code ? renderCodeBlock(bug.replacement_code, "added") : ""}
+      ${code}
+      ${bug.add_location ? `<div class="solution-action">${escapeHtml(bug.add_location)}</div>` : ""}
+      ${solutionText}
     `;
   }
+
   if (bug.solution_type === "remove") {
-    return `${intro}`;
+    return `
+      ${code ? `<div class="solution-code-label">Remove this code</div>${code}` : ""}
+      ${solutionText}
+    `;
   }
+
   if (bug.solution_type === "create_file") {
     return `
-      ${intro}
-      ${bug.new_file_path ? `<div class="location-line" style="margin-top:8px;">${escapeHtml(bug.new_file_path)}</div>` : ""}
-      ${bug.replacement_code ? renderCodeBlock(bug.replacement_code, "added") : ""}
+      ${bug.new_file_path ? `<div class="location-line solution-file">${escapeHtml(bug.new_file_path)}</div>` : ""}
+      ${code}
+      ${solutionText}
     `;
   }
-  // default: "replace"
+
+  // Default: replace the detected buggy code with the corrected code.
   return `
-    ${intro}
-    ${bug.replacement_code ? renderCodeBlock(bug.replacement_code, "added") : ""}
+    ${code ? `<div class="solution-code-label">Replace with this code</div>${code}` : ""}
+    ${solutionText}
   `;
 }
 
