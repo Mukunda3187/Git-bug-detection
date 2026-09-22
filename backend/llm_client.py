@@ -81,40 +81,34 @@ def _build_rate_limit_message(retry_seconds, is_daily):
 
     return "The AI usage limit has been reached for now. Please try again in a minute or two."
 
-SYSTEM_PROMPT = """You are an expert code reviewer helping explain bugs to developers. Your goal is to provide clear, 
-actionable solutions that can be immediately applied.
+SYSTEM_PROMPT = """You are an expert code reviewer. Give an immediately usable fix for the exact bug shown.
 
-For each reported issue, provide a response with:
-1. **cause**: Explain EXACTLY why this code is problematic in 2-3 sentences, no jargon.
-2. **solution_type**: Choose from "replace", "add", "remove", or "create_file" - pick the most direct fix.
-3. **replacement_code**: For "replace" solutions, provide the EXACT corrected code that can be directly substituted.
-   - Keep variable names and structure identical
-   - Only modify the problematic part
-   - Ensure it's production-ready and handles edge cases
-4. **solution**: ONE clear, complete, specific passage (2-4 sentences) that fully explains the fix -
-   what exactly to change or do, in concrete terms tied to this exact code (line numbers, variable
-   names, the exact characters involved), not generic advice that could apply to any bug of this
-   type. This is the ONLY place the person reads for "what do I do" - do not split this into a vague
-   intro plus a separate action elsewhere; say everything they need in this one passage. If the fix
-   is a code replacement, describe what changed and why, since the code itself is also shown separately.
-5. **explanation**: Provide a brief technical explanation of why the fix works.
-6. **confidence**: An integer from 0 to 100 for THIS SPECIFIC finding, reflecting how confident you are that
-   (a) this is genuinely a real, correctly-diagnosed problem given the code and context shown, and
-   (b) the fix you're proposing actually resolves it correctly and completely.
-   Use the full range honestly - a solid, unambiguous fix for a clear-cut issue deserves 90-100.
-   A fix you're reasonably sure about but that depends on context you can't fully see deserves 60-85.
-   Anything you're genuinely unsure about, where the retrieved historical evidence is thin or the fix
-   is a best guess, deserves 30-55. Do not default to a single "safe" number every time - vary it
-   honestly based on the actual evidence for this specific finding.
+For each issue:
+1. cause: Explain why this exact code is wrong in 1-2 short sentences.
+2. solution_type: Choose "replace", "add", "remove", or "create_file".
+3. replacement_code:
+   - For "replace", give the COMPLETE corrected replacement for the supplied current_code.
+   - It must be directly copy-pasteable.
+   - Change only what is necessary to fix the bug.
+   - For "add", give the exact code that must be added when possible.
+   - For "remove", give the exact code that should be removed when possible.
+4. solution: EXACTLY 2 short sentences:
+   Sentence 1: what the developer must do.
+   Sentence 2: why that fixes this bug.
+   Do NOT give theory, background, long explanations, or generic advice.
+5. explanation: one short technical sentence.
+6. confidence: integer 0-100 for this specific diagnosis and fix.
+7. insufficient_evidence: true if the supplied code is not enough to create a reliable exact fix.
 
-CRITICAL RULES:
-- If solution_type is "replace", replacement_code MUST NEVER be null or empty. Always provide working code.
-- If you cannot provide a concrete fix, use solution_type "add" or set insufficient_evidence to true.
-- Do not paraphrase or restructure unrelated code.
-- Provide solutions that are immediately applicable to the codebase.
-- Consider edge cases and error handling in your fixes.
+CRITICAL:
+- The replacement_code is the actual fix shown to the user.
+- Never invent code when the supplied snippet is insufficient.
+- If an exact replacement cannot be determined safely, set insufficient_evidence=true.
+- Do not put markdown fences around replacement_code.
+- Do not include code inside solution; code belongs in replacement_code.
+- Keep solution to exactly two short sentences.
 
-Reply with ONLY a JSON object, no markdown fences or extra text:
+Reply with ONLY a JSON object:
 {
   "error": string,
   "bug_type": one of ["Runtime Error","Logic Error","Syntax Error","Type Error","Dependency Error","Security Issue","Performance Issue","API Error","Unnecessary Code","Other"],
@@ -159,7 +153,7 @@ def _build_user_message(finding: dict, retrieved: list) -> str:
 {retrieved_block}
 
 **Your Task:**
-Analyze this candidate and provide a complete, production-ready fix. Ensure replacement_code is never empty for "replace" solutions."""
+Analyze this candidate and provide the smallest reliable code replacement that fixes the reported bug. The replacement_code must be directly usable for the supplied Current Code. If the exact fix cannot be determined from the supplied code, set insufficient_evidence=true instead of inventing code."""
 
 
 # How confident the FALLBACK path (no live LLM call) can honestly be in
@@ -322,72 +316,75 @@ def _fallback_report(finding: dict) -> dict:
 
     if rule == "possibly_unused_function":
         solution_type = "remove"
-        solution = "Delete this function. It isn't called anywhere else in this file, so removing it has no effect on behavior - if it turns out to be used from another file this detector can't see, undo the deletion instead of guessing."
+        replacement_code = current_code
+        solution = "Remove this unused function if it is not referenced elsewhere. This removes dead code without changing behavior when there are no external references."
 
     elif rule == "bare_except":
         solution_type = "replace"
         replacement_code = current_code.replace("except:", "except Exception as e:", 1)
-        solution = "Replace the bare 'except:' with 'except Exception as e:', as shown below. A bare except also catches things like KeyboardInterrupt and SystemExit, which should almost never be silently swallowed - naming Exception avoids that while still catching ordinary errors."
+        solution = "Replace the bare 'except:' with 'except Exception as e:' using the code below. This catches normal exceptions without also swallowing system-exit and keyboard-interrupt signals."
 
     elif rule == "mutable_default_arg":
         replacement_code = _fix_mutable_default_arg(current_code)
         if replacement_code:
             solution_type = "replace"
-            solution = "Replace this signature with the version below: change the default to None, then create a fresh list/dict/set inside the function body on first use. The current version reuses the SAME object across every call, so items added in one call silently show up in the next."
+            solution = "Replace the function code with the version below so the mutable value is created separately for each call. This prevents data from one function call being reused by the next call."
         else:
             # Couldn't mechanically locate the mutable default in the captured
             # snippet (e.g. a multi-line signature) - never claim code is
             # "shown below" and then show nothing.
             solution_type = "add"
-            solution = "Change the default value to None, then add 'if <param> is None: <param> = []' (or {} / set(), matching whatever the original default was) as the first line inside the function body. This function's mutable default is currently shared across every call to it, which usually isn't intended."
+            solution = "Change the mutable default to None and create a new list, dict, or set inside the function. This prevents the same mutable object from being shared across calls."
 
     elif rule == "eq_none":
         solution_type = "replace"
         replacement_code = current_code.replace("== None", "is None").replace("!= None", "is not None")
-        solution = "Replace '==' / '!=' with 'is' / 'is not' when comparing to None, as shown below. 'is' checks identity directly and can't be fooled by a custom __eq__ method, which is why it's the correct way to check for None in Python."
+        solution = "Replace the None comparison with 'is None' or 'is not None' using the code below. This performs the intended identity check for Python's None value."
 
     elif rule == "possible_division_by_zero":
         solution_type = "add"
         add_location = "Add this check on the line right before the division."
         replacement_code = "if denominator != 0:  # replace 'denominator' with your actual variable name"
-        solution = "Add a check that the denominator isn't zero before this line runs (see the line to add below), and decide what should happen when it is - skip the calculation, return a default value, or raise a clear error instead of letting the program crash with a ZeroDivisionError."
+        solution = "Add the zero check immediately before the division and handle the zero case explicitly. This prevents the calculation from raising ZeroDivisionError at runtime."
 
     elif rule == "syntax_error":
-        solution_type = "replace"
+        solution_type = "add"
         cause = f"Python's own parser could not read this code. The exact reason it gave was: \"{cause_from_detector}\"."
-        solution = f"Edit this line to fix the specific problem Python's parser reported: {cause_from_detector}. The file won't run at all until this is fixed, since Python can't even finish reading it - after editing, re-run the file (or 'python -m py_compile <file>') to confirm it now parses cleanly."
+        add_location = "Edit the reported line and correct the parser error."
+        solution = f"Fix the parser problem reported here: {cause_from_detector}. Re-run the file after editing to confirm that the syntax error is gone."
 
     elif rule == "unclosed_bracket":
         solution_type = "replace"
         m = UNCLOSED_CHAR_RE.search(error_text)
         opener = m.group(1) if m else "{"
         closer = BRACKET_CLOSER.get(opener, "}")
+        if current_code.strip():
+            replacement_code = current_code.rstrip() + closer
         solution = (
-            f"A '{opener}' was opened here but is never closed anywhere in the rest of the file. "
-            f"Add the missing '{closer}' at the point where this block, function call, or expression "
-            f"is meant to end - if you're not sure exactly where, work outward from this line counting "
-            f"'{opener}' and '{closer}' until you find the spot where one is missing."
+            f"Add the missing '{closer}' to close the '{opener}' opened by this code. "
+            f"Place it where the block or expression ends so the brackets are balanced."
         )
 
     elif rule == "mismatched_bracket":
         solution_type = "replace"
         m = MISMATCHED_CHARS_RE.search(error_text)
         found, expected = (m.group(1), m.group(2)) if m else ("?", "?")
+        if found in current_code and expected:
+            replacement_code = current_code.replace(found, expected, 1)
         solution = (
-            f"This should be a closing '{expected}' to match the bracket opened earlier, but '{found}' "
-            f"appears instead. Either replace it with '{expected}', or - if '{found}' is actually correct "
-            f"here - check whether an earlier bracket in this block was closed at the wrong spot, since "
-            f"that would make this one line up with the wrong opener."
+            f"Replace the unexpected '{found}' with the expected '{expected}' when this is the closing bracket for the current block. "
+            f"If the surrounding structure uses '{found}' intentionally, check the earlier opening bracket instead."
         )
 
     elif rule == "unexpected_closing_bracket":
         solution_type = "replace"
         m = UNEXPECTED_CHAR_RE.search(error_text)
         closer = m.group(1) if m else "}"
+        if closer in current_code:
+            replacement_code = current_code.replace(closer, "", 1)
         solution = (
-            f"This '{closer}' has no matching opening bracket anywhere before it in the file. Either "
-            f"delete this extra '{closer}', or - if it's meant to close something real - add the missing "
-            f"opening bracket earlier in the code where that block, call, or expression actually starts."
+            f"Remove the extra '{closer}' if it has no matching opening bracket. "
+            f"If it is meant to close a real block, add the missing opening bracket at that block's start instead."
         )
 
     elif rule == "unterminated_string":
@@ -396,56 +393,64 @@ def _fallback_report(finding: dict) -> dict:
 
     elif rule == "unterminated_template_literal":
         solution_type = "replace"
-        solution = "Add the missing closing backtick (`) to complete this template string. Every backtick that opens a template literal needs exactly one matching backtick to close it - count the backticks on this line and nearby lines to find where one was left out."
+        if current_code.strip():
+            replacement_code = current_code.rstrip() + "`"
+        solution = "Add the missing closing backtick (`) to complete this template literal. This lets the parser treat the following code as code instead of continuing the string."
 
     elif rule == "unterminated_comment":
         solution_type = "replace"
-        solution = "Add the missing */ to close this comment block. Until it's closed, every line after it in the file is silently treated as part of the comment, which can hide real code from the compiler without any warning - so check that nothing important got swallowed once this is fixed."
+        if current_code.strip():
+            replacement_code = current_code.rstrip() + "*/"
+        solution = "Add the missing */ to close this block comment. Then check the following lines to ensure no real code was accidentally included inside the comment."
 
     elif rule == "loose_equality":
         solution_type = "replace"
         if "!=" in current_code:
             replacement_code = current_code.replace("!=", "!==")
-            solution = "Change '!=' to '!==', as shown below. '!=' compares values after converting them to a common type first, which can make surprisingly different values look equal (e.g. 0 != \"0\" is false) - '!==' compares type and value together with no conversion."
+            solution = "Change '!=' to '!==' using the code below. This compares both type and value without implicit type conversion."
         else:
             replacement_code = current_code.replace("==", "===")
-            solution = "Change '==' to '===', as shown below. '==' compares values after converting them to a common type first, which can make surprisingly different values look equal (e.g. 0 == \"0\" is true) - '===' compares type and value together with no conversion."
+            solution = "Change '==' to '===' using the code below. This compares both type and value without implicit type conversion."
 
     elif rule == "var_declaration":
         solution_type = "replace"
         replacement_code = current_code.replace("var ", "let ", 1)
-        solution = "Change 'var' to 'let' (or 'const' if this value is never reassigned), as shown below. 'var' is function-scoped and hoisted, which can let a variable leak out of the block it looks like it belongs to - 'let'/'const' are block-scoped and avoid that entire class of bug."
+        solution = "Change 'var' to 'let' or 'const' using the code below. Block-scoped declarations prevent the variable from leaking outside its intended block."
 
     elif rule == "empty_catch_block":
         replacement_code = _fix_empty_catch(current_code, finding.get("file", ""))
         if replacement_code:
             solution_type = "replace"
-            solution = "Replace this with the version below, which logs the caught error instead of silently discarding it. Right now, if this code ever throws, the failure disappears with no log, no fallback, and no way to know it happened."
+            solution = "Replace this empty catch block with the version below so the error is recorded. This prevents failures from being silently discarded."
         else:
             solution_type = "add"
-            solution = "Add at least a log statement (e.g. console.error(err), or the equivalent for this language) inside the catch block. Right now this catch block does nothing, so if the wrapped code ever throws, the failure is silently discarded with no trace of it happening."
+            solution = "Add an error log inside the catch block. This keeps the failure visible instead of silently discarding the exception."
 
     elif rule == "leftover_console_statement":
         solution_type = "remove"
-        solution = "Delete this console.log/debug statement before shipping. It's harmless in production but usually isn't meant to ship, and can leak internal data into the browser console - if it's intentional logging rather than a debugging leftover, it's fine to leave as-is."
+        replacement_code = current_code
+        solution = "Remove this debugging console statement if it is not intentional application logging. This keeps temporary debugging output out of the shipped code."
 
     elif rule == "leftover_debugger_statement":
         solution_type = "remove"
-        solution = "Delete this 'debugger' statement before shipping. It pauses execution in any browser with developer tools open, which is almost always leftover from debugging rather than something meant to run in production."
+        replacement_code = current_code
+        solution = "Remove this 'debugger' statement from the code. Otherwise execution can pause when developer tools are open."
 
     elif rule == "leftover_debug_print":
         solution_type = "remove"
-        solution = "Delete this print statement before shipping, unless it's intentional program output (e.g. a CLI tool's actual result) rather than a debugging leftover - if you're not sure which it is, check whether removing it would change what the program is supposed to display to a real user."
+        replacement_code = current_code
+        solution = "Remove this print statement if it is only debugging output. Keep it only when the program intentionally uses it as user-facing or command-line output."
 
     elif rule == "unreachable_code":
         solution_type = "remove"
-        solution = "Delete this code. It sits right after a return, throw, or a branch that always exits, so it can never actually execute - removing it has no effect on the program's behavior, since it never ran in the first place."
+        replacement_code = current_code
+        solution = "Remove this unreachable code. It cannot execute because the control flow always exits before reaching it."
 
     else:
         # Should not normally be reached - every known rule is handled above -
         # but keep a safe, honest fallback for any future/unknown rule.
         solution_type = "replace"
-        solution = "We couldn't prepare an automatic fix for this one - review the code below and apply the fix yourself, using the cause above as a starting point."
+        solution = "Review the reported code and apply a manual fix based on the detected cause. An exact automatic replacement is not safe to generate from the available context."
 
     return {
         "error": finding.get("error", "Possible issue"),
@@ -642,6 +647,51 @@ def get_fallback_report(finding: dict) -> dict:
     return _fallback_report(finding)
 
 
+
+def _normalize_solution_text(solution: str) -> str:
+    """Keep the user-facing solution short: exactly two concise sentences when possible."""
+    if not solution:
+        return ""
+    clean = re.sub(r"```(?:\w+)?|```", "", str(solution)).strip()
+    clean = re.sub(r"\s+", " ", clean)
+    sentences = re.split(r"(?<=[.!?])\s+", clean)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if len(sentences) >= 2:
+        return " ".join(sentences[:2])
+    return clean
+
+
+def _validate_llm_result(result: dict, finding: dict) -> dict | None:
+    """Validate and normalize the LLM result before it reaches the frontend."""
+    if not isinstance(result, dict):
+        return None
+
+    solution_type = result.get("solution_type")
+    replacement = result.get("replacement_code")
+
+    if solution_type == "replace":
+        if not isinstance(replacement, str) or not replacement.strip():
+            return None
+    elif solution_type in {"add", "remove", "create_file"}:
+        if replacement is not None and not isinstance(replacement, str):
+            result["replacement_code"] = str(replacement)
+
+    solution = _normalize_solution_text(result.get("solution", ""))
+    if not solution:
+        return None
+
+    result["solution"] = solution
+
+    confidence = result.get("confidence")
+    if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
+        result["confidence"] = 70
+    else:
+        result["confidence"] = int(confidence)
+
+    result.setdefault("insufficient_evidence", False)
+    return result
+
+
 def analyze_finding(finding: dict, retrieved: list) -> dict:
     api_keys = []
 
@@ -722,28 +772,12 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
 
                     result = json.loads(cleaned)
 
-                    # Validate that replacement_code is not empty for "replace" solutions
-                    if result.get("solution_type") == "replace" and not result.get("replacement_code"):
-                        print(f"[llm_client] Gemini returned empty replacement_code for replace solution. Using fallback.")
+                    validated = _validate_llm_result(result, finding)
+                    if validated is None:
+                        print("[llm_client] Gemini returned an unusable fix. Using fallback.")
                         return _fallback_report(finding)
 
-                    # A missing/empty solution would mean the one thing the person
-                    # actually opens this report to read is blank - never let that
-                    # reach the frontend silently.
-                    if not (result.get("solution") or "").strip():
-                        print(f"[llm_client] Gemini returned an empty solution field. Using fallback.")
-                        return _fallback_report(finding)
-
-                    # Gemini occasionally omits confidence despite the instruction, or
-                    # returns something outside 0-100 - never let a missing/bad number
-                    # here break the scan-wide average computed in main.py.
-                    confidence = result.get("confidence")
-                    if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
-                        result["confidence"] = 70
-                    else:
-                        result["confidence"] = int(confidence)
-
-                    return result
+                    return validated
 
                 except (json.JSONDecodeError, ValueError) as e:
                     print(f"[llm_client] Gemini returned non-JSON response: {raw_text[:300]}")
