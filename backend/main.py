@@ -24,7 +24,7 @@ from detectors.python_detector import detect as detect_python
 from detectors.js_detector import detect as detect_js
 from detectors.cfamily_detector import detect as detect_cfamily
 from rag.retriever import retrieve_similar_bugs
-from llm_client import analyze_finding, get_fallback_report
+from llm_client import analyze_finding, get_fallback_report, analyze_file
 
 app = FastAPI(title="RAG-Enhanced LLM for GitHub Bug Detection and Recovery")
 
@@ -172,20 +172,27 @@ def scan_repo(req: ScanRequest):
         # instead of one at a time shrinks that the same way Stage 2 already
         # shrinks the network-bound analysis step.
         def _scan_one_file(full_path):
-            ext = os.path.splitext(full_path)[1].lower()
-              detector = DETECTORS_BY_EXTENSION.get(ext)
-            source = read_file_safely(full_path)
-            if not source:
-                return []
-            relative_path = os.path.relpath(full_path, repo_path)
-            try:
-    if detector:
-        findings = detector(relative_path, source)
-    else:
-        findings = []
-except Exception:
-    findings = []
-            return [(finding, relative_path) for finding in findings]
+    ext = os.path.splitext(full_path)[1].lower()
+
+    source = read_file_safely(full_path)
+    if not source:
+        return []
+
+    relative_path = os.path.relpath(full_path, repo_path)
+
+    try:
+        detector = DETECTORS_BY_EXTENSION.get(ext)
+
+        if detector:
+            findings = detector(relative_path, source)
+        else:
+            findings = analyze_file(relative_path, source)
+
+    except Exception as e:
+        print(f"[scan] Failed to analyze {relative_path}: {e}")
+        return []
+
+    return [(finding, relative_path) for finding in findings]
 
         # Indexed so file_findings[i] always corresponds to files[i], however
         # the threads finish - keeps finding order (and therefore bug
