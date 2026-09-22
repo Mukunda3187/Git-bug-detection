@@ -172,18 +172,19 @@ def scan_repo(req: ScanRequest):
         # instead of one at a time shrinks that the same way Stage 2 already
         # shrinks the network-bound analysis step.
         def _scan_one_file(full_path):
-            ext = os.path.splitext(full_path)[1]
-            detector = DETECTORS_BY_EXTENSION.get(ext)
-            if not detector:
-                return []
+            ext = os.path.splitext(full_path)[1].lower()
+              detector = DETECTORS_BY_EXTENSION.get(ext)
             source = read_file_safely(full_path)
             if not source:
                 return []
             relative_path = os.path.relpath(full_path, repo_path)
             try:
-                findings = detector(relative_path, source)
-            except Exception:
-                return []
+    if detector:
+        findings = detector(relative_path, source)
+    else:
+        findings = []
+except Exception:
+    findings = []
             return [(finding, relative_path) for finding in findings]
 
         # Indexed so file_findings[i] always corresponds to files[i], however
