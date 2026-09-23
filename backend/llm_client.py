@@ -23,6 +23,13 @@ import requests
 GEMINI_MODEL = "gemini-2.0-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
+# See the comment in analyze_finding() where this is used - together these two
+# bound the worst-case time one finding's LLM call can take to
+# MAX_KEYS_TO_TRY_PER_CALL * GEMINI_REQUEST_TIMEOUT_SECONDS, regardless of how
+# many keys end up configured.
+MAX_KEYS_TO_TRY_PER_CALL = 4
+GEMINI_REQUEST_TIMEOUT_SECONDS = 7
+
 
 def _parse_rate_limit_info(resp):
     """
@@ -74,40 +81,81 @@ def _build_rate_limit_message(retry_seconds, is_daily):
 
     return "The AI usage limit has been reached for now. Please try again in a minute or two."
 
-SYSTEM_PROMPT = """You are an expert code reviewer helping explain bugs to developers. Your goal is to provide clear, 
-actionable solutions that can be immediately applied.
+SYSTEM_PROMPT = """You are an expert software debugger. You are given ONE individual bug finding at a time.
 
-For each reported issue, provide a response with:
-1. **cause**: Explain EXACTLY why this code is problematic in 2-3 sentences, no jargon.
-2. **solution_type**: Choose from "replace", "add", "remove", or "create_file" - pick the most direct fix.
-3. **replacement_code**: For "replace" solutions, provide the EXACT corrected code that can be directly substituted.
-   - Keep variable names and structure identical
-   - Only modify the problematic part
-   - Ensure it's production-ready and handles edge cases
-4. **solution**: ONE clear, complete, specific passage (2-4 sentences) that fully explains the fix -
-   what exactly to change or do, in concrete terms tied to this exact code (line numbers, variable
-   names, the exact characters involved), not generic advice that could apply to any bug of this
-   type. This is the ONLY place the person reads for "what do I do" - do not split this into a vague
-   intro plus a separate action elsewhere; say everything they need in this one passage. If the fix
-   is a code replacement, describe what changed and why, since the code itself is also shown separately.
-5. **explanation**: Provide a brief technical explanation of why the fix works.
-6. **confidence**: An integer from 0 to 100 for THIS SPECIFIC finding, reflecting how confident you are that
-   (a) this is genuinely a real, correctly-diagnosed problem given the code and context shown, and
-   (b) the fix you're proposing actually resolves it correctly and completely.
-   Use the full range honestly - a solid, unambiguous fix for a clear-cut issue deserves 90-100.
-   A fix you're reasonably sure about but that depends on context you can't fully see deserves 60-85.
-   Anything you're genuinely unsure about, where the retrieved historical evidence is thin or the fix
-   is a best guess, deserves 30-55. Do not default to a single "safe" number every time - vary it
-   honestly based on the actual evidence for this specific finding.
+Your job is NOT to give a generic explanation for the bug category. You must analyze THIS exact finding independently.
 
-CRITICAL RULES:
-- If solution_type is "replace", replacement_code MUST NEVER be null or empty. Always provide working code.
-- If you cannot provide a concrete fix, use solution_type "add" or set insufficient_evidence to true.
-- Do not paraphrase or restructure unrelated code.
-- Provide solutions that are immediately applicable to the codebase.
-- Consider edge cases and error handling in your fixes.
+Use ALL of these inputs:
+- exact file path
+- exact function/component
+- exact line range
+- detector rule
+- detector's cause
+- exact Current Code snippet
+- relevant historical bug/fix examples from the RAG context
 
-Reply with ONLY a JSON object, no markdown fences or extra text:
+FIRST analyze the exact Current Code.
+Then identify the specific mistake in that code.
+Then create the smallest reliable fix for THAT exact code.
+Do not copy a solution from another bug just because the rule name is similar.
+
+OUTPUT REQUIREMENTS:
+
+1. "cause"
+Explain why THIS exact code is wrong in 1-2 short sentences. Mention the actual variable, statement, operator, bracket, function, or code pattern involved.
+
+2. "solution_type"
+Choose exactly one:
+- "replace" = the shown buggy code should be replaced by corrected code
+- "add" = new code must be added
+- "remove" = the shown code should be deleted
+- "create_file" = a new file must be created
+
+3. "replacement_code"
+For "replace":
+- Return the complete corrected replacement for Current Code.
+- It MUST be different from Current Code.
+- Keep unrelated code unchanged.
+- The code must directly fix THIS finding.
+- Do not return a generic example.
+
+For "add":
+- Return the exact code that should be added, based on THIS finding.
+
+For "remove":
+- Set replacement_code to null. Never repeat the buggy Current Code as the solution.
+
+For "create_file":
+- Return the exact new file content when enough context exists.
+
+4. "solution"
+Write EXACTLY TWO short sentences and make them specific to THIS bug.
+Sentence 1 must tell the developer exactly what to change.
+Sentence 2 must tell briefly why that exact change fixes THIS bug.
+Do NOT write generic theory.
+Do NOT reuse the same sentence for different bugs.
+Do NOT mention generic advice such as "review the code", "follow best practices", or "handle errors properly".
+Do NOT put code blocks in solution.
+
+5. "explanation"
+One short technical sentence explaining why the generated fix works.
+
+6. "confidence"
+Integer 0-100 based on the actual evidence in THIS finding.
+
+7. "insufficient_evidence"
+Set true if the exact supplied code is not enough to safely generate the required fix. Never invent a fix.
+
+IMPORTANT:
+- Every finding is independent. Never assume two findings have the same solution.
+- The same rule can have different fixes depending on the actual Current Code.
+- The solution must be derived from the supplied code, not from the rule name alone.
+- Historical RAG examples are supporting evidence only; adapt them to the Current Code.
+- Never return replacement_code identical to Current Code.
+- Never claim a fix is exact when the required context is missing.
+- Return ONLY valid JSON. No markdown fences and no text outside JSON.
+
+JSON schema:
 {
   "error": string,
   "bug_type": one of ["Runtime Error","Logic Error","Syntax Error","Type Error","Dependency Error","Security Issue","Performance Issue","API Error","Unnecessary Code","Other"],
@@ -152,7 +200,13 @@ def _build_user_message(finding: dict, retrieved: list) -> str:
 {retrieved_block}
 
 **Your Task:**
-Analyze this candidate and provide a complete, production-ready fix. Ensure replacement_code is never empty for "replace" solutions."""
+Treat this as a NEW and INDEPENDENT bug. Analyze only this finding first, using the exact Current Code and context above.
+
+Do not reuse a generic solution from another bug. Derive the fix from the actual statement, variable, operator, bracket, control flow, or other code shown here.
+
+For "replace", replacement_code must be a genuinely corrected version and MUST differ from Current Code.
+For "remove", replacement_code must be null.
+The two solution sentences must describe what to do for THIS exact bug and why THIS exact change fixes it."""
 
 
 # How confident the FALLBACK path (no live LLM call) can honestly be in
@@ -440,6 +494,13 @@ def _fallback_report(finding: dict) -> dict:
         solution_type = "replace"
         solution = "We couldn't prepare an automatic fix for this one - review the code below and apply the fix yourself, using the cause above as a starting point."
 
+    if solution_type == "replace" and isinstance(replacement_code, str):
+        if re.sub(r"\s+", "", replacement_code) == re.sub(r"\s+", "", current_code):
+            replacement_code = None
+            solution_type = "add"
+            add_location = add_location or "Edit the reported code at this location using the detected cause."
+            solution = "Apply the correction described by the detected cause at this location. An exact automatic replacement could not be generated safely from the available code."
+
     return {
         "error": finding.get("error", "Possible issue"),
         "bug_type": bug_type,
@@ -456,6 +517,175 @@ def _fallback_report(finding: dict) -> dict:
     }
 
 
+
+def analyze_file(file_path: str, source: str) -> list:
+    """
+    Analyze a readable text file directly with Gemini when there is no
+    specialized detector for its extension.
+
+    This is intentionally separate from analyze_finding(): analyze_finding()
+    receives one detector finding plus RAG context, while this function asks
+    Gemini to inspect the whole file and return candidate findings that can
+    then enter the normal RAG + report pipeline in main.py.
+
+    Returns an empty list when no API key is available, the file is empty, the
+    model call fails, or Gemini returns invalid JSON. This keeps the normal
+    detector/fallback pipeline safe instead of inventing a finding.
+    """
+    if not source or not source.strip():
+        return []
+
+    api_keys = []
+
+    # Reuse the same multi-key configuration as analyze_finding().
+    for i in range(1, 11):
+        key = os.getenv(f"GEMINI_API_KEY_{i}")
+        if key and key.strip():
+            api_keys.append(key.strip())
+
+    old_key = os.getenv("GEMINI_API_KEY")
+    if old_key and old_key.strip() and old_key.strip() not in api_keys:
+        api_keys.append(old_key.strip())
+
+    if not api_keys:
+        return []
+
+    api_keys = api_keys[:MAX_KEYS_TO_TRY_PER_CALL]
+
+    file_prompt = f"""You are reviewing a source/configuration/text file for real software bugs.
+
+File: {file_path}
+
+Analyze the complete file below. Report ONLY issues that are reasonably supported
+by the code/text itself. Do not invent bugs just because a style preference is
+not followed. If there are no clear issues, return an empty JSON array.
+
+For every real or strongly supported issue, return an object with exactly these
+fields:
+- error: short description of the bug
+- bug_type: one of Runtime Error, Logic Error, Syntax Error, Type Error,
+  Dependency Error, Security Issue, Performance Issue, API Error,
+  Unnecessary Code, Other
+- cause: why the issue occurs
+- line_start: 1-based starting line number
+- line_end: 1-based ending line number
+- current_code: the smallest relevant code/text snippet
+- function: function/class/component name if applicable, otherwise null
+
+Rules:
+- Use 1-based line numbers.
+- Only report issues you can point to in the supplied file.
+- Do not report vague possibilities without evidence.
+- Do not include markdown fences or explanations outside the JSON array.
+
+Return ONLY a JSON array.
+
+FILE CONTENT:
+--------------------
+{source}
+--------------------
+"""
+
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": "You are a precise software bug detector. Return valid JSON only."}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": file_prompt}],
+            }
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.1,
+            "maxOutputTokens": 2500,
+            "topP": 0.9,
+            "topK": 40,
+        },
+    }
+
+    last_error = None
+
+    for key_number, api_key in enumerate(api_keys, start=1):
+        try:
+            resp = requests.post(
+                GEMINI_URL,
+                params={"key": api_key},
+                json=payload,
+                timeout=GEMINI_REQUEST_TIMEOUT_SECONDS,
+            )
+
+            if resp.status_code != 200:
+                last_error = (
+                    f"Gemini file-analysis key {key_number} returned "
+                    f"HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+                continue
+
+            data = resp.json()
+            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            cleaned = (
+                raw_text.strip()
+                .removeprefix("```json")
+                .removeprefix("```")
+                .removesuffix("```")
+                .strip()
+            )
+
+            result = json.loads(cleaned)
+            if not isinstance(result, list):
+                print("[llm_client] Gemini file analysis did not return a JSON array.")
+                return []
+
+            findings = []
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+
+                error = str(item.get("error") or "").strip()
+                if not error:
+                    continue
+
+                bug_type = str(item.get("bug_type") or "Other").strip()
+                allowed_types = {
+                    "Runtime Error", "Logic Error", "Syntax Error", "Type Error",
+                    "Dependency Error", "Security Issue", "Performance Issue",
+                    "API Error", "Unnecessary Code", "Other",
+                }
+                if bug_type not in allowed_types:
+                    bug_type = "Other"
+
+                line_start = item.get("line_start")
+                line_end = item.get("line_end")
+                try:
+                    line_start = int(line_start) if line_start is not None else None
+                    line_end = int(line_end) if line_end is not None else line_start
+                except (TypeError, ValueError):
+                    line_start = None
+                    line_end = None
+
+                findings.append({
+                    "error": error,
+                    "bug_type": bug_type,
+                    "cause": str(item.get("cause") or "").strip(),
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "current_code": str(item.get("current_code") or "").strip(),
+                    "function": item.get("function"),
+                    "rule": "llm_file_analysis",
+                    "file": file_path,
+                })
+
+            return findings
+
+        except Exception as e:
+            last_error = f"Gemini file analysis key {key_number} failed: {e}"
+
+    if last_error:
+        print(f"[llm_client] File analysis failed: {last_error}")
+    return []
+
 def get_fallback_report(finding: dict) -> dict:
     """
     Public entry point to the same real, rule-specific advice used when
@@ -464,6 +694,60 @@ def get_fallback_report(finding: dict) -> dict:
     genuine, specific answer instead of dropping the finding entirely.
     """
     return _fallback_report(finding)
+
+
+
+def _short_solution(text: str) -> str:
+    """Return only the first two useful sentences for the Solution UI."""
+    if not text:
+        return ""
+    clean = re.sub(r"```(?:\w+)?|```", "", str(text)).strip()
+    clean = re.sub(r"\s+", " ", clean)
+    sentences = re.split(r"(?<=[.!?])\s+", clean)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    return " ".join(sentences[:2]) if sentences else clean
+
+
+def _same_code(a, b) -> bool:
+    """Compare code while ignoring harmless whitespace differences."""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    normalize = lambda s: re.sub(r"\s+", "", s).strip()
+    return normalize(a) == normalize(b)
+
+
+def _validate_llm_result(result: dict, finding: dict):
+    """Reject unusable or non-specific LLM fixes before they reach the frontend."""
+    if not isinstance(result, dict):
+        return None
+
+    solution_type = result.get("solution_type")
+    current_code = str(finding.get("current_code") or "")
+    replacement = result.get("replacement_code")
+
+    if solution_type == "replace":
+        if not isinstance(replacement, str) or not replacement.strip():
+            return None
+        if _same_code(replacement, current_code):
+            print("[llm_client] Gemini returned the same code as the error code. Using fallback.")
+            return None
+
+    if solution_type == "remove":
+        # A remove solution must never display the same buggy code again.
+        result["replacement_code"] = None
+
+    result["solution"] = _short_solution(result.get("solution", ""))
+    if not result["solution"]:
+        return None
+
+    confidence = result.get("confidence")
+    if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
+        result["confidence"] = 70
+    else:
+        result["confidence"] = int(confidence)
+
+    result.setdefault("insufficient_evidence", False)
+    return result
 
 
 def analyze_finding(finding: dict, retrieved: list) -> dict:
@@ -482,6 +766,14 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
 
     if not api_keys:
         return _fallback_report(finding)
+
+    # Bounds the worst case for one finding to MAX_KEYS_TO_TRY_PER_CALL * the
+    # per-attempt timeout below, no matter how many keys end up configured -
+    # a scan with many findings calls this once per finding, so an unbounded
+    # key list here directly multiplies into minutes of wall-clock time on a
+    # bad run (several keys rate-limited or slow to respond) even before
+    # accounting for how many findings there are.
+    api_keys = api_keys[:MAX_KEYS_TO_TRY_PER_CALL]
 
     payload = {
         "system_instruction": {
@@ -519,7 +811,7 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
                 GEMINI_URL,
                 params={"key": api_key},
                 json=payload,
-                timeout=12,
+                timeout=GEMINI_REQUEST_TIMEOUT_SECONDS,
             )
 
             if resp.status_code == 200:
@@ -538,28 +830,10 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
 
                     result = json.loads(cleaned)
 
-                    # Validate that replacement_code is not empty for "replace" solutions
-                    if result.get("solution_type") == "replace" and not result.get("replacement_code"):
-                        print(f"[llm_client] Gemini returned empty replacement_code for replace solution. Using fallback.")
+                    validated = _validate_llm_result(result, finding)
+                    if validated is None:
                         return _fallback_report(finding)
-
-                    # A missing/empty solution would mean the one thing the person
-                    # actually opens this report to read is blank - never let that
-                    # reach the frontend silently.
-                    if not (result.get("solution") or "").strip():
-                        print(f"[llm_client] Gemini returned an empty solution field. Using fallback.")
-                        return _fallback_report(finding)
-
-                    # Gemini occasionally omits confidence despite the instruction, or
-                    # returns something outside 0-100 - never let a missing/bad number
-                    # here break the scan-wide average computed in main.py.
-                    confidence = result.get("confidence")
-                    if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
-                        result["confidence"] = 70
-                    else:
-                        result["confidence"] = int(confidence)
-
-                    return result
+                    return validated
 
                 except (json.JSONDecodeError, ValueError) as e:
                     print(f"[llm_client] Gemini returned non-JSON response: {raw_text[:300]}")
