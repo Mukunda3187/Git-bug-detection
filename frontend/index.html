@@ -607,7 +607,7 @@
   <div id="results-holder"></div>
 
   <footer>
-    <strong>⚠ Check before editing code.</strong> Every finding here comes from static analysis plus an LLM guess — it can be wrong, incomplete, or miss context only you have. Review each suggested fix yourself before applying it, especially anything marked "not fully sure" above.
+    <strong>⚠ Check before editing code.</strong> Every finding here comes from static analysis plus an LLM guess — it can be wrong, incomplete, or miss context only you have. Review each suggested fix yourself before applying it.
   </footer>
 </div>
 
@@ -819,11 +819,6 @@ function renderBugCard(bug) {
           <div class="field-label">Solution</div>
           ${renderSolutionBlock(bug)}
         </div>
-
-        ${bug.insufficient_evidence ? `
-          <div class="simple-note">We are not fully sure this is a real problem, so please check it yourself before making any changes.</div>
-        ` : ""}
-
         ${retrievedSection}
       </div>
     </div>
