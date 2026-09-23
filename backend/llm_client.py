@@ -370,7 +370,7 @@ def _fallback_report(finding: dict) -> dict:
     if rule == "possibly_unused_function":
         solution_type = "remove"
         fn_match = re.search(
-            r"\\b(?:def|async\\s+def|function)\\s+([A-Za-z_]\\w*)",
+            r"\b(?:def|async\s+def|function)\s+([A-Za-z_]\w*)",
             current_code,
         )
         fn_name = fn_match.group(1) if fn_match else "this function"
@@ -728,7 +728,7 @@ def _code_anchor(finding: dict) -> str:
 
     # Prefer a function/class name because it makes the solution visibly
     # specific to the individual finding.
-    m = re.search(r"\\b(?:def|async\\s+def|function|class)\\s+([A-Za-z_]\\w*)", code)
+    m = re.search(r"\b(?:def|async\s+def|function|class)\s+([A-Za-z_]\w*)", code)
     if m:
         return f"`{m.group(1)}()`"
 
@@ -750,21 +750,21 @@ def _solution_is_specific(solution: str, finding: dict) -> bool:
         return True
 
     # Exact function/class name is the strongest signal.
-    names = re.findall(r"\\b(?:def|async\\s+def|function|class)\\s+([A-Za-z_]\\w*)", code)
+    names = re.findall(r"\b(?:def|async\s+def|function|class)\s+([A-Za-z_]\w*)", code)
     for name in names:
-        if re.search(rf"\\b{re.escape(name)}\\b", solution):
+        if re.search(rf"\b{re.escape(name)}\b", solution):
             return True
 
     # Require at least one meaningful identifier/operator/token from the
     # actual code, rather than allowing "this code" / "replace this" templates.
-    tokens = re.findall(r"\\b[A-Za-z_][A-Za-z0-9_]{2,}\\b", code)
+    tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", code)
     stop = {
         "def", "return", "function", "class", "self", "true", "false",
         "none", "null", "this", "else", "elif", "from", "import", "with",
         "async", "await", "try", "except", "finally", "for", "while", "if",
     }
     meaningful = [t for t in tokens if t.lower() not in stop]
-    return any(re.search(rf"\\b{re.escape(t)}\\b", solution) for t in meaningful[:20])
+    return any(re.search(rf"\b{re.escape(t)}\b", solution) for t in meaningful[:20])
 
 
 def _make_specific_solution(result: dict, finding: dict) -> str:
