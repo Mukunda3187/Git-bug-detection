@@ -369,12 +369,23 @@ def _fallback_report(finding: dict) -> dict:
 
     if rule == "possibly_unused_function":
         solution_type = "remove"
-        solution = "Delete this function. It isn't called anywhere else in this file, so removing it has no effect on behavior - if it turns out to be used from another file this detector can't see, undo the deletion instead of guessing."
+        fn_match = re.search(
+            r"\\b(?:def|async\\s+def|function)\\s+([A-Za-z_]\\w*)",
+            current_code,
+        )
+        fn_name = fn_match.group(1) if fn_match else "this function"
+        solution = (
+            f"Remove `{fn_name}()` because this function is not called anywhere in the scanned file. "
+            f"This removes the specific unused definition reported at this location without changing the calls detected in this file."
+        )
 
     elif rule == "bare_except":
         solution_type = "replace"
         replacement_code = current_code.replace("except:", "except Exception as e:", 1)
-        solution = "Replace the bare 'except:' with 'except Exception as e:', as shown below. A bare except also catches things like KeyboardInterrupt and SystemExit, which should almost never be silently swallowed - naming Exception avoids that while still catching ordinary errors."
+        solution = (
+            f"Replace the bare `except:` in {_code_anchor(finding)} with `except Exception as e:`. "
+            f"This keeps ordinary exception handling for the reported block without swallowing system-exit signals."
+        )
 
     elif rule == "mutable_default_arg":
         replacement_code = _fix_mutable_default_arg(current_code)
@@ -391,7 +402,10 @@ def _fallback_report(finding: dict) -> dict:
     elif rule == "eq_none":
         solution_type = "replace"
         replacement_code = current_code.replace("== None", "is None").replace("!= None", "is not None")
-        solution = "Replace '==' / '!=' with 'is' / 'is not' when comparing to None, as shown below. 'is' checks identity directly and can't be fooled by a custom __eq__ method, which is why it's the correct way to check for None in Python."
+        solution = (
+            f"Change the None comparison in {_code_anchor(finding)} from `==`/`!=` to `is`/`is not`. "
+            f"This makes the reported None check use Python identity comparison as intended."
+        )
 
     elif rule == "possible_division_by_zero":
         solution_type = "add"
@@ -453,15 +467,24 @@ def _fallback_report(finding: dict) -> dict:
         solution_type = "replace"
         if "!=" in current_code:
             replacement_code = current_code.replace("!=", "!==")
-            solution = "Change '!=' to '!==', as shown below. '!=' compares values after converting them to a common type first, which can make surprisingly different values look equal (e.g. 0 != \"0\" is false) - '!==' compares type and value together with no conversion."
+            solution = (
+                f"Replace `!=` in {_code_anchor(finding)} with `!==`. "
+                f"This makes the reported comparison require both the same type and the same value."
+            )
         else:
             replacement_code = current_code.replace("==", "===")
-            solution = "Change '==' to '===', as shown below. '==' compares values after converting them to a common type first, which can make surprisingly different values look equal (e.g. 0 == \"0\" is true) - '===' compares type and value together with no conversion."
+            solution = (
+                f"Replace `==` in {_code_anchor(finding)} with `===`. "
+                f"This makes the reported comparison require both the same type and the same value."
+            )
 
     elif rule == "var_declaration":
         solution_type = "replace"
         replacement_code = current_code.replace("var ", "let ", 1)
-        solution = "Change 'var' to 'let' (or 'const' if this value is never reassigned), as shown below. 'var' is function-scoped and hoisted, which can let a variable leak out of the block it looks like it belongs to - 'let'/'const' are block-scoped and avoid that entire class of bug."
+        solution = (
+            f"Replace the `var` declaration in {_code_anchor(finding)} with the corrected `let` declaration shown below. "
+            f"This keeps the reported variable scoped to the block where it is used."
+        )
 
     elif rule == "empty_catch_block":
         replacement_code = _fix_empty_catch(current_code, finding.get("file", ""))
@@ -697,6 +720,82 @@ def get_fallback_report(finding: dict) -> dict:
 
 
 
+def _code_anchor(finding: dict) -> str:
+    """Return a small, human-readable identifier from THIS finding's code."""
+    code = str(finding.get("current_code") or "").strip()
+    if not code:
+        return "the reported code"
+
+    # Prefer a function/class name because it makes the solution visibly
+    # specific to the individual finding.
+    m = re.search(r"\\b(?:def|async\\s+def|function|class)\\s+([A-Za-z_]\\w*)", code)
+    if m:
+        return f"`{m.group(1)}()`"
+
+    # Otherwise use the first meaningful code line, shortened for the UI.
+    first = next((x.strip() for x in code.splitlines() if x.strip()), code)
+    first = re.sub(r"\\s+", " ", first)
+    if len(first) > 70:
+        first = first[:67] + "..."
+    return f"`{first}`"
+
+
+def _solution_is_specific(solution: str, finding: dict) -> bool:
+    """Require the solution to refer to something actually present in this finding."""
+    if not solution:
+        return False
+
+    code = str(finding.get("current_code") or "")
+    if not code:
+        return True
+
+    # Exact function/class name is the strongest signal.
+    names = re.findall(r"\\b(?:def|async\\s+def|function|class)\\s+([A-Za-z_]\\w*)", code)
+    for name in names:
+        if re.search(rf"\\b{re.escape(name)}\\b", solution):
+            return True
+
+    # Require at least one meaningful identifier/operator/token from the
+    # actual code, rather than allowing "this code" / "replace this" templates.
+    tokens = re.findall(r"\\b[A-Za-z_][A-Za-z0-9_]{2,}\\b", code)
+    stop = {
+        "def", "return", "function", "class", "self", "true", "false",
+        "none", "null", "this", "else", "elif", "from", "import", "with",
+        "async", "await", "try", "except", "finally", "for", "while", "if",
+    }
+    meaningful = [t for t in tokens if t.lower() not in stop]
+    return any(re.search(rf"\\b{re.escape(t)}\\b", solution) for t in meaningful[:20])
+
+
+def _make_specific_solution(result: dict, finding: dict) -> str:
+    """Create a short solution tied to this exact finding when Gemini is generic."""
+    anchor = _code_anchor(finding)
+    solution_type = result.get("solution_type")
+
+    if solution_type == "remove":
+        return (
+            f"Remove {anchor} from this file because this reported code is not used here. "
+            f"This removes the specific unused code without changing the code path shown in the finding."
+        )
+
+    if solution_type == "add":
+        return (
+            f"Add the required check or statement at the reported location for {anchor}. "
+            f"This prevents the specific condition identified in this finding from reaching the failing code."
+        )
+
+    if solution_type == "create_file":
+        return (
+            f"Create the new file shown in the generated solution for {anchor}. "
+            f"This supplies the missing file or definition required by the reported code."
+        )
+
+    return (
+        f"Replace {anchor} with the corrected code shown in the Solution section. "
+        f"This changes the exact code reported by the detector while preserving the surrounding code."
+    )
+
+
 def _short_solution(text: str) -> str:
     """Return only the first two useful sentences for the Solution UI."""
     if not text:
@@ -737,8 +836,17 @@ def _validate_llm_result(result: dict, finding: dict):
         result["replacement_code"] = None
 
     result["solution"] = _short_solution(result.get("solution", ""))
+
     if not result["solution"]:
         return None
+
+    # A solution such as "Delete this function" can be technically valid but
+    # is too generic for the UI. It must refer to the actual function,
+    # variable, statement, or other token in THIS finding.
+    if not _solution_is_specific(result["solution"], finding):
+        result["solution"] = _make_specific_solution(result, finding)
+
+    result["solution"] = _short_solution(result["solution"])
 
     confidence = result.get("confidence")
     if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
