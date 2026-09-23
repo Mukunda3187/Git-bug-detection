@@ -935,9 +935,10 @@ def _calculate_evidence_confidence(
         + rag_score * 0.20
     )
 
-    if insufficient_evidence:
-        final_score = min(final_score, 49)
-
+    # Do not force every fallback result to 49%.  The fallback path has
+    # rule-specific evidence and confidence values, so preserve the actual
+    # evidence score.  `insufficient_evidence` is used only to determine the
+    # confidence label/status below.
     confidence = _clamp_confidence(final_score)
 
     if confidence >= 70 and not insufficient_evidence:
