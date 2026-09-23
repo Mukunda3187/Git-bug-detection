@@ -524,6 +524,15 @@ def _fallback_report(finding: dict) -> dict:
             add_location = add_location or "Edit the reported code at this location using the detected cause."
             solution = "Apply the correction described by the detected cause at this location. An exact automatic replacement could not be generated safely from the available code."
 
+    fallback_confidence, fallback_level, fallback_status = _calculate_evidence_confidence(
+        finding=finding,
+        retrieved=[],
+        llm_confidence=FALLBACK_CONFIDENCE_BY_RULE.get(
+            rule, DEFAULT_FALLBACK_CONFIDENCE
+        ),
+        insufficient_evidence=True,
+    )
+
     return {
         "error": finding.get("error", "Possible issue"),
         "bug_type": bug_type,
@@ -535,7 +544,9 @@ def _fallback_report(finding: dict) -> dict:
         "add_location": add_location,
         "new_file_path": None,
         "explanation": "",
-        "confidence": FALLBACK_CONFIDENCE_BY_RULE.get(rule, DEFAULT_FALLBACK_CONFIDENCE),
+        "confidence": fallback_confidence,
+        "confidence_level": fallback_level,
+        "confidence_status": fallback_status,
         "insufficient_evidence": True,
     }
 
@@ -815,7 +826,131 @@ def _same_code(a, b) -> bool:
     return normalize(a) == normalize(b)
 
 
-def _validate_llm_result(result: dict, finding: dict):
+
+def _clamp_confidence(value: float) -> int:
+    """Keep confidence in the valid 0-100 range."""
+    return max(0, min(100, int(round(value))))
+
+
+def _detector_evidence_score(finding: dict) -> int:
+    """
+    Estimate how strong the detector evidence is for THIS finding.
+
+    This is evidence strength, not a claim that the detector is statistically
+    calibrated. Exact syntax/structural findings receive stronger evidence than
+    heuristic findings.
+    """
+    rule = str(finding.get("rule") or "").lower()
+
+    strong_rules = {
+        "syntax_error",
+        "unclosed_bracket",
+        "mismatched_bracket",
+        "unexpected_closing_bracket",
+        "unterminated_string",
+        "unterminated_template_literal",
+        "unterminated_comment",
+        "unreachable_code",
+        "eq_none",
+    }
+
+    medium_rules = {
+        "bare_except",
+        "mutable_default_arg",
+        "loose_equality",
+        "var_declaration",
+        "leftover_console_statement",
+        "leftover_debugger_statement",
+        "leftover_debug_print",
+        "possibly_unused_function",
+        "possible_division_by_zero",
+        "empty_catch_block",
+    }
+
+    if rule in strong_rules:
+        return 95
+    if rule in medium_rules:
+        return 80
+
+    # LLM-discovered findings have weaker detector evidence because they were
+    # not produced by a specialized deterministic rule.
+    if rule == "llm_file_analysis":
+        return 65
+
+    return 60
+
+
+def _rag_evidence_score(retrieved: list) -> int:
+    """
+    Convert the strongest retrieved historical similarity into an evidence
+    score. No retrieved evidence contributes zero.
+    """
+    if not retrieved:
+        return 0
+
+    similarities = []
+    for item in retrieved:
+        try:
+            value = float(item.get("similarity", 0.0))
+        except (TypeError, ValueError):
+            value = 0.0
+        similarities.append(max(0.0, min(1.0, value)))
+
+    if not similarities:
+        return 0
+
+    return _clamp_confidence(max(similarities) * 100)
+
+
+def _calculate_evidence_confidence(
+    finding: dict,
+    retrieved: list,
+    llm_confidence,
+    insufficient_evidence: bool = False,
+) -> tuple[int, str, str]:
+    """
+    Calculate the final per-bug confidence from three explicit evidence
+    sources:
+
+      50% = LLM confidence for this exact finding
+      30% = static detector evidence strength
+      20% = strongest historical RAG similarity
+
+    This is a transparent evidence score for the project UI. It is not a
+    statistically calibrated probability unless the project later validates
+    it against labelled bug data.
+    """
+    try:
+        llm_score = float(llm_confidence)
+    except (TypeError, ValueError):
+        llm_score = 50.0
+
+    llm_score = max(0.0, min(100.0, llm_score))
+    detector_score = _detector_evidence_score(finding)
+    rag_score = _rag_evidence_score(retrieved)
+
+    final_score = (
+        llm_score * 0.50
+        + detector_score * 0.30
+        + rag_score * 0.20
+    )
+
+    if insufficient_evidence:
+        final_score = min(final_score, 49)
+
+    confidence = _clamp_confidence(final_score)
+
+    if confidence >= 70 and not insufficient_evidence:
+        level = "High Confidence"
+        status = "Potential Bug"
+    else:
+        level = "Low Confidence"
+        status = "Uncertain Finding"
+
+    return confidence, level, status
+
+
+def _validate_llm_result(result: dict, finding: dict, retrieved: list | None = None):
     """Reject unusable or non-specific LLM fixes before they reach the frontend."""
     if not isinstance(result, dict):
         return None
@@ -848,13 +983,18 @@ def _validate_llm_result(result: dict, finding: dict):
 
     result["solution"] = _short_solution(result["solution"])
 
-    confidence = result.get("confidence")
-    if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
-        result["confidence"] = 70
-    else:
-        result["confidence"] = int(confidence)
-
     result.setdefault("insufficient_evidence", False)
+
+    confidence, confidence_level, confidence_status = _calculate_evidence_confidence(
+        finding=finding,
+        retrieved=retrieved or [],
+        llm_confidence=result.get("confidence"),
+        insufficient_evidence=bool(result.get("insufficient_evidence", False)),
+    )
+    result["confidence"] = confidence
+    result["confidence_level"] = confidence_level
+    result["confidence_status"] = confidence_status
+
     return result
 
 
@@ -938,7 +1078,7 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
 
                     result = json.loads(cleaned)
 
-                    validated = _validate_llm_result(result, finding)
+                    validated = _validate_llm_result(result, finding, retrieved)
                     if validated is None:
                         return _fallback_report(finding)
                     return validated
