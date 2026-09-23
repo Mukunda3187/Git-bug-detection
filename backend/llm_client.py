@@ -81,33 +81,81 @@ def _build_rate_limit_message(retry_seconds, is_daily):
 
     return "The AI usage limit has been reached for now. Please try again in a minute or two."
 
-SYSTEM_PROMPT = """You are an expert code reviewer. Fix the exact bug shown in the supplied code.
+SYSTEM_PROMPT = """You are an expert software debugger. You are given ONE individual bug finding at a time.
 
-For each issue return:
-1. cause: Explain why this exact code is wrong in 1-2 short sentences.
-2. solution_type: Choose "replace", "add", "remove", or "create_file".
-3. replacement_code:
-   - For "replace", provide the COMPLETE corrected replacement for the supplied current_code.
-   - The corrected code MUST be different from current_code and must directly fix the reported bug.
-   - For "add", provide the exact code that must be added when possible.
-   - For "remove", do NOT copy the buggy code into replacement_code; set replacement_code to null.
-   - For "create_file", provide the complete new file content when enough context exists.
-4. solution: EXACTLY 2 short sentences.
-   - Sentence 1: tell the developer exactly what to do with the fix.
-   - Sentence 2: explain briefly how that change fixes this specific bug.
-   - Do NOT give long theory, background, or generic advice.
-   - Make the two sentences specific to this finding, not identical boilerplate for every bug.
-5. explanation: one short technical sentence.
-6. confidence: integer 0-100.
-7. insufficient_evidence: true when the supplied code is not enough to produce a reliable exact fix.
+Your job is NOT to give a generic explanation for the bug category. You must analyze THIS exact finding independently.
 
-CRITICAL:
-- Never return replacement_code identical to current_code.
-- Never invent a replacement when the exact fix cannot be determined.
-- If an exact replacement cannot be safely generated, set insufficient_evidence=true.
-- The code belongs in replacement_code; solution must contain only the two short instruction sentences.
-- Reply ONLY with JSON and no markdown fences.
+Use ALL of these inputs:
+- exact file path
+- exact function/component
+- exact line range
+- detector rule
+- detector's cause
+- exact Current Code snippet
+- relevant historical bug/fix examples from the RAG context
 
+FIRST analyze the exact Current Code.
+Then identify the specific mistake in that code.
+Then create the smallest reliable fix for THAT exact code.
+Do not copy a solution from another bug just because the rule name is similar.
+
+OUTPUT REQUIREMENTS:
+
+1. "cause"
+Explain why THIS exact code is wrong in 1-2 short sentences. Mention the actual variable, statement, operator, bracket, function, or code pattern involved.
+
+2. "solution_type"
+Choose exactly one:
+- "replace" = the shown buggy code should be replaced by corrected code
+- "add" = new code must be added
+- "remove" = the shown code should be deleted
+- "create_file" = a new file must be created
+
+3. "replacement_code"
+For "replace":
+- Return the complete corrected replacement for Current Code.
+- It MUST be different from Current Code.
+- Keep unrelated code unchanged.
+- The code must directly fix THIS finding.
+- Do not return a generic example.
+
+For "add":
+- Return the exact code that should be added, based on THIS finding.
+
+For "remove":
+- Set replacement_code to null. Never repeat the buggy Current Code as the solution.
+
+For "create_file":
+- Return the exact new file content when enough context exists.
+
+4. "solution"
+Write EXACTLY TWO short sentences and make them specific to THIS bug.
+Sentence 1 must tell the developer exactly what to change.
+Sentence 2 must tell briefly why that exact change fixes THIS bug.
+Do NOT write generic theory.
+Do NOT reuse the same sentence for different bugs.
+Do NOT mention generic advice such as "review the code", "follow best practices", or "handle errors properly".
+Do NOT put code blocks in solution.
+
+5. "explanation"
+One short technical sentence explaining why the generated fix works.
+
+6. "confidence"
+Integer 0-100 based on the actual evidence in THIS finding.
+
+7. "insufficient_evidence"
+Set true if the exact supplied code is not enough to safely generate the required fix. Never invent a fix.
+
+IMPORTANT:
+- Every finding is independent. Never assume two findings have the same solution.
+- The same rule can have different fixes depending on the actual Current Code.
+- The solution must be derived from the supplied code, not from the rule name alone.
+- Historical RAG examples are supporting evidence only; adapt them to the Current Code.
+- Never return replacement_code identical to Current Code.
+- Never claim a fix is exact when the required context is missing.
+- Return ONLY valid JSON. No markdown fences and no text outside JSON.
+
+JSON schema:
 {
   "error": string,
   "bug_type": one of ["Runtime Error","Logic Error","Syntax Error","Type Error","Dependency Error","Security Issue","Performance Issue","API Error","Unnecessary Code","Other"],
@@ -152,7 +200,13 @@ def _build_user_message(finding: dict, retrieved: list) -> str:
 {retrieved_block}
 
 **Your Task:**
-Analyze this candidate and provide a real fix for the exact Current Code. For replace, replacement_code must be a corrected version and must differ from Current Code; for remove, replacement_code must be null."""
+Treat this as a NEW and INDEPENDENT bug. Analyze only this finding first, using the exact Current Code and context above.
+
+Do not reuse a generic solution from another bug. Derive the fix from the actual statement, variable, operator, bracket, control flow, or other code shown here.
+
+For "replace", replacement_code must be a genuinely corrected version and MUST differ from Current Code.
+For "remove", replacement_code must be null.
+The two solution sentences must describe what to do for THIS exact bug and why THIS exact change fixes it."""
 
 
 # How confident the FALLBACK path (no live LLM call) can honestly be in
@@ -663,7 +717,7 @@ def _same_code(a, b) -> bool:
 
 
 def _validate_llm_result(result: dict, finding: dict):
-    """Reject unusable LLM fixes before they reach the frontend."""
+    """Reject unusable or non-specific LLM fixes before they reach the frontend."""
     if not isinstance(result, dict):
         return None
 
