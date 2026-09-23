@@ -753,12 +753,9 @@ function typeIcon(bugType) {
   return "🟠";
 }
 
-function confidenceClass(bugOrLevel) {
-  const level = typeof bugOrLevel === "object"
-    ? (bugOrLevel?.confidence_level || "")
-    : String(bugOrLevel || "");
-
-  if (level.toLowerCase() === "high confidence") return "confidence-high";
+function confidenceClass(confidence) {
+  if (confidence >= 80) return "confidence-high";
+  if (confidence >= 50) return "confidence-medium";
   return "confidence-low";
 }
 
@@ -767,7 +764,7 @@ function renderBugCard(bug) {
     ? bug.line_note
     : (bug.line_start ? `Line${bug.line_end && bug.line_end !== bug.line_start ? "s" : ""} ${bug.line_start}${bug.line_end && bug.line_end !== bug.line_start ? "-" + bug.line_end : ""}` : "");
 
-  const cClass = confidenceClass(bug);
+  const cClass = confidenceClass(bug.confidence);
   const tClass = typeClass(bug.bug_type);
 
   const retrievedSection = (bug.retrieved_bugs && bug.retrieved_bugs.length > 0) ? `
@@ -797,7 +794,6 @@ function renderBugCard(bug) {
         </div>
         <div class="badge-row">
           <span class="badge ${tClass}">${escapeHtml(bug.bug_type)}</span>
-          <span class="badge ${cClass}">${bug.confidence}% — ${escapeHtml(bug.confidence_level || "Low Confidence")}</span>
         </div>
       </div>
       <div class="bug-body">
@@ -851,7 +847,7 @@ function renderSummary(summary) {
         <div class="label">Possible bugs</div>
       </div>
       <div class="summary-cell">
-        <div class="num ${confidenceClass(summary.confidence_level || "Low Confidence")}">${summary.confidence}%</div>
+        <div class="num ${confidenceClass(summary.confidence)}">${summary.confidence}%</div>
         <div class="label">Confidence</div>
       </div>
       <div class="summary-cell">
