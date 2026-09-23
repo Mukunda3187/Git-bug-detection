@@ -3,8 +3,9 @@ Shared data models for the whole backend.
 Every module imports from here so the JSON shape sent to the frontend
 never drifts between files.
 """
+
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ScanRequest(BaseModel):
@@ -12,7 +13,7 @@ class ScanRequest(BaseModel):
 
 
 class RepoStatus(BaseModel):
-    status: str          # "valid" | "invalid" | "private" | "not_found" | "unreachable"
+    status: str
     message: str
     owner: Optional[str] = None
     name: Optional[str] = None
@@ -29,30 +30,51 @@ class RetrievedBug(BaseModel):
 
 class BugReport(BaseModel):
     id: str
-    number: int                    # sequential display number: Bug 1, Bug 2, ...
-    error: str                     # short title, e.g. "Possibly unused function"
+    number: int
+
+    error: str
     bug_type: str
     file: str
+
     function: Optional[str] = None
     line_start: Optional[int] = None
     line_end: Optional[int] = None
-    line_note: Optional[str] = None   # "Exact line could not be determined." when line is unknown
+    line_note: Optional[str] = None
+
     cause: str
     why_occurs: Optional[str] = None
-    solution_type: str = "replace"    # "replace" | "add" | "remove" | "create_file"
-    solution: str = ""                # the complete, specific fix explanation - what's wrong at this
-                                       # exact spot and what to do about it, in one clear passage.
-                                       # (Merged from what used to be two separate fields - a generic
-                                       # "solution_intro" sentence plus a separate "action" sentence -
-                                       # into one, so every finding gets a single precise answer
-                                       # instead of two sentences that often repeated each other.)
+
+    solution_type: str = "replace"
+    solution: str = ""
+
     current_code: str
     replacement_code: Optional[str] = None
-    add_location: Optional[str] = None   # human description of where to add code, for solution_type == "add"
-    new_file_path: Optional[str] = None  # for solution_type == "create_file"
+
+    add_location: Optional[str] = None
+    new_file_path: Optional[str] = None
+
     explanation: Optional[str] = None
-    confidence: int = 70          # 0-100, how confident the system is in THIS specific finding's fix
-    retrieved_bugs: List[RetrievedBug] = []
+
+    # ---------------------------------------------------------
+    # CONFIDENCE
+    # ---------------------------------------------------------
+    # Final confidence calculated by the backend for THIS bug.
+    # This is not calculated by the frontend.
+    confidence: int = 70
+
+    # Explicit confidence classification produced by the backend.
+    confidence_level: str = "Low Confidence"
+
+    # Explicit interpretation of the confidence result.
+    confidence_status: str = "Uncertain Finding"
+
+    # ---------------------------------------------------------
+    # RAG EVIDENCE
+    # ---------------------------------------------------------
+    retrieved_bugs: List[RetrievedBug] = Field(default_factory=list)
+
+    # True when the available evidence is not sufficient to make
+    # a reliable conclusion.
     insufficient_evidence: bool = False
 
 
@@ -60,12 +82,21 @@ class ScanSummary(BaseModel):
     repo: str
     files_scanned: int
     bugs_found: int
-    confidence: int            # 0-100, how confident the system is in the findings shown
-    error_level: str           # "Less Errors" | "Medium Errors" | "More Errors"
+
+    # Overall confidence of the findings in this scan.
+    confidence: int
+
+    # Overall confidence classification.
+    confidence_level: str = "Low Confidence"
+
+    # Overall scan error level.
+    error_level: str
+
     scan_status: str
-    ai_notice: Optional[str] = None   # shown when the AI hit a usage limit during this scan
+
+    ai_notice: Optional[str] = None
 
 
 class ScanResult(BaseModel):
     summary: ScanSummary
-    bugs: List[BugReport]
+    bugs: List[BugReport] = Field(default_factory=list)
