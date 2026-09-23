@@ -524,13 +524,21 @@ def _fallback_report(finding: dict) -> dict:
             add_location = add_location or "Edit the reported code at this location using the detected cause."
             solution = "Apply the correction described by the detected cause at this location. An exact automatic replacement could not be generated safely from the available code."
 
+    fallback_llm_confidence = FALLBACK_CONFIDENCE_BY_RULE.get(
+        rule, DEFAULT_FALLBACK_CONFIDENCE
+    )
+
+    # Fallback still uses the real detector finding and its source code.
+    # It is not automatically "insufficient evidence".
+    fallback_insufficient_evidence = not bool(
+        str(finding.get("current_code") or "").strip()
+    )
+
     fallback_confidence, fallback_level, fallback_status = _calculate_evidence_confidence(
         finding=finding,
         retrieved=[],
-        llm_confidence=FALLBACK_CONFIDENCE_BY_RULE.get(
-            rule, DEFAULT_FALLBACK_CONFIDENCE
-        ),
-        insufficient_evidence=True,
+        llm_confidence=fallback_llm_confidence,
+        insufficient_evidence=fallback_insufficient_evidence,
     )
 
     return {
@@ -547,7 +555,7 @@ def _fallback_report(finding: dict) -> dict:
         "confidence": fallback_confidence,
         "confidence_level": fallback_level,
         "confidence_status": fallback_status,
-        "insufficient_evidence": True,
+        "insufficient_evidence": fallback_insufficient_evidence,
     }
 
 
@@ -833,58 +841,45 @@ def _clamp_confidence(value: float) -> int:
 
 
 def _detector_evidence_score(finding: dict) -> int:
-    """
-    Estimate how strong the detector evidence is for THIS finding.
-
-    This is evidence strength, not a claim that the detector is statistically
-    calibrated. Exact syntax/structural findings receive stronger evidence than
-    heuristic findings.
-    """
+    """Return the evidence strength of the detector for THIS finding."""
     rule = str(finding.get("rule") or "").lower()
 
-    strong_rules = {
-        "syntax_error",
-        "unclosed_bracket",
-        "mismatched_bracket",
-        "unexpected_closing_bracket",
-        "unterminated_string",
-        "unterminated_template_literal",
-        "unterminated_comment",
-        "unreachable_code",
-        "eq_none",
+    exact_rules = {
+        "syntax_error": 98,
+        "unclosed_bracket": 98,
+        "mismatched_bracket": 98,
+        "unexpected_closing_bracket": 98,
+        "unterminated_string": 98,
+        "unterminated_template_literal": 98,
+        "unterminated_comment": 98,
+        "unreachable_code": 96,
+        "eq_none": 95,
+        "leftover_debugger_statement": 92,
+        "leftover_console_statement": 88,
+        "leftover_debug_print": 88,
+        "loose_equality": 88,
+        "var_declaration": 82,
     }
 
-    medium_rules = {
-        "bare_except",
-        "mutable_default_arg",
-        "loose_equality",
-        "var_declaration",
-        "leftover_console_statement",
-        "leftover_debugger_statement",
-        "leftover_debug_print",
-        "possibly_unused_function",
-        "possible_division_by_zero",
-        "empty_catch_block",
+    heuristic_rules = {
+        "bare_except": 78,
+        "mutable_default_arg": 74,
+        "possibly_unused_function": 60,
+        "possible_division_by_zero": 55,
+        "empty_catch_block": 55,
     }
 
-    if rule in strong_rules:
-        return 95
-    if rule in medium_rules:
-        return 80
-
-    # LLM-discovered findings have weaker detector evidence because they were
-    # not produced by a specialized deterministic rule.
+    if rule in exact_rules:
+        return exact_rules[rule]
+    if rule in heuristic_rules:
+        return heuristic_rules[rule]
     if rule == "llm_file_analysis":
         return 65
-
-    return 60
+    return 50
 
 
 def _rag_evidence_score(retrieved: list) -> int:
-    """
-    Convert the strongest retrieved historical similarity into an evidence
-    score. No retrieved evidence contributes zero.
-    """
+    """Return the strongest historical similarity as 0-100."""
     if not retrieved:
         return 0
 
@@ -896,10 +891,7 @@ def _rag_evidence_score(retrieved: list) -> int:
             value = 0.0
         similarities.append(max(0.0, min(1.0, value)))
 
-    if not similarities:
-        return 0
-
-    return _clamp_confidence(max(similarities) * 100)
+    return _clamp_confidence(max(similarities) * 100) if similarities else 0
 
 
 def _calculate_evidence_confidence(
@@ -909,16 +901,14 @@ def _calculate_evidence_confidence(
     insufficient_evidence: bool = False,
 ) -> tuple[int, str, str]:
     """
-    Calculate the final per-bug confidence from three explicit evidence
-    sources:
+    Calculate a per-finding evidence score.
 
-      50% = LLM confidence for this exact finding
-      30% = static detector evidence strength
-      20% = strongest historical RAG similarity
+    60% detector evidence + 40% LLM/fallback confidence.
+    RAG similarity is a supporting bonus of up to 10 points when matching
+    historical evidence exists. Missing RAG evidence does not penalize a
+    finding.
 
-    This is a transparent evidence score for the project UI. It is not a
-    statistically calibrated probability unless the project later validates
-    it against labelled bug data.
+    This is an evidence score, not a statistically calibrated probability.
     """
     try:
         llm_score = float(llm_confidence)
@@ -929,16 +919,17 @@ def _calculate_evidence_confidence(
     detector_score = _detector_evidence_score(finding)
     rag_score = _rag_evidence_score(retrieved)
 
-    final_score = (
-        llm_score * 0.50
-        + detector_score * 0.30
-        + rag_score * 0.20
-    )
+    final_score = (detector_score * 0.60) + (llm_score * 0.40)
 
-    # Do not force every fallback result to 49%.  The fallback path has
-    # rule-specific evidence and confidence values, so preserve the actual
-    # evidence score.  `insufficient_evidence` is used only to determine the
-    # confidence label/status below.
+    # Historical RAG evidence can strengthen a matching finding, but the
+    # absence of a historical match must not reduce confidence.
+    if rag_score > 0:
+        final_score += min(rag_score * 0.10, 10.0)
+
+    # Do not collapse every insufficient-evidence result to one fixed number.
+    if insufficient_evidence:
+        final_score *= 0.65
+
     confidence = _clamp_confidence(final_score)
 
     if confidence >= 70 and not insufficient_evidence:
@@ -949,6 +940,7 @@ def _calculate_evidence_confidence(
         status = "Uncertain Finding"
 
     return confidence, level, status
+
 
 
 def _validate_llm_result(result: dict, finding: dict, retrieved: list | None = None):
