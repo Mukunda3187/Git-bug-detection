@@ -58,7 +58,7 @@ MAX_LLM_CALLS_PER_SCAN = 8
 # scanning more files. The one genuinely slow, rate-limited step is the
 # LLM call per finding, which is why that alone still has a budget below.
 
-MAX_PARALLEL_WORKERS = 6
+MAX_PARALLEL_WORKERS = 2
 # How many findings get analyzed (LLM call or fallback) at once instead of
 # one at a time. Each analysis is dominated by waiting on a network response
 # (or, for the fallback path, is fast local work) - not CPU - so threads are
@@ -69,7 +69,7 @@ MAX_PARALLEL_WORKERS = 6
 # means the wall-clock cost is roughly the SLOWEST single call, not the sum
 # of all of them.
 
-MAX_FILE_SCAN_WORKERS = 12
+MAX_FILE_SCAN_WORKERS = 4
 # How many files get read-and-detected at once. Higher than
 # MAX_PARALLEL_WORKERS above on purpose: this stage isn't rate-limited by an
 # external API the way Gemini calls are, it's just local disk reads plus
