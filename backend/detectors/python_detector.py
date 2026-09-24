@@ -237,7 +237,7 @@ def detect(file_path: str, source: str):
                 "rule": "possibly_unused_function",
                 "error": "Possibly unused function",
                 "bug_type": "Unnecessary Code",
-                "current_code": _get_source_segment(source_lines, node)[:200],
+                "current_code": _get_source_segment(source_lines, node),
                 "cause": f"'{name}' is not called anywhere else in this file. It may be used from "
                          f"another file (this detector only sees one file at a time), or it may be dead code.",
             })
