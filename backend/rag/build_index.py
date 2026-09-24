@@ -1,129 +1,544 @@
 """
-Reads every *.jsonl file in datasets/normalized/, converts each entry into
-a TF-IDF vector, and saves the vectorizer + vectors to disk.
+Build the RAG knowledge-base index.
 
-Why TF-IDF instead of a neural embedding model: sentence-transformers pulls
-in PyTorch, which needs hundreds of MB of RAM just to import and also needs
-to download the model from Hugging Face on first use - both are unreliable
-on a free-tier host with limited memory and no guarantee of outbound access
-at runtime. TF-IDF has neither problem: it installs light, builds instantly,
-and works fully offline.
+This module creates:
+1. Semantic embeddings using Sentence Transformers
+2. A FAISS vector index for fast similarity search
+3. Metadata containing the original bug records
+4. A TF-IDF fallback index
 
-Run this once after adding/updating any normalized dataset:
-    python -m rag.build_index
+Embedding model:
+    all-MiniLM-L6-v2
 
-Produces:
-    rag/index/vectorizer.joblib   -> the fitted TF-IDF vectorizer
-    rag/index/metadata.json       -> the original records, same row order as the vectorizer's vocabulary
+Generated files:
+    rag/index/embeddings.npy
+    rag/index/faiss.index
+    rag/index/metadata.json
+    rag/index/vectorizer.joblib
 """
+
 import glob
 import json
 import os
 
 import joblib
+import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-DATASETS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "datasets", "normalized")
-INDEX_DIR = os.path.join(os.path.dirname(__file__), "index")
+
+DATASETS_DIR = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "datasets",
+        "normalized",
+    )
+)
+
+INDEX_DIR = os.path.join(
+    os.path.dirname(__file__),
+    "index",
+)
+
+EMBEDDINGS_PATH = os.path.join(
+    INDEX_DIR,
+    "embeddings.npy",
+)
+
+FAISS_INDEX_PATH = os.path.join(
+    INDEX_DIR,
+    "faiss.index",
+)
+
+METADATA_PATH = os.path.join(
+    INDEX_DIR,
+    "metadata.json",
+)
+
+TFIDF_VECTORIZER_PATH = os.path.join(
+    INDEX_DIR,
+    "vectorizer.joblib",
+)
+
+MODEL_NAME = "all-MiniLM-L6-v2"
+
+
+def _synthesize_description(record):
+    """
+    Create a short description when a dataset record does not
+    contain bug_description.
+    """
+
+    bug_type = record.get("bug_type")
+    error = record.get("error")
+    language = record.get("language") or "code"
+
+    if bug_type and error:
+        return (
+            f"A {str(bug_type).lower()} in "
+            f"{language} code: {error}"
+        )
+
+    if bug_type:
+        return (
+            f"A {str(bug_type).lower()} found "
+            f"in {language} code."
+        )
+
+    if error:
+        return (
+            f"{language} code that raises: {error}"
+        )
+
+    return (
+        f"A bug fixed in {language} code."
+    )
 
 
 def load_all_records():
     """
-    Load and validate all records from normalized datasets.
-
-    Only `buggy_code` is required - it's the one field every normalizer
-    always fills in. `bug_description` is treated as optional: the real
-    normalize_bugs2fix.py and normalize_runbugrun.py scripts intentionally
-    leave it as None (CodeXGLUE/RunBugRun don't provide a natural-language
-    description), so requiring it here used to silently discard every
-    single record those two normalizers ever produced - the bundled
-    sample.jsonl (which does have descriptions) was the only dataset that
-    could ever make it into the index. When bug_description is missing we
-    synthesize a short one from bug_type/error/language instead of
-    dropping a perfectly usable record.
+    Load all valid normalized JSONL records.
     """
+
     records = []
-    for path in glob.glob(os.path.join(DATASETS_DIR, "*.jsonl")):
-        with open(path, "r", encoding="utf-8") as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                    if not record.get("buggy_code"):
-                        print(f"[build_index] Skipping malformed record in {os.path.basename(path)}:{line_num} - missing buggy_code")
+
+    if not os.path.isdir(DATASETS_DIR):
+        print(
+            f"[build_index] Dataset directory not found: "
+            f"{DATASETS_DIR}"
+        )
+        return records
+
+    dataset_paths = sorted(
+        glob.glob(
+            os.path.join(
+                DATASETS_DIR,
+                "*.jsonl",
+            )
+        )
+    )
+
+    print(
+        f"[build_index] Found {len(dataset_paths)} dataset files."
+    )
+
+    for path in dataset_paths:
+
+        print(
+            f"[build_index] Reading {os.path.basename(path)}"
+        )
+
+        try:
+
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as f:
+
+                for line_number, line in enumerate(
+                    f,
+                    1,
+                ):
+
+                    line = line.strip()
+
+                    if not line:
                         continue
-                    if not record.get("bug_description"):
-                        record["bug_description"] = _synthesize_description(record)
-                    records.append(record)
-                except json.JSONDecodeError as e:
-                    print(f"[build_index] Skipping invalid JSON in {os.path.basename(path)}:{line_num}: {e}")
-                    continue
+
+                    try:
+
+                        record = json.loads(
+                            line
+                        )
+
+                    except json.JSONDecodeError as e:
+
+                        print(
+                            f"[build_index] Invalid JSON in "
+                            f"{os.path.basename(path)}:"
+                            f"{line_number}: {e}"
+                        )
+
+                        continue
+
+                    if not isinstance(
+                        record,
+                        dict,
+                    ):
+                        continue
+
+                    if not record.get(
+                        "buggy_code"
+                    ):
+                        continue
+
+                    if not record.get(
+                        "bug_description"
+                    ):
+
+                        record[
+                            "bug_description"
+                        ] = _synthesize_description(
+                            record
+                        )
+
+                    record[
+                        "_dataset_source"
+                    ] = os.path.basename(
+                        path
+                    )
+
+                    records.append(
+                        record
+                    )
+
+        except Exception as e:
+
+            print(
+                f"[build_index] Failed reading "
+                f"{path}: {e}"
+            )
+
     return records
 
 
-def _synthesize_description(record: dict) -> str:
+def embedding_text(record):
     """
-    Builds a short, honest fallback description for records whose source
-    dataset didn't provide one, so they still carry a non-empty
-    bug_description into the index instead of being dropped.
+    Create the text representation used for semantic embeddings.
+
+    This format must remain consistent with retriever.py.
     """
-    bug_type = record.get("bug_type")
-    error = record.get("error")
-    language = record.get("language") or "code"
-    if bug_type and error:
-        return f"A {bug_type.lower()} in {language} code: {error}"
-    if bug_type:
-        return f"A {bug_type.lower()} found in {language} code."
-    if error:
-        return f"{language} code that raises: {error}"
-    return f"A bug fixed in {language} code (see the before/after code for details)."
 
-
-def embedding_text(record: dict) -> str:
-    """Extract text from a record for embedding - keep in sync with retriever.py's _embedding_text."""
     parts = []
-    if record.get("bug_description"):
-        parts.append(record["bug_description"])
-    if record.get("error"):
-        parts.append(f"Error: {record['error']}")
-    if record.get("bug_type"):
-        parts.append(f"Type: {record['bug_type']}")
-    if record.get("buggy_code"):
-        parts.append(f"Code: {record['buggy_code']}")
-    return "\n".join(filter(None, parts))
+
+    if record.get(
+        "bug_description"
+    ):
+
+        parts.append(
+            str(
+                record[
+                    "bug_description"
+                ]
+            )
+        )
+
+    if record.get(
+        "error"
+    ):
+
+        parts.append(
+            f"Error: {record['error']}"
+        )
+
+    if record.get(
+        "bug_type"
+    ):
+
+        parts.append(
+            f"Type: {record['bug_type']}"
+        )
+
+    if record.get(
+        "language"
+    ):
+
+        parts.append(
+            f"Language: {record['language']}"
+        )
+
+    if record.get(
+        "buggy_code"
+    ):
+
+        parts.append(
+            f"Code: {record['buggy_code']}"
+        )
+
+    if record.get(
+        "solution"
+    ):
+
+        parts.append(
+            f"Solution: {record['solution']}"
+        )
+
+    return "\n".join(
+        filter(
+            None,
+            parts,
+        )
+    )
+
+
+def build_semantic_index(
+    records,
+    texts,
+):
+    """
+    Generate Sentence Transformer embeddings and build FAISS index.
+    """
+
+    print(
+        f"[build_index] Loading embedding model: "
+        f"{MODEL_NAME}"
+    )
+
+    from sentence_transformers import (
+        SentenceTransformer,
+    )
+
+    import faiss
+
+    model = SentenceTransformer(
+        MODEL_NAME
+    )
+
+    print(
+        "[build_index] Generating semantic embeddings..."
+    )
+
+    embeddings = model.encode(
+        texts,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=True,
+    )
+
+    embeddings = np.asarray(
+        embeddings,
+        dtype="float32",
+    )
+
+    if embeddings.ndim != 2:
+        raise ValueError(
+            "Semantic embeddings must be a 2D array."
+        )
+
+    print(
+        f"[build_index] Embedding shape: "
+        f"{embeddings.shape}"
+    )
+
+    # Save raw embeddings as well.
+    np.save(
+        EMBEDDINGS_PATH,
+        embeddings,
+    )
+
+    # Because embeddings are normalized, inner product is equivalent
+    # to cosine similarity.
+    dimension = embeddings.shape[1]
+
+    index = faiss.IndexFlatIP(
+        dimension
+    )
+
+    index.add(
+        embeddings
+    )
+
+    faiss.write_index(
+        index,
+        FAISS_INDEX_PATH,
+    )
+
+    print(
+        f"[build_index] FAISS index saved: "
+        f"{FAISS_INDEX_PATH}"
+    )
+
+    print(
+        f"[build_index] FAISS records: "
+        f"{index.ntotal}"
+    )
+
+
+def build_tfidf_index(
+    texts,
+):
+    """
+    Build the lightweight TF-IDF fallback.
+    """
+
+    print(
+        "[build_index] Building TF-IDF fallback..."
+    )
+
+    vectorizer = TfidfVectorizer(
+        max_features=5000,
+        stop_words="english",
+    )
+
+    vectorizer.fit(
+        texts
+    )
+
+    joblib.dump(
+        vectorizer,
+        TFIDF_VECTORIZER_PATH,
+    )
+
+    print(
+        f"[build_index] TF-IDF vectorizer saved: "
+        f"{TFIDF_VECTORIZER_PATH}"
+    )
+
+
+def save_metadata(
+    records,
+):
+    """
+    Save the original normalized records.
+    """
+
+    with open(
+        METADATA_PATH,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            records,
+            f,
+            ensure_ascii=False,
+        )
+
+    print(
+        f"[build_index] Metadata saved: "
+        f"{METADATA_PATH}"
+    )
 
 
 def build():
-    """Build a TF-IDF index from normalized datasets."""
+    """
+    Build the complete RAG index.
+    """
+
     records = load_all_records()
 
     if not records:
-        print(f"[build_index] No valid normalized dataset files found in {DATASETS_DIR}. "
-              f"Run the normalize_*.py scripts in datasets/ first (or keep "
-              f"the bundled sample.jsonl to test the pipeline).")
+
+        print(
+            "[build_index] No valid records found."
+        )
+
         return
 
-    print(f"[build_index] Loaded {len(records)} valid records. Fitting TF-IDF vectorizer...")
-    texts = [embedding_text(r) for r in records]
+    os.makedirs(
+        INDEX_DIR,
+        exist_ok=True,
+    )
 
-    vectorizer = TfidfVectorizer(max_features=5000, stop_words="english")
-    vectorizer.fit(texts)  # the vectorizer itself is saved; vectors are recomputed cheaply at query time
+    print(
+        f"[build_index] Loaded "
+        f"{len(records)} valid records."
+    )
 
-    os.makedirs(INDEX_DIR, exist_ok=True)
+    texts = [
+        embedding_text(
+            record
+        )
+        for record in records
+    ]
+
+    # ---------------------------------------------------------
+    # Semantic embeddings + FAISS
+    # ---------------------------------------------------------
+
+    semantic_success = False
 
     try:
-        joblib.dump(vectorizer, os.path.join(INDEX_DIR, "vectorizer.joblib"))
-        with open(os.path.join(INDEX_DIR, "metadata.json"), "w", encoding="utf-8") as f:
-            json.dump(records, f)
-        print(f"[build_index] Index built successfully!")
-        print(f"   - Vectorizer: {os.path.join(INDEX_DIR, 'vectorizer.joblib')}")
-        print(f"   - Metadata: {os.path.join(INDEX_DIR, 'metadata.json')}")
-        print(f"   - Total records: {len(records)}")
+
+        build_semantic_index(
+            records,
+            texts,
+        )
+
+        semantic_success = True
+
     except Exception as e:
-        print(f"[build_index] Failed to save index: {e}")
+
+        print(
+            "[build_index] WARNING: Semantic/FAISS "
+            f"index creation failed: {e}"
+        )
+
+        print(
+            "[build_index] Continuing with TF-IDF fallback."
+        )
+
+    # ---------------------------------------------------------
+    # TF-IDF fallback
+    # ---------------------------------------------------------
+
+    try:
+
+        build_tfidf_index(
+            texts
+        )
+
+    except Exception as e:
+
+        print(
+            f"[build_index] WARNING: TF-IDF build failed: {e}"
+        )
+
+    # ---------------------------------------------------------
+    # Metadata
+    # ---------------------------------------------------------
+
+    try:
+
+        save_metadata(
+            records
+        )
+
+    except Exception as e:
+
+        print(
+            f"[build_index] Failed to save metadata: {e}"
+        )
+
         return
+
+    # ---------------------------------------------------------
+    # Final status
+    # ---------------------------------------------------------
+
+    print()
+    print(
+        "=============================================="
+    )
+
+    print(
+        "RAG INDEX BUILD COMPLETE"
+    )
+
+    print(
+        f"Records: {len(records)}"
+    )
+
+    print(
+        f"Semantic embeddings: "
+        f"{'READY' if semantic_success else 'FAILED'}"
+    )
+
+    print(
+        f"FAISS index: "
+        f"{'READY' if os.path.exists(FAISS_INDEX_PATH) else 'FAILED'}"
+    )
+
+    print(
+        f"TF-IDF fallback: "
+        f"{'READY' if os.path.exists(TFIDF_VECTORIZER_PATH) else 'FAILED'}"
+    )
+
+    print(
+        "=============================================="
+    )
 
 
 if __name__ == "__main__":
