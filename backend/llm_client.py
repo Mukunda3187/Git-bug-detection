@@ -85,6 +85,14 @@ SYSTEM_PROMPT = """You are an expert software debugger. You are given ONE indivi
 
 Your job is NOT to give a generic explanation for the bug category. You must analyze THIS exact finding independently.
 
+FIRST, make a strict false-positive check:
+- Decide whether the reported issue is actually demonstrated by the supplied Current Code.
+- A detector warning, style preference, naming preference, or theoretical possibility is NOT enough to call it a real bug.
+- If the code can legitimately use the reported pattern, mark "is_real_bug" as false.
+- If the supplied snippet is too small or missing the context needed to decide, mark "is_real_bug" as false and set "insufficient_evidence" to true.
+- Only mark "is_real_bug" true when you can point to a concrete incorrect behavior, invalid syntax, unreachable statement, unsafe construct, or other directly supported defect.
+- Do not invent callers, inputs, runtime behavior, types, imports, configuration, or surrounding code that were not supplied.
+
 Use ALL of these inputs:
 - exact file path
 - exact function/component
@@ -140,11 +148,14 @@ Do NOT put code blocks in solution.
 5. "explanation"
 One short technical sentence explaining why the generated fix works.
 
-6. "confidence"
-Integer 0-100 based on the actual evidence in THIS finding.
+6. "is_real_bug"
+A boolean. Set true only when the exact supplied Current Code demonstrates a real defect. Set false for a false positive, style-only issue, theoretical possibility, or insufficient context.
 
-7. "insufficient_evidence"
-Set true if the exact supplied code is not enough to safely generate the required fix. Never invent a fix.
+7. "confidence"
+Integer 0-100 based on the actual evidence in THIS finding. This is confidence that the finding is a real bug, not confidence in the quality of the prose.
+
+8. "insufficient_evidence"
+Set true if the exact supplied code is not enough to safely confirm the bug or generate the required fix. Never invent a fix.
 
 IMPORTANT:
 - Every finding is independent. Never assume two findings have the same solution.
@@ -153,6 +164,7 @@ IMPORTANT:
 - Historical RAG examples are supporting evidence only; adapt them to the Current Code.
 - Never return replacement_code identical to Current Code.
 - Never claim a fix is exact when the required context is missing.
+- If the finding is not a real bug, set is_real_bug=false, confidence at or below 35, insufficient_evidence=true when context is missing, and do not invent a fix.
 - Return ONLY valid JSON. No markdown fences and no text outside JSON.
 
 JSON schema:
@@ -167,6 +179,7 @@ JSON schema:
   "add_location": string or null,
   "new_file_path": string or null,
   "explanation": string,
+  "is_real_bug": boolean,
   "confidence": integer from 0 to 100,
   "insufficient_evidence": boolean
 }"""
@@ -556,6 +569,13 @@ def _fallback_report(finding: dict) -> dict:
         "confidence_level": fallback_level,
         "confidence_status": fallback_status,
         "insufficient_evidence": fallback_insufficient_evidence,
+        "is_real_bug": rule in {
+            "syntax_error", "unclosed_bracket", "mismatched_bracket",
+            "unexpected_closing_bracket", "unterminated_string",
+            "unterminated_template_literal", "unterminated_comment",
+            "unreachable_code", "eq_none",
+        },
+        "false_positive": False,
     }
 
 
@@ -707,13 +727,27 @@ FILE CONTENT:
                     line_start = None
                     line_end = None
 
+                current_code = str(item.get("current_code") or "").strip()
+                cause = str(item.get("cause") or "").strip()
+
+                # Whole-file analysis is especially prone to speculative
+                # findings. Require an exact code snippet and a plausible
+                # line location before allowing the candidate into the
+                # normal RAG/LLM report pipeline.
+                if not current_code or not cause:
+                    continue
+                if line_start is None or line_start < 1 or line_start > len(source.splitlines()):
+                    continue
+                if line_end is None or line_end < line_start:
+                    line_end = line_start
+
                 findings.append({
                     "error": error,
                     "bug_type": bug_type,
-                    "cause": str(item.get("cause") or "").strip(),
+                    "cause": cause,
                     "line_start": line_start,
-                    "line_end": line_end,
-                    "current_code": str(item.get("current_code") or "").strip(),
+                    "line_end": min(line_end, len(source.splitlines())),
+                    "current_code": current_code,
                     "function": item.get("function"),
                     "rule": "llm_file_analysis",
                     "file": file_path,
@@ -928,7 +962,7 @@ def _calculate_evidence_confidence(
 
     # Do not collapse every insufficient-evidence result to one fixed number.
     if insufficient_evidence:
-        final_score *= 0.65
+        final_score *= 0.50
 
     confidence = _clamp_confidence(final_score)
 
@@ -943,14 +977,81 @@ def _calculate_evidence_confidence(
 
 
 
+def _uncertain_finding_report(finding: dict, reason: str = "") -> dict:
+    """
+    Preserve the finding as an explicitly unconfirmed result instead of
+    presenting a detector warning as a confirmed bug.
+
+    This is the false-positive guard used when Gemini decides that the
+    supplied code does not actually prove the detector warning is a bug.
+    """
+    cause = reason.strip() or str(finding.get("cause") or "").strip()
+    if not cause:
+        cause = "The supplied code does not provide enough evidence to confirm this as a real bug."
+
+    return {
+        "error": "Potential false positive - not confirmed as a real bug",
+        "bug_type": "Other",
+        "cause": cause,
+        "why_occurs": "",
+        "solution_type": "add",
+        "solution": (
+            "Do not apply an automatic code change because the supplied evidence does not confirm a real defect. "
+            "Treat this finding as an uncertain result and verify it with the surrounding code or runtime behavior."
+        ),
+        "replacement_code": None,
+        "add_location": None,
+        "new_file_path": None,
+        "explanation": "Gemini could not confirm that the detector warning represents an actual defect in the supplied code.",
+        "is_real_bug": False,
+        "confidence": 0,
+        "confidence_level": "Low Confidence",
+        "confidence_status": "Uncertain Finding",
+        "insufficient_evidence": True,
+        "false_positive": True,
+    }
+
+
 def _validate_llm_result(result: dict, finding: dict, retrieved: list | None = None):
     """Reject unusable or non-specific LLM fixes before they reach the frontend."""
     if not isinstance(result, dict):
         return None
 
+    # Explicit false-positive gate. A detector warning is not allowed to
+    # become a confirmed bug unless Gemini independently confirms it from
+    # the exact supplied code.
+    is_real_bug = result.get("is_real_bug")
+    if is_real_bug is False:
+        reason = str(
+            result.get("cause")
+            or result.get("why_occurs")
+            or "The supplied code does not confirm the reported issue."
+        )
+        return _uncertain_finding_report(finding, reason)
+
+    # Older/unexpected model output that omits the gate is not trusted.
+    # Keep the existing pipeline working, but require the evidence fields
+    # below before treating the result as a confirmed bug.
+    if is_real_bug is not True:
+        return None
+
     solution_type = result.get("solution_type")
     current_code = str(finding.get("current_code") or "")
     replacement = result.get("replacement_code")
+
+    if not current_code.strip():
+        return _uncertain_finding_report(
+            finding,
+            "The finding does not contain the exact code needed to confirm the reported issue safely.",
+        )
+
+    try:
+        model_confidence = int(result.get("confidence"))
+    except (TypeError, ValueError):
+        return None
+
+    if model_confidence < 0 or model_confidence > 100:
+        return None
 
     if solution_type == "replace":
         if not isinstance(replacement, str) or not replacement.strip():
@@ -976,6 +1077,8 @@ def _validate_llm_result(result: dict, finding: dict, retrieved: list | None = N
 
     result["solution"] = _short_solution(result["solution"])
 
+    result["is_real_bug"] = True
+    result["false_positive"] = False
     result.setdefault("insufficient_evidence", False)
 
     confidence, confidence_level, confidence_status = _calculate_evidence_confidence(
