@@ -13,7 +13,7 @@ import re
 import shutil
 import tempfile
 import zipfile
-
+from models import RepoStatus
 import requests
 
 
@@ -803,3 +803,46 @@ def cleanup_repo(
         print(
             f"[github] Cleanup failed: {e}"
         )
+# ---------------------------------------------------------
+# Compatibility functions used by main.py
+# ---------------------------------------------------------
+
+_TEMP_ROOTS = {}
+
+
+def check_repository(repo_url: str) -> RepoStatus:
+    try:
+        info = validate_repo(repo_url)
+
+        return RepoStatus(
+            status="valid",
+            message="Repository is valid.",
+            owner=info["owner"],
+            name=info["repo"],
+            default_branch=info["default_branch"],
+        )
+
+    except (ValueError, RuntimeError) as e:
+        return RepoStatus(
+            status="invalid",
+            message=str(e),
+        )
+
+
+def download_repository(owner, name, default_branch):
+    repo_url = f"https://github.com/{owner}/{name}"
+
+    repo_path, temp_root = download_repo(repo_url)
+
+    _TEMP_ROOTS[repo_path] = temp_root
+
+    return repo_path
+
+
+def cleanup(repo_path):
+    temp_root = _TEMP_ROOTS.pop(repo_path, None)
+
+    if temp_root:
+        cleanup_repo(temp_root)
+    else:
+        cleanup_repo(repo_path)
