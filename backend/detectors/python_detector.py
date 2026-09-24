@@ -96,15 +96,38 @@ def detect(file_path: str, source: str):
         tree = ast.parse(source, filename=file_path)
     except SyntaxError as e:
         lines = source.splitlines()
+        error_line = max(0, min((e.lineno or 1) - 1, max(0, len(lines) - 1)))
+
+        # Include the surrounding indented block instead of only the error line.
+        # This gives the LLM enough context to repair missing brackets/colons
+        # without inventing the rest of the function.
+        start = error_line
+        while start > 0:
+            previous = lines[start - 1]
+            current = lines[start] if start < len(lines) else ""
+            if previous.strip() and (len(previous) - len(previous.lstrip()) <=
+                                     len(current) - len(current.lstrip())):
+                break
+            start -= 1
+
+        end = error_line
+        base_indent = len(lines[error_line]) - len(lines[error_line].lstrip()) if lines else 0
+        while end + 1 < len(lines):
+            nxt = lines[end + 1]
+            if nxt.strip() and len(nxt) - len(nxt.lstrip()) < base_indent:
+                break
+            end += 1
+
+        context = "\n".join(lines[start:end + 1]).strip()
         return [{
             "file": file_path,
             "function": None,
-            "line_start": e.lineno,
-            "line_end": e.lineno,
+            "line_start": start + 1,
+            "line_end": end + 1,
             "rule": "syntax_error",
             "error": "Syntax Error",
             "bug_type": "Syntax Error",
-            "current_code": lines[e.lineno - 1].strip() if e.lineno and e.lineno <= len(lines) else "",
+            "current_code": context or (lines[error_line].strip() if lines else ""),
             "cause": str(e.msg),
         }]
 
