@@ -109,6 +109,14 @@ Do not copy a solution from another bug just because the rule name is similar.
 
 OUTPUT REQUIREMENTS:
 
+READY-TO-PASTE COMPLETENESS RULES:
+- For a typo or defect confined to one line, replacement_code must contain only the corrected line.
+- For a defect spanning multiple lines, replacement_code must contain the complete corrected block that replaces the supplied Current Code.
+- For missing brackets, parentheses, braces, or syntax delimiters, return the complete corrected enclosing block available in Current Code, not just the error line.
+- For missing code, use solution_type="add", provide the exact code in replacement_code, and identify the insertion point precisely in add_location.
+- For dead or unnecessary code, use solution_type="remove" and replacement_code=null; the solution must explicitly tell the user to delete the supplied code.
+- Never return an incomplete fragment when a complete replacement block is needed. If the supplied context is insufficient, set insufficient_evidence=true and do not fabricate code.
+
 1. "cause"
 Explain why THIS exact code is wrong in 1-2 short sentences. Mention the actual variable, statement, operator, bracket, function, or code pattern involved.
 
