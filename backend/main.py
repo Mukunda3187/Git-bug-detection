@@ -53,16 +53,12 @@ DETECTORS_BY_EXTENSION = {
     ".go": detect_cfamily,
     ".php": detect_cfamily,
 }
-
-
 # Maximum number of Gemini analyses running at the same time.
-# There is NO fixed limit on the total number of bugs analyzed.
+# There is no fixed limit on the total number of bugs analyzed.
 MAX_PARALLEL_WORKERS = 2
-
 
 # Number of files being scanned simultaneously.
 MAX_FILE_SCAN_WORKERS = 4
-
 
 def _empty_summary(repo: str, message: str) -> ScanResult:
     return ScanResult(
