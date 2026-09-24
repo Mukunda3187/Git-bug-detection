@@ -20,7 +20,7 @@ import re
 
 import requests
 
-GEMINI_MODEL = "gemini-3.6-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # See the comment in analyze_finding() where this is used - together these two
@@ -81,101 +81,34 @@ def _build_rate_limit_message(retry_seconds, is_daily):
 
     return "The AI usage limit has been reached for now. Please try again in a minute or two."
 
-SYSTEM_PROMPT = """You are an expert software debugger. You are given ONE individual bug finding at a time.
+SYSTEM_PROMPT = """You are an expert code reviewer. Give an immediately usable fix for the exact bug shown.
 
-Your job is NOT to give a generic explanation for the bug category. You must analyze THIS exact finding independently.
+For each issue:
+1. cause: Explain why this exact code is wrong in 1-2 short sentences.
+2. solution_type: Choose "replace", "add", "remove", or "create_file".
+3. replacement_code:
+   - For "replace", give the COMPLETE corrected replacement for the supplied current_code.
+   - It must be directly copy-pasteable.
+   - Change only what is necessary to fix the bug.
+   - For "add", give the exact code that must be added when possible.
+   - For "remove", give the exact code that should be removed when possible.
+4. solution: EXACTLY 2 short sentences:
+   Sentence 1: what the developer must do.
+   Sentence 2: why that fixes this bug.
+   Do NOT give theory, background, long explanations, or generic advice.
+5. explanation: one short technical sentence.
+6. confidence: integer 0-100 for this specific diagnosis and fix.
+7. insufficient_evidence: true if the supplied code is not enough to create a reliable exact fix.
 
-FIRST, make a strict false-positive check:
-- Decide whether the reported issue is actually demonstrated by the supplied Current Code.
-- A detector warning, style preference, naming preference, or theoretical possibility is NOT enough to call it a real bug.
-- If the code can legitimately use the reported pattern, mark "is_real_bug" as false.
-- If the supplied snippet is too small or missing the context needed to decide, mark "is_real_bug" as false and set "insufficient_evidence" to true.
-- Only mark "is_real_bug" true when you can point to a concrete incorrect behavior, invalid syntax, unreachable statement, unsafe construct, or other directly supported defect.
-- Do not invent callers, inputs, runtime behavior, types, imports, configuration, or surrounding code that were not supplied.
+CRITICAL:
+- The replacement_code is the actual fix shown to the user.
+- Never invent code when the supplied snippet is insufficient.
+- If an exact replacement cannot be determined safely, set insufficient_evidence=true.
+- Do not put markdown fences around replacement_code.
+- Do not include code inside solution; code belongs in replacement_code.
+- Keep solution to exactly two short sentences.
 
-Use ALL of these inputs:
-- exact file path
-- exact function/component
-- exact line range
-- detector rule
-- detector's cause
-- exact Current Code snippet
-- relevant historical bug/fix examples from the RAG context
-
-FIRST analyze the exact Current Code.
-Then identify the specific mistake in that code.
-Then create the smallest reliable fix for THAT exact code.
-Do not copy a solution from another bug just because the rule name is similar.
-
-OUTPUT REQUIREMENTS:
-
-READY-TO-PASTE COMPLETENESS RULES:
-- For a typo or defect confined to one line, replacement_code must contain only the corrected line.
-- For a defect spanning multiple lines, replacement_code must contain the complete corrected block that replaces the supplied Current Code.
-- For missing brackets, parentheses, braces, or syntax delimiters, return the complete corrected enclosing block available in Current Code, not just the error line.
-- For missing code, use solution_type="add", provide the exact code in replacement_code, and identify the insertion point precisely in add_location.
-- For dead or unnecessary code, use solution_type="remove" and replacement_code=null; the solution must explicitly tell the user to delete the supplied code.
-- Never return an incomplete fragment when a complete replacement block is needed. If the supplied context is insufficient, set insufficient_evidence=true and do not fabricate code.
-
-1. "cause"
-Explain why THIS exact code is wrong in 1-2 short sentences. Mention the actual variable, statement, operator, bracket, function, or code pattern involved.
-
-2. "solution_type"
-Choose exactly one:
-- "replace" = the shown buggy code should be replaced by corrected code
-- "add" = new code must be added
-- "remove" = the shown code should be deleted
-- "create_file" = a new file must be created
-
-3. "replacement_code"
-For "replace":
-- Return the complete corrected replacement for Current Code.
-- It MUST be different from Current Code.
-- Keep unrelated code unchanged.
-- The code must directly fix THIS finding.
-- Do not return a generic example.
-
-For "add":
-- Return the exact code that should be added, based on THIS finding.
-
-For "remove":
-- Set replacement_code to null. Never repeat the buggy Current Code as the solution.
-
-For "create_file":
-- Return the exact new file content when enough context exists.
-
-4. "solution"
-Write EXACTLY TWO short sentences and make them specific to THIS bug.
-Sentence 1 must tell the developer exactly what to change.
-Sentence 2 must tell briefly why that exact change fixes THIS bug.
-Do NOT write generic theory.
-Do NOT reuse the same sentence for different bugs.
-Do NOT mention generic advice such as "review the code", "follow best practices", or "handle errors properly".
-Do NOT put code blocks in solution.
-
-5. "explanation"
-One short technical sentence explaining why the generated fix works.
-
-6. "is_real_bug"
-A boolean. Set true only when the exact supplied Current Code demonstrates a real defect. Set false for a false positive, style-only issue, theoretical possibility, or insufficient context.
-
-7. "confidence"
-Integer 0-100 based on the actual evidence in THIS finding. This is confidence that the finding is a real bug, not confidence in the quality of the prose.
-
-8. "insufficient_evidence"
-Set true if the exact supplied code is not enough to safely confirm the bug or generate the required fix. Never invent a fix.
-
-IMPORTANT:
-- Every finding is independent. Never assume two findings have the same solution.
-- The same rule can have different fixes depending on the actual Current Code.
-- The solution must be derived from the supplied code, not from the rule name alone.
-- Historical RAG examples are supporting evidence only; adapt them to the Current Code.
-- Never return replacement_code identical to Current Code.
-- Never claim a fix is exact when the required context is missing.
-- If the finding is not a real bug, set is_real_bug=false, confidence at or below 35, insufficient_evidence=true when context is missing, and do not invent a fix.
-- Return ONLY valid JSON. No markdown fences and no text outside JSON.
-
-JSON schema:
+Reply with ONLY a JSON object:
 {
   "error": string,
   "bug_type": one of ["Runtime Error","Logic Error","Syntax Error","Type Error","Dependency Error","Security Issue","Performance Issue","API Error","Unnecessary Code","Other"],
@@ -187,7 +120,6 @@ JSON schema:
   "add_location": string or null,
   "new_file_path": string or null,
   "explanation": string,
-  "is_real_bug": boolean,
   "confidence": integer from 0 to 100,
   "insufficient_evidence": boolean
 }"""
@@ -221,13 +153,7 @@ def _build_user_message(finding: dict, retrieved: list) -> str:
 {retrieved_block}
 
 **Your Task:**
-Treat this as a NEW and INDEPENDENT bug. Analyze only this finding first, using the exact Current Code and context above.
-
-Do not reuse a generic solution from another bug. Derive the fix from the actual statement, variable, operator, bracket, control flow, or other code shown here.
-
-For "replace", replacement_code must be a genuinely corrected version and MUST differ from Current Code.
-For "remove", replacement_code must be null.
-The two solution sentences must describe what to do for THIS exact bug and why THIS exact change fixes it."""
+Analyze this candidate and provide the smallest reliable code replacement that fixes the reported bug. The replacement_code must be directly usable for the supplied Current Code. If the exact fix cannot be determined from the supplied code, set insufficient_evidence=true instead of inventing code."""
 
 
 # How confident the FALLBACK path (no live LLM call) can honestly be in
@@ -290,6 +216,73 @@ CATCH_LOG_STATEMENT_BY_EXTENSION = {
     ".cpp": "std::cerr << {var}.what() << std::endl;",
     ".php": "error_log({var}->getMessage());",
 }
+
+# Matches a simple denominator right after a '/': a plain identifier,
+# optionally followed by attribute access (.name) or indexing ([key]).
+# Deliberately does NOT match a parenthesized expression, a function call,
+# or an arithmetic expression on the right of the '/' - for "x / (a + b)" or
+# "x / get_count()" there's no single safe variable name to point at, so
+# _extract_division_denominator returns None for those rather than guessing.
+DIVISION_DENOMINATOR_RE = re.compile(r"/\s*([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*|\[[^\]\[]+\])*)")
+
+PYTHON_MISSING_COLON_RE = re.compile(r"expected ':'")
+PYTHON_UNCLOSED_BRACKET_RE = re.compile(r"'(.)' was never closed")
+
+
+def _extract_division_denominator(current_code: str):
+    """Pulls the real denominator out of a simple division expression
+    (e.g. "total / count" -> "count", "x / self.n" -> "self.n"), so the
+    suggested zero-check names the actual variable instead of a generic
+    placeholder every division-by-zero finding used to show identically."""
+    if not current_code:
+        return None
+    m = DIVISION_DENOMINATOR_RE.search(current_code)
+    return m.group(1) if m else None
+
+
+def _fix_unterminated_string_line(current_code: str):
+    """Appends whichever quote character has an odd count on this line - the
+    one the detector already identified as never closed. Works for both the
+    JS/TS structural check and Python's own "unterminated string literal"
+    parser message, since both report the single offending line as
+    current_code. Returns None if neither quote type has an odd count (not
+    expected for a genuinely unterminated string, but this is a heuristic
+    over plain text, not a real parser, so it stays conservative rather than
+    guessing)."""
+    if not current_code or not current_code.strip():
+        return None
+    if current_code.count('"') % 2 == 1:
+        return current_code.rstrip() + '"'
+    if current_code.count("'") % 2 == 1:
+        return current_code.rstrip() + "'"
+    return None
+
+
+def _fix_python_syntax_error(current_code: str, cause_from_detector: str):
+    """Mechanically fixes the Python syntax errors where the fix is safely
+    derivable from Python's own error message and the single reported line:
+    a missing trailing colon, an unclosed bracket/paren, or an unterminated
+    string. Returns None for anything less certain (Python's generic
+    "invalid syntax" covers a huge range of different real problems) rather
+    than guessing at a fix for something structurally ambiguous - those stay
+    theory-only, same as before."""
+    if not current_code or not current_code.strip():
+        return None
+
+    if PYTHON_MISSING_COLON_RE.search(cause_from_detector):
+        stripped = current_code.rstrip()
+        return stripped + ":" if not stripped.endswith(":") else None
+
+    m = PYTHON_UNCLOSED_BRACKET_RE.search(cause_from_detector)
+    if m:
+        closer = BRACKET_CLOSER.get(m.group(1))
+        return current_code.rstrip() + closer if closer else None
+
+    lowered = cause_from_detector.lower()
+    if "unterminated string literal" in lowered or "unterminated triple-quoted string literal" in lowered:
+        return _fix_unterminated_string_line(current_code)
+
+    return None
 
 
 def _fix_mutable_default_arg(current_code: str):
@@ -390,177 +383,163 @@ def _fallback_report(finding: dict) -> dict:
 
     if rule == "possibly_unused_function":
         solution_type = "remove"
-        fn_match = re.search(
-            r"\b(?:def|async\s+def|function)\s+([A-Za-z_]\w*)",
-            current_code,
-        )
-        fn_name = fn_match.group(1) if fn_match else "this function"
-        solution = (
-            f"Remove `{fn_name}()` because this function is not called anywhere in the scanned file. "
-            f"This removes the specific unused definition reported at this location without changing the calls detected in this file."
-        )
+        replacement_code = current_code
+        solution = "Remove this unused function if it is not referenced elsewhere. This removes dead code without changing behavior when there are no external references."
 
     elif rule == "bare_except":
         solution_type = "replace"
         replacement_code = current_code.replace("except:", "except Exception as e:", 1)
-        solution = (
-            f"Replace the bare `except:` in {_code_anchor(finding)} with `except Exception as e:`. "
-            f"This keeps ordinary exception handling for the reported block without swallowing system-exit signals."
-        )
+        solution = "Replace the bare 'except:' with 'except Exception as e:' using the code below. This catches normal exceptions without also swallowing system-exit and keyboard-interrupt signals."
 
     elif rule == "mutable_default_arg":
         replacement_code = _fix_mutable_default_arg(current_code)
         if replacement_code:
             solution_type = "replace"
-            solution = "Replace this signature with the version below: change the default to None, then create a fresh list/dict/set inside the function body on first use. The current version reuses the SAME object across every call, so items added in one call silently show up in the next."
+            solution = "Replace the function code with the version below so the mutable value is created separately for each call. This prevents data from one function call being reused by the next call."
         else:
             # Couldn't mechanically locate the mutable default in the captured
             # snippet (e.g. a multi-line signature) - never claim code is
             # "shown below" and then show nothing.
             solution_type = "add"
-            solution = "Change the default value to None, then add 'if <param> is None: <param> = []' (or {} / set(), matching whatever the original default was) as the first line inside the function body. This function's mutable default is currently shared across every call to it, which usually isn't intended."
+            solution = "Change the mutable default to None and create a new list, dict, or set inside the function. This prevents the same mutable object from being shared across calls."
 
     elif rule == "eq_none":
         solution_type = "replace"
         replacement_code = current_code.replace("== None", "is None").replace("!= None", "is not None")
-        solution = (
-            f"Change the None comparison in {_code_anchor(finding)} from `==`/`!=` to `is`/`is not`. "
-            f"This makes the reported None check use Python identity comparison as intended."
-        )
+        solution = "Replace the None comparison with 'is None' or 'is not None' using the code below. This performs the intended identity check for Python's None value."
 
     elif rule == "possible_division_by_zero":
         solution_type = "add"
-        add_location = "Add this check on the line right before the division."
-        replacement_code = "if denominator != 0:  # replace 'denominator' with your actual variable name"
-        solution = "Add a check that the denominator isn't zero before this line runs (see the line to add below), and decide what should happen when it is - skip the calculation, return a default value, or raise a clear error instead of letting the program crash with a ZeroDivisionError."
+        denominator = _extract_division_denominator(current_code)
+        if denominator:
+            add_location = "Add this check on the line right before the division."
+            replacement_code = f"if {denominator} != 0:"
+            solution = f"Add a check that '{denominator}' isn't zero immediately before this line, using the code below, and handle the zero case explicitly (skip the calculation, use a default, or raise a clear error). This prevents the calculation from raising ZeroDivisionError at runtime."
+        else:
+            solution = "Add a check that the denominator isn't zero immediately before this division, and handle the zero case explicitly (skip the calculation, use a default value, or raise a clear error). This prevents the calculation from raising ZeroDivisionError at runtime."
 
     elif rule == "syntax_error":
-        solution_type = "replace"
         cause = f"Python's own parser could not read this code. The exact reason it gave was: \"{cause_from_detector}\"."
-        solution = f"Edit this line to fix the specific problem Python's parser reported: {cause_from_detector}. The file won't run at all until this is fixed, since Python can't even finish reading it - after editing, re-run the file (or 'python -m py_compile <file>') to confirm it now parses cleanly."
+        replacement_code = _fix_python_syntax_error(current_code, cause_from_detector)
+        if replacement_code:
+            solution_type = "replace"
+            solution = f"Replace this line with the version below to fix the exact problem Python reported: {cause_from_detector}. Re-run the file afterward to confirm the syntax error is gone."
+        else:
+            solution_type = "add"
+            add_location = "Edit the reported line and correct the parser error."
+            solution = f"Fix the parser problem reported here: {cause_from_detector}. Re-run the file after editing to confirm that the syntax error is gone."
 
     elif rule == "unclosed_bracket":
         solution_type = "replace"
         m = UNCLOSED_CHAR_RE.search(error_text)
         opener = m.group(1) if m else "{"
         closer = BRACKET_CLOSER.get(opener, "}")
+        if current_code.strip():
+            replacement_code = current_code.rstrip() + closer
         solution = (
-            f"A '{opener}' was opened here but is never closed anywhere in the rest of the file. "
-            f"Add the missing '{closer}' at the point where this block, function call, or expression "
-            f"is meant to end - if you're not sure exactly where, work outward from this line counting "
-            f"'{opener}' and '{closer}' until you find the spot where one is missing."
+            f"Add the missing '{closer}' to close the '{opener}' opened by this code. "
+            f"Place it where the block or expression ends so the brackets are balanced."
         )
 
     elif rule == "mismatched_bracket":
         solution_type = "replace"
         m = MISMATCHED_CHARS_RE.search(error_text)
         found, expected = (m.group(1), m.group(2)) if m else ("?", "?")
+        if found in current_code and expected:
+            replacement_code = current_code.replace(found, expected, 1)
         solution = (
-            f"This should be a closing '{expected}' to match the bracket opened earlier, but '{found}' "
-            f"appears instead. Either replace it with '{expected}', or - if '{found}' is actually correct "
-            f"here - check whether an earlier bracket in this block was closed at the wrong spot, since "
-            f"that would make this one line up with the wrong opener."
+            f"Replace the unexpected '{found}' with the expected '{expected}' when this is the closing bracket for the current block. "
+            f"If the surrounding structure uses '{found}' intentionally, check the earlier opening bracket instead."
         )
 
     elif rule == "unexpected_closing_bracket":
-        solution_type = "replace"
         m = UNEXPECTED_CHAR_RE.search(error_text)
         closer = m.group(1) if m else "}"
-        solution = (
-            f"This '{closer}' has no matching opening bracket anywhere before it in the file. Either "
-            f"delete this extra '{closer}', or - if it's meant to close something real - add the missing "
-            f"opening bracket earlier in the code where that block, call, or expression actually starts."
-        )
+        remainder = current_code.replace(closer, "", 1).strip() if closer in current_code else None
+        if remainder:
+            # Something else shares this line with the stray bracket (e.g.
+            # "});" where only the "}" is extra) - show the corrected line.
+            solution_type = "replace"
+            replacement_code = current_code.replace(closer, "", 1)
+            solution = f"Remove the extra '{closer}' from this line, using the code below. If it's meant to close a real block instead, add the missing opening bracket at that block's start."
+        elif remainder == "":
+            # The stray bracket is the entire line - "replacing" it would
+            # just be an empty code block, which is confusing to show as a
+            # "here's your fix" box. Say delete the line instead.
+            solution_type = "remove"
+            solution = f"Delete this line - the '{closer}' on it has no matching opening bracket anywhere before it in the file. If it's meant to close a real block instead, add the missing opening bracket at that block's start rather than deleting this line."
+        else:
+            solution_type = "replace"
+            solution = f"Remove the extra '{closer}' if it has no matching opening bracket. If it's meant to close a real block, add the missing opening bracket at that block's start instead."
 
     elif rule == "unterminated_string":
         solution_type = "replace"
-        solution = "Add the missing closing quote at the end of this string - it needs to match whichever quote character (' or \") opened it. A string can't span multiple lines unless it's a template literal (backticks) or a triple-quoted string, so a missing quote here usually means the string was meant to end on this same line."
+        replacement_code = _fix_unterminated_string_line(current_code)
+        if replacement_code:
+            solution = "Add the missing closing quote using the code below - it matches whichever quote character opened the string."
+        else:
+            solution = "Add the missing closing quote at the end of this string - it needs to match whichever quote character (' or \") opened it. A string can't span multiple lines unless it's a template literal (backticks) or a triple-quoted string, so a missing quote here usually means the string was meant to end on this same line."
 
     elif rule == "unterminated_template_literal":
         solution_type = "replace"
-        solution = "Add the missing closing backtick (`) to complete this template string. Every backtick that opens a template literal needs exactly one matching backtick to close it - count the backticks on this line and nearby lines to find where one was left out."
+        if current_code.strip():
+            replacement_code = current_code.rstrip() + "`"
+        solution = "Add the missing closing backtick (`) to complete this template literal. This lets the parser treat the following code as code instead of continuing the string."
 
     elif rule == "unterminated_comment":
         solution_type = "replace"
-        solution = "Add the missing */ to close this comment block. Until it's closed, every line after it in the file is silently treated as part of the comment, which can hide real code from the compiler without any warning - so check that nothing important got swallowed once this is fixed."
+        if current_code.strip():
+            replacement_code = current_code.rstrip() + "*/"
+        solution = "Add the missing */ to close this block comment. Then check the following lines to ensure no real code was accidentally included inside the comment."
 
     elif rule == "loose_equality":
         solution_type = "replace"
         if "!=" in current_code:
             replacement_code = current_code.replace("!=", "!==")
-            solution = (
-                f"Replace `!=` in {_code_anchor(finding)} with `!==`. "
-                f"This makes the reported comparison require both the same type and the same value."
-            )
+            solution = "Change '!=' to '!==' using the code below. This compares both type and value without implicit type conversion."
         else:
             replacement_code = current_code.replace("==", "===")
-            solution = (
-                f"Replace `==` in {_code_anchor(finding)} with `===`. "
-                f"This makes the reported comparison require both the same type and the same value."
-            )
+            solution = "Change '==' to '===' using the code below. This compares both type and value without implicit type conversion."
 
     elif rule == "var_declaration":
         solution_type = "replace"
         replacement_code = current_code.replace("var ", "let ", 1)
-        solution = (
-            f"Replace the `var` declaration in {_code_anchor(finding)} with the corrected `let` declaration shown below. "
-            f"This keeps the reported variable scoped to the block where it is used."
-        )
+        solution = "Change 'var' to 'let' or 'const' using the code below. Block-scoped declarations prevent the variable from leaking outside its intended block."
 
     elif rule == "empty_catch_block":
         replacement_code = _fix_empty_catch(current_code, finding.get("file", ""))
         if replacement_code:
             solution_type = "replace"
-            solution = "Replace this with the version below, which logs the caught error instead of silently discarding it. Right now, if this code ever throws, the failure disappears with no log, no fallback, and no way to know it happened."
+            solution = "Replace this empty catch block with the version below so the error is recorded. This prevents failures from being silently discarded."
         else:
             solution_type = "add"
-            solution = "Add at least a log statement (e.g. console.error(err), or the equivalent for this language) inside the catch block. Right now this catch block does nothing, so if the wrapped code ever throws, the failure is silently discarded with no trace of it happening."
+            solution = "Add an error log inside the catch block. This keeps the failure visible instead of silently discarding the exception."
 
     elif rule == "leftover_console_statement":
         solution_type = "remove"
-        solution = "Delete this console.log/debug statement before shipping. It's harmless in production but usually isn't meant to ship, and can leak internal data into the browser console - if it's intentional logging rather than a debugging leftover, it's fine to leave as-is."
+        replacement_code = current_code
+        solution = "Remove this debugging console statement if it is not intentional application logging. This keeps temporary debugging output out of the shipped code."
 
     elif rule == "leftover_debugger_statement":
         solution_type = "remove"
-        solution = "Delete this 'debugger' statement before shipping. It pauses execution in any browser with developer tools open, which is almost always leftover from debugging rather than something meant to run in production."
+        replacement_code = current_code
+        solution = "Remove this 'debugger' statement from the code. Otherwise execution can pause when developer tools are open."
 
     elif rule == "leftover_debug_print":
         solution_type = "remove"
-        solution = "Delete this print statement before shipping, unless it's intentional program output (e.g. a CLI tool's actual result) rather than a debugging leftover - if you're not sure which it is, check whether removing it would change what the program is supposed to display to a real user."
+        replacement_code = current_code
+        solution = "Remove this print statement if it is only debugging output. Keep it only when the program intentionally uses it as user-facing or command-line output."
 
     elif rule == "unreachable_code":
         solution_type = "remove"
-        solution = "Delete this code. It sits right after a return, throw, or a branch that always exits, so it can never actually execute - removing it has no effect on the program's behavior, since it never ran in the first place."
+        replacement_code = current_code
+        solution = "Remove this unreachable code. It cannot execute because the control flow always exits before reaching it."
 
     else:
         # Should not normally be reached - every known rule is handled above -
         # but keep a safe, honest fallback for any future/unknown rule.
         solution_type = "replace"
-        solution = "We couldn't prepare an automatic fix for this one - review the code below and apply the fix yourself, using the cause above as a starting point."
-
-    if solution_type == "replace" and isinstance(replacement_code, str):
-        if re.sub(r"\s+", "", replacement_code) == re.sub(r"\s+", "", current_code):
-            replacement_code = None
-            solution_type = "add"
-            add_location = add_location or "Edit the reported code at this location using the detected cause."
-            solution = "Apply the correction described by the detected cause at this location. An exact automatic replacement could not be generated safely from the available code."
-
-    fallback_llm_confidence = FALLBACK_CONFIDENCE_BY_RULE.get(
-        rule, DEFAULT_FALLBACK_CONFIDENCE
-    )
-
-    # Fallback still uses the real detector finding and its source code.
-    # It is not automatically "insufficient evidence".
-    fallback_insufficient_evidence = not bool(
-        str(finding.get("current_code") or "").strip()
-    )
-
-    fallback_confidence, fallback_level, fallback_status = _calculate_evidence_confidence(
-        finding=finding,
-        retrieved=[],
-        llm_confidence=fallback_llm_confidence,
-        insufficient_evidence=fallback_insufficient_evidence,
-    )
+        solution = "Review the reported code and apply a manual fix based on the detected cause. An exact automatic replacement is not safe to generate from the available context."
 
     return {
         "error": finding.get("error", "Possible issue"),
@@ -573,17 +552,8 @@ def _fallback_report(finding: dict) -> dict:
         "add_location": add_location,
         "new_file_path": None,
         "explanation": "",
-        "confidence": fallback_confidence,
-        "confidence_level": fallback_level,
-        "confidence_status": fallback_status,
-        "insufficient_evidence": fallback_insufficient_evidence,
-        "is_real_bug": rule in {
-            "syntax_error", "unclosed_bracket", "mismatched_bracket",
-            "unexpected_closing_bracket", "unterminated_string",
-            "unterminated_template_literal", "unterminated_comment",
-            "unreachable_code", "eq_none",
-        },
-        "false_positive": False,
+        "confidence": FALLBACK_CONFIDENCE_BY_RULE.get(rule, DEFAULT_FALLBACK_CONFIDENCE),
+        "insufficient_evidence": True,
     }
 
 
@@ -735,27 +705,13 @@ FILE CONTENT:
                     line_start = None
                     line_end = None
 
-                current_code = str(item.get("current_code") or "").strip()
-                cause = str(item.get("cause") or "").strip()
-
-                # Whole-file analysis is especially prone to speculative
-                # findings. Require an exact code snippet and a plausible
-                # line location before allowing the candidate into the
-                # normal RAG/LLM report pipeline.
-                if not current_code or not cause:
-                    continue
-                if line_start is None or line_start < 1 or line_start > len(source.splitlines()):
-                    continue
-                if line_end is None or line_end < line_start:
-                    line_end = line_start
-
                 findings.append({
                     "error": error,
                     "bug_type": bug_type,
-                    "cause": cause,
+                    "cause": str(item.get("cause") or "").strip(),
                     "line_start": line_start,
-                    "line_end": min(line_end, len(source.splitlines())),
-                    "current_code": current_code,
+                    "line_end": line_end,
+                    "current_code": str(item.get("current_code") or "").strip(),
                     "function": item.get("function"),
                     "rule": "llm_file_analysis",
                     "file": file_path,
@@ -781,324 +737,47 @@ def get_fallback_report(finding: dict) -> dict:
 
 
 
-def _code_anchor(finding: dict) -> str:
-    """Return a small, human-readable identifier from THIS finding's code."""
-    code = str(finding.get("current_code") or "").strip()
-    if not code:
-        return "the reported code"
-
-    # Prefer a function/class name because it makes the solution visibly
-    # specific to the individual finding.
-    m = re.search(r"\b(?:def|async\s+def|function|class)\s+([A-Za-z_]\w*)", code)
-    if m:
-        return f"`{m.group(1)}()`"
-
-    # Otherwise use the first meaningful code line, shortened for the UI.
-    first = next((x.strip() for x in code.splitlines() if x.strip()), code)
-    first = re.sub(r"\\s+", " ", first)
-    if len(first) > 70:
-        first = first[:67] + "..."
-    return f"`{first}`"
-
-
-def _solution_is_specific(solution: str, finding: dict) -> bool:
-    """Require the solution to refer to something actually present in this finding."""
+def _normalize_solution_text(solution: str) -> str:
+    """Keep the user-facing solution short: exactly two concise sentences when possible."""
     if not solution:
-        return False
-
-    code = str(finding.get("current_code") or "")
-    if not code:
-        return True
-
-    # Exact function/class name is the strongest signal.
-    names = re.findall(r"\b(?:def|async\s+def|function|class)\s+([A-Za-z_]\w*)", code)
-    for name in names:
-        if re.search(rf"\b{re.escape(name)}\b", solution):
-            return True
-
-    # Require at least one meaningful identifier/operator/token from the
-    # actual code, rather than allowing "this code" / "replace this" templates.
-    tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", code)
-    stop = {
-        "def", "return", "function", "class", "self", "true", "false",
-        "none", "null", "this", "else", "elif", "from", "import", "with",
-        "async", "await", "try", "except", "finally", "for", "while", "if",
-    }
-    meaningful = [t for t in tokens if t.lower() not in stop]
-    return any(re.search(rf"\b{re.escape(t)}\b", solution) for t in meaningful[:20])
-
-
-def _make_specific_solution(result: dict, finding: dict) -> str:
-    """Create a short solution tied to this exact finding when Gemini is generic."""
-    anchor = _code_anchor(finding)
-    solution_type = result.get("solution_type")
-
-    if solution_type == "remove":
-        return (
-            f"Remove {anchor} from this file because this reported code is not used here. "
-            f"This removes the specific unused code without changing the code path shown in the finding."
-        )
-
-    if solution_type == "add":
-        return (
-            f"Add the required check or statement at the reported location for {anchor}. "
-            f"This prevents the specific condition identified in this finding from reaching the failing code."
-        )
-
-    if solution_type == "create_file":
-        return (
-            f"Create the new file shown in the generated solution for {anchor}. "
-            f"This supplies the missing file or definition required by the reported code."
-        )
-
-    return (
-        f"Replace {anchor} with the corrected code shown in the Solution section. "
-        f"This changes the exact code reported by the detector while preserving the surrounding code."
-    )
-
-
-def _short_solution(text: str) -> str:
-    """Return only the first two useful sentences for the Solution UI."""
-    if not text:
         return ""
-    clean = re.sub(r"```(?:\w+)?|```", "", str(text)).strip()
+    clean = re.sub(r"```(?:\w+)?|```", "", str(solution)).strip()
     clean = re.sub(r"\s+", " ", clean)
     sentences = re.split(r"(?<=[.!?])\s+", clean)
     sentences = [s.strip() for s in sentences if s.strip()]
-    return " ".join(sentences[:2]) if sentences else clean
+    if len(sentences) >= 2:
+        return " ".join(sentences[:2])
+    return clean
 
 
-def _same_code(a, b) -> bool:
-    """Compare code while ignoring harmless whitespace differences."""
-    if not isinstance(a, str) or not isinstance(b, str):
-        return False
-    normalize = lambda s: re.sub(r"\s+", "", s).strip()
-    return normalize(a) == normalize(b)
-
-
-
-def _clamp_confidence(value: float) -> int:
-    """Keep confidence in the valid 0-100 range."""
-    return max(0, min(100, int(round(value))))
-
-
-def _detector_evidence_score(finding: dict) -> int:
-    """Return the evidence strength of the detector for THIS finding."""
-    rule = str(finding.get("rule") or "").lower()
-
-    exact_rules = {
-        "syntax_error": 98,
-        "unclosed_bracket": 98,
-        "mismatched_bracket": 98,
-        "unexpected_closing_bracket": 98,
-        "unterminated_string": 98,
-        "unterminated_template_literal": 98,
-        "unterminated_comment": 98,
-        "unreachable_code": 96,
-        "eq_none": 95,
-        "leftover_debugger_statement": 92,
-        "leftover_console_statement": 88,
-        "leftover_debug_print": 88,
-        "loose_equality": 88,
-        "var_declaration": 82,
-    }
-
-    heuristic_rules = {
-        "bare_except": 78,
-        "mutable_default_arg": 74,
-        "possibly_unused_function": 60,
-        "possible_division_by_zero": 55,
-        "empty_catch_block": 55,
-    }
-
-    if rule in exact_rules:
-        return exact_rules[rule]
-    if rule in heuristic_rules:
-        return heuristic_rules[rule]
-    if rule == "llm_file_analysis":
-        return 65
-    return 50
-
-
-def _rag_evidence_score(retrieved: list) -> int:
-    """Return the strongest historical similarity as 0-100."""
-    if not retrieved:
-        return 0
-
-    similarities = []
-    for item in retrieved:
-        try:
-            value = float(item.get("similarity", 0.0))
-        except (TypeError, ValueError):
-            value = 0.0
-        similarities.append(max(0.0, min(1.0, value)))
-
-    return _clamp_confidence(max(similarities) * 100) if similarities else 0
-
-
-def _calculate_evidence_confidence(
-    finding: dict,
-    retrieved: list,
-    llm_confidence,
-    insufficient_evidence: bool = False,
-) -> tuple[int, str, str]:
-    """
-    Calculate a per-finding evidence score.
-
-    60% detector evidence + 40% LLM/fallback confidence.
-    RAG similarity is a supporting bonus of up to 10 points when matching
-    historical evidence exists. Missing RAG evidence does not penalize a
-    finding.
-
-    This is an evidence score, not a statistically calibrated probability.
-    """
-    try:
-        llm_score = float(llm_confidence)
-    except (TypeError, ValueError):
-        llm_score = 50.0
-
-    llm_score = max(0.0, min(100.0, llm_score))
-    detector_score = _detector_evidence_score(finding)
-    rag_score = _rag_evidence_score(retrieved)
-
-    final_score = (detector_score * 0.60) + (llm_score * 0.40)
-
-    # Historical RAG evidence can strengthen a matching finding, but the
-    # absence of a historical match must not reduce confidence.
-    if rag_score > 0:
-        final_score += min(rag_score * 0.10, 10.0)
-
-    # Do not collapse every insufficient-evidence result to one fixed number.
-    if insufficient_evidence:
-        final_score *= 0.50
-
-    confidence = _clamp_confidence(final_score)
-
-    if confidence >= 70 and not insufficient_evidence:
-        level = "High Confidence"
-        status = "Potential Bug"
-    else:
-        level = "Low Confidence"
-        status = "Uncertain Finding"
-
-    return confidence, level, status
-
-
-
-def _uncertain_finding_report(finding: dict, reason: str = "") -> dict:
-    """
-    Preserve the finding as an explicitly unconfirmed result instead of
-    presenting a detector warning as a confirmed bug.
-
-    This is the false-positive guard used when Gemini decides that the
-    supplied code does not actually prove the detector warning is a bug.
-    """
-    cause = reason.strip() or str(finding.get("cause") or "").strip()
-    if not cause:
-        cause = "The supplied code does not provide enough evidence to confirm this as a real bug."
-
-    return {
-        "error": "Potential false positive - not confirmed as a real bug",
-        "bug_type": "Other",
-        "cause": cause,
-        "why_occurs": "",
-        "solution_type": "add",
-        "solution": (
-            "Do not apply an automatic code change because the supplied evidence does not confirm a real defect. "
-            "Treat this finding as an uncertain result and verify it with the surrounding code or runtime behavior."
-        ),
-        "replacement_code": None,
-        "add_location": None,
-        "new_file_path": None,
-        "explanation": "Gemini could not confirm that the detector warning represents an actual defect in the supplied code.",
-        "is_real_bug": False,
-        "confidence": 0,
-        "confidence_level": "Low Confidence",
-        "confidence_status": "Uncertain Finding",
-        "insufficient_evidence": True,
-        "false_positive": True,
-    }
-
-
-def _validate_llm_result(result: dict, finding: dict, retrieved: list | None = None):
-    """Reject unusable or non-specific LLM fixes before they reach the frontend."""
+def _validate_llm_result(result: dict, finding: dict) -> dict | None:
+    """Validate and normalize the LLM result before it reaches the frontend."""
     if not isinstance(result, dict):
         return None
 
-    # Explicit false-positive gate. A detector warning is not allowed to
-    # become a confirmed bug unless Gemini independently confirms it from
-    # the exact supplied code.
-    is_real_bug = result.get("is_real_bug")
-    if is_real_bug is False:
-        reason = str(
-            result.get("cause")
-            or result.get("why_occurs")
-            or "The supplied code does not confirm the reported issue."
-        )
-        return _uncertain_finding_report(finding, reason)
-
-    # Older/unexpected model output that omits the gate is not trusted.
-    # Keep the existing pipeline working, but require the evidence fields
-    # below before treating the result as a confirmed bug.
-    if is_real_bug is not True:
-        return None
-
     solution_type = result.get("solution_type")
-    current_code = str(finding.get("current_code") or "")
     replacement = result.get("replacement_code")
-
-    if not current_code.strip():
-        return _uncertain_finding_report(
-            finding,
-            "The finding does not contain the exact code needed to confirm the reported issue safely.",
-        )
-
-    try:
-        model_confidence = int(result.get("confidence"))
-    except (TypeError, ValueError):
-        return None
-
-    if model_confidence < 0 or model_confidence > 100:
-        return None
 
     if solution_type == "replace":
         if not isinstance(replacement, str) or not replacement.strip():
             return None
-        if _same_code(replacement, current_code):
-            print("[llm_client] Gemini returned the same code as the error code. Using fallback.")
-            return None
+    elif solution_type in {"add", "remove", "create_file"}:
+        if replacement is not None and not isinstance(replacement, str):
+            result["replacement_code"] = str(replacement)
 
-    if solution_type == "remove":
-        # A remove solution must never display the same buggy code again.
-        result["replacement_code"] = None
-
-    result["solution"] = _short_solution(result.get("solution", ""))
-
-    if not result["solution"]:
+    solution = _normalize_solution_text(result.get("solution", ""))
+    if not solution:
         return None
 
-    # A solution such as "Delete this function" can be technically valid but
-    # is too generic for the UI. It must refer to the actual function,
-    # variable, statement, or other token in THIS finding.
-    if not _solution_is_specific(result["solution"], finding):
-        result["solution"] = _make_specific_solution(result, finding)
+    result["solution"] = solution
 
-    result["solution"] = _short_solution(result["solution"])
+    confidence = result.get("confidence")
+    if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
+        result["confidence"] = 70
+    else:
+        result["confidence"] = int(confidence)
 
-    result["is_real_bug"] = True
-    result["false_positive"] = False
     result.setdefault("insufficient_evidence", False)
-
-    confidence, confidence_level, confidence_status = _calculate_evidence_confidence(
-        finding=finding,
-        retrieved=retrieved or [],
-        llm_confidence=result.get("confidence"),
-        insufficient_evidence=bool(result.get("insufficient_evidence", False)),
-    )
-    result["confidence"] = confidence
-    result["confidence_level"] = confidence_level
-    result["confidence_status"] = confidence_status
-
     return result
 
 
@@ -1182,9 +861,11 @@ def analyze_finding(finding: dict, retrieved: list) -> dict:
 
                     result = json.loads(cleaned)
 
-                    validated = _validate_llm_result(result, finding, retrieved)
+                    validated = _validate_llm_result(result, finding)
                     if validated is None:
+                        print("[llm_client] Gemini returned an unusable fix. Using fallback.")
                         return _fallback_report(finding)
+
                     return validated
 
                 except (json.JSONDecodeError, ValueError) as e:
