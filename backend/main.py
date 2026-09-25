@@ -60,6 +60,37 @@ MAX_PARALLEL_WORKERS = 2
 # Number of files being scanned simultaneously.
 MAX_FILE_SCAN_WORKERS = 4
 
+
+def _looks_like_python_source(source: str) -> bool:
+    """Recognize likely Python code in extensionless files without parsing it.
+
+    This lets files such as test fixtures named ``s-error`` use the Python
+    detector even when they contain syntax errors that prevent ast.parse().
+    A small keyword score reduces accidental classification of ordinary text.
+    """
+    import re
+
+    if not source or not source.strip():
+        return False
+
+    if re.search(r"^#!.*\bpython(?:[0-9.]*)?\b", source, re.MULTILINE | re.IGNORECASE):
+        return True
+
+    patterns = (
+        r"^\s*(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(",
+        r"^\s*class\s+[A-Za-z_]\w*",
+        r"^\s*(?:from\s+[\w.]+\s+import|import\s+[\w.]+)",
+        r"^\s*(?:if|elif|for|while|try|except|finally|with|return|raise|yield|pass|break|continue)\b",
+        r"^\s*print\s*\(",
+    )
+    score = sum(
+        1
+        for line in source.splitlines()
+        if any(re.search(pattern, line) for pattern in patterns)
+    )
+    return score >= 2
+
+
 def _empty_summary(repo: str, message: str) -> ScanResult:
     return ScanResult(
         summary=ScanSummary(
@@ -180,6 +211,13 @@ def scan_repo(req: ScanRequest):
             try:
 
                 detector = DETECTORS_BY_EXTENSION.get(ext)
+
+                # Extensionless Python test/source files would otherwise be
+                # sent to whole-file Gemini analysis, which may return fewer
+                # findings or none. Route recognizable extensionless Python
+                # through the deterministic Python detector instead.
+                if detector is None and not ext and _looks_like_python_source(source):
+                    detector = detect_python
 
                 if detector:
                     findings = detector(
