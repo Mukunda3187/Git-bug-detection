@@ -7,6 +7,7 @@ GitHub URL -> validate -> download -> scan files -> detect candidates
 """
 
 import os
+import re
 import uuid
 import concurrent.futures
 
@@ -62,33 +63,23 @@ MAX_FILE_SCAN_WORKERS = 4
 
 
 def _looks_like_python_source(source: str) -> bool:
-    """Recognize likely Python code in extensionless files without parsing it.
-
-    This lets files such as test fixtures named ``s-error`` use the Python
-    detector even when they contain syntax errors that prevent ast.parse().
-    A small keyword score reduces accidental classification of ordinary text.
-    """
-    import re
-
-    if not source or not source.strip():
-        return False
-
-    if re.search(r"^#!.*\bpython(?:[0-9.]*)?\b", source, re.MULTILINE | re.IGNORECASE):
-        return True
-
+    """Recognize common Python syntax in extensionless source files."""
     patterns = (
-        r"^\s*(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(",
-        r"^\s*class\s+[A-Za-z_]\w*",
-        r"^\s*(?:from\s+[\w.]+\s+import|import\s+[\w.]+)",
-        r"^\s*(?:if|elif|for|while|try|except|finally|with|return|raise|yield|pass|break|continue)\b",
+        r"^\s*(?:async\s+)?def\s+\w+\s*\(",
+        r"^\s*class\s+\w+",
+        r"^\s*(?:from\s+[\w.]+\s+import|import\s+\w+)",
+        r"^\s*(?:if|elif|for|while|try|except|with)\b",
+        r"^\s*(?:return|yield|raise|pass|break|continue)\b",
         r"^\s*print\s*\(",
+        r"^\s*#.*(?:python|bug|error)",
     )
-    score = sum(
-        1
-        for line in source.splitlines()
-        if any(re.search(pattern, line) for pattern in patterns)
-    )
-    return score >= 2
+    matched = 0
+    for line in source.splitlines()[:100]:
+        if any(re.search(pattern, line) for pattern in patterns):
+            matched += 1
+            if matched >= 2:
+                return True
+    return False
 
 
 def _empty_summary(repo: str, message: str) -> ScanResult:
@@ -212,15 +203,17 @@ def scan_repo(req: ScanRequest):
 
                 detector = DETECTORS_BY_EXTENSION.get(ext)
 
-                # Extensionless Python test/source files would otherwise be
-                # sent to whole-file Gemini analysis, which may return fewer
-                # findings or none. Route recognizable extensionless Python
-                # through the deterministic Python detector instead.
-                if detector is None and not ext and _looks_like_python_source(source):
-                    detector = detect_python
-
+                # Some repositories contain runnable Python scripts without a
+                # .py suffix (for example, an executable named ``s-error``).
+                # Route those through the Python parser instead of the generic
+                # LLM-only file analyzer so syntax fixes are available.
                 if detector:
                     findings = detector(
+                        relative_path,
+                        source
+                    )
+                elif not ext and _looks_like_python_source(source):
+                    findings = detect_python(
                         relative_path,
                         source
                     )
