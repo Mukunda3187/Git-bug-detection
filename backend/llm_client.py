@@ -8,7 +8,7 @@ models.BugReport (minus the fields the caller already knows, like id/file).
 Uses Gemini's REST API directly via `requests` (already a dependency) -
 no extra SDK to install or version-pin.
 
-If no GEMINI_API_KEY is set, falls back to a transparent rule-based
+If no GEMINI_API_KEY is set, falls back to a transparent rule-baseda
 formatter so the app still runs end-to-end for a demo - it clearly does
 NOT pretend to be the LLM's reasoning, it just formats what the detector
 already found.
@@ -491,35 +491,28 @@ def _fallback_report(finding: dict) -> dict:
 
     elif rule == "syntax_error":
         cause = f"Python's own parser could not read this code. The exact reason it gave was: \"{cause_from_detector}\"."
-
-        # Prefer the parser-backed detector's candidate. Recomputing a fix from
-        # only the short code snippet can lose context and leave the UI without
-        # corrected code even when the detector already found a repair.
-        detector_candidate = finding.get("replacement_code")
+        # The detector already ran a parser-guided repair attempt. Prefer its
+        # exact replacement over a second, narrower regex guess. This is the
+        # critical handoff that keeps valid detector fixes from being discarded.
+        detector_replacement = finding.get("replacement_code")
         replacement_code = (
-            detector_candidate
-            if isinstance(detector_candidate, str) and detector_candidate.strip()
+            detector_replacement.strip("\n")
+            if isinstance(detector_replacement, str) and detector_replacement.strip()
             else _fix_python_syntax_error(current_code, cause_from_detector)
         )
-
-        if replacement_code is not None:
+        if replacement_code:
             solution_type = "replace"
-            if replacement_code.lstrip().startswith("# TODO:"):
-                solution = (
-                    "The code below comments out the invalid statement so parsing can continue. "
-                    "Move the statement into its required function or loop if its behavior is needed."
-                )
-            else:
-                solution = (
-                    f"Replace the reported code with the corrected version below. "
-                    f"It addresses the parser error: {cause_from_detector}. Re-scan to verify."
-                )
+            solution = (
+                f"Replace the reported code with the corrected version below. "
+                f"It addresses the parser error: {cause_from_detector}."
+            )
         else:
             solution_type = "add"
-            add_location = "The parser error is ambiguous; edit the reported code using the explanation below."
+            add_location = "Edit the reported line and correct the parser error."
             solution = (
-                f"No safe automatic replacement could be inferred for: {cause_from_detector}. "
-                "The cause is shown so you can make a context-aware correction."
+                f"Python reported this syntax problem: {cause_from_detector}. "
+                "The intended behavior is ambiguous, so no automatic replacement is shown; "
+                "move or rewrite the statement in its intended context."
             )
 
     elif rule == "unclosed_bracket":
@@ -864,6 +857,15 @@ def _validate_llm_result(result: dict, finding: dict) -> dict | None:
 
     result["solution"] = solution
 
+    # For syntax errors, retain a concrete parser-guided correction from the
+    # detector even if the LLM returns a weaker or empty replacement.
+    if finding.get("rule") == "syntax_error":
+        detector_replacement = finding.get("replacement_code")
+        if isinstance(detector_replacement, str) and detector_replacement.strip():
+            result["solution_type"] = "replace"
+            result["replacement_code"] = detector_replacement.strip("\n")
+            result["insufficient_evidence"] = False
+
     confidence = result.get("confidence")
     if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
         result["confidence"] = 70
@@ -875,11 +877,6 @@ def _validate_llm_result(result: dict, finding: dict) -> dict | None:
 
 
 def analyze_finding(finding: dict, retrieved: list) -> dict:
-    # Syntax fixes come from the parser-backed detector. Do not let an LLM
-    # replace a concrete line-level repair with generic or unverified text.
-    if finding.get("rule") == "syntax_error":
-        return _fallback_report(finding)
-
     api_keys = []
 
     # Read multiple Gemini API keys from environment variables.
