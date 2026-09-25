@@ -419,15 +419,20 @@ def _fallback_report(finding: dict) -> dict:
             solution = "Add a check that the denominator isn't zero immediately before this division, and handle the zero case explicitly (skip the calculation, use a default value, or raise a clear error). This prevents the calculation from raising ZeroDivisionError at runtime."
 
     elif rule == "syntax_error":
-        cause = f"Python's own parser could not read this code. The exact reason it gave was: \"{cause_from_detector}\"."
-        replacement_code = _fix_python_syntax_error(current_code, cause_from_detector)
+        cause = f"Python's syntax checker identified this issue: {cause_from_detector}"
+        # Prefer the detector's recovery-validated correction. It was produced
+        # by applying the repair and re-parsing the file, rather than guessing
+        # a replacement from a short error message.
+        replacement_code = finding.get("replacement_code") or _fix_python_syntax_error(
+            current_code, cause_from_detector
+        )
         if replacement_code:
             solution_type = "replace"
-            solution = f"Replace this line with the version below to fix the exact problem Python reported: {cause_from_detector}. Re-run the file afterward to confirm the syntax error is gone."
+            solution = "Replace the reported line with the corrected code shown below. Scan the file again to check for any remaining syntax errors."
         else:
             solution_type = "add"
             add_location = "Edit the reported line and correct the parser error."
-            solution = f"Fix the parser problem reported here: {cause_from_detector}. Re-run the file after editing to confirm that the syntax error is gone."
+            solution = f"Fix the syntax problem reported here: {cause_from_detector}. Scan the file again to check for any remaining syntax errors."
 
     elif rule == "unclosed_bracket":
         solution_type = "replace"
@@ -782,6 +787,11 @@ def _validate_llm_result(result: dict, finding: dict) -> dict | None:
 
 
 def analyze_finding(finding: dict, retrieved: list) -> dict:
+    # Syntax-error fixes are based on parser-driven, re-validated repairs.
+    # Do not let the LLM replace these exact corrections with speculative code.
+    if finding.get("rule") == "syntax_error":
+        return _fallback_report(finding)
+
     api_keys = []
 
     # Read multiple Gemini API keys from environment variables.
