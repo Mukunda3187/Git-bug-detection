@@ -168,11 +168,14 @@ def _syntax_repair_candidate(lines, error):
     # lets analysis continue; no behavior-preserving edit can be inferred.
     lowered = message.lower()
     if "'break' outside loop" in lowered:
-        return idx, "# " + current.lstrip(), "'break' must be inside a loop. Move it into the intended loop.", None
+        replacement = re.match(r"^\s*", current).group(0) + "# TODO: move 'break' inside the intended loop"
+        return idx, replacement, "'break' is outside a loop. The suggested comment disables the invalid statement; move it into the intended loop if that behavior is required.", replacement
     if "'continue' not properly in loop" in lowered or "'continue' not supported" in lowered or "'continue' outside loop" in lowered:
-        return idx, "# " + current.lstrip(), "'continue' must be inside a loop. Move it into the intended loop.", None
+        replacement = re.match(r"^\s*", current).group(0) + "# TODO: move 'continue' inside the intended loop"
+        return idx, replacement, "'continue' is outside a loop. The suggested comment disables the invalid statement; move it into the intended loop if that behavior is required.", replacement
     if "'return' outside function" in lowered:
-        return idx, "# " + current.lstrip(), "'return' must be inside a function. Move it into the intended function.", None
+        replacement = re.match(r"^\s*", current).group(0) + "# TODO: move 'return' inside the intended function"
+        return idx, replacement, "'return' is outside a function. The suggested comment disables the invalid statement; move it into the intended function if that behavior is required.", replacement
 
     # A malformed function header such as `def greet(name:` can make the
     # parser point at the following line. Repair the nearest preceding header.
