@@ -272,11 +272,75 @@ def _fix_python_syntax_error(current_code: str, cause_from_detector: str):
     code = current_code.rstrip()
     cause = (cause_from_detector or "").lower()
 
+    # A lambda is an expression and cannot contain ``return``.
+    lambda_return = re.match(r"^(\s*.*?\blambda\s+[^:]+:\s*)return\s+(.+?)\s*$", code)
+    if lambda_return:
+        return lambda_return.group(1) + lambda_return.group(2)
+
+    # Common deterministic syntax corrections for malformed conditions,
+    # dictionary pairs, and incomplete comprehension filters.
+    if re.match(r"^\s*(?:if|elif|while)\b", code) and re.search(r"(?<![<>=!])=(?!=)", code):
+        return re.sub(r"(?<![<>=!])=(?!=)", "==", code, count=1)
+    dict_pair = re.search(r"([\"'])([A-Za-z_]\w*)\1\s+([\"'])", code)
+    if dict_pair and "{" in code and "}" in code:
+        return code[:dict_pair.start()] + f"{dict_pair.group(1)}{dict_pair.group(2)}{dict_pair.group(1)}: " + code[dict_pair.end() - 1:]
+    if re.search(r"\bif\s*([\]])", code):
+        return re.sub(r"\s+if\s*([\]])", r"\1", code, count=1)
+
+    # Repair a mismatched closing delimiter such as ``sum([1, 2)`` by inserting
+    # the required close delimiter(s) before the mismatched closer and balancing
+    # any still-open delimiters on the line.
+    if "does not match opening parenthesis" in cause or "was never closed" in cause:
+        opening = "([{"
+        pair = {"(": ")", "[": "]", "{": "}"}
+        reverse = {v: k for k, v in pair.items()}
+        stack = []
+        out = []
+        quote = None
+        escaped = False
+        for ch in code:
+            if quote:
+                out.append(ch)
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in ("'", '\"'):
+                quote = ch
+                out.append(ch)
+            elif ch in opening:
+                stack.append(ch)
+                out.append(ch)
+            elif ch in reverse:
+                if stack and stack[-1] == reverse[ch]:
+                    stack.pop()
+                    out.append(ch)
+                elif reverse[ch] in stack:
+                    while stack and stack[-1] != reverse[ch]:
+                        out.append(pair[stack.pop()])
+                    if stack:
+                        stack.pop()
+                        out.append(ch)
+                else:
+                    return None
+            else:
+                out.append(ch)
+        if quote:
+            return None
+        while stack:
+            out.append(pair[stack.pop()])
+        fixed = "".join(out)
+        if fixed != code:
+            return fixed
+
     # A required parameter cannot follow a parameter with a default.
     # Move required simple parameters before defaulted parameters, preserving
     # the default expression. Only handle simple signatures without annotations,
     # *args, /, or **kwargs, where comma splitting is unambiguous.
-    if "non-default argument follows default argument" in cause:
+    if "non-default argument follows default argument" in cause or "parameter without a default follows parameter with a default" in cause:
         match = re.search(
             r"(?m)^(\s*(?:async\s+)?def\s+\w+\s*\()([^()\n]*)(\)\s*:\s*)$",
             code,
