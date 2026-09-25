@@ -92,6 +92,81 @@ def _find_unreachable_code(body, file_path, source_lines, findings):
             _find_unreachable_code(handler.body, file_path, source_lines, findings)
 
 
+def _balance_line_delimiters(line):
+    """Return a syntax-balanced version of a simple line with mismatched delimiters.
+
+    This is deliberately quote-aware and only repairs bracket structure; it does
+    not try to infer application logic. For example, ``print(sum([1, 2)`` becomes
+    ``print(sum([1, 2]))`` by inserting the missing ``]`` and final ``)``.
+    """
+    opening = "([{"
+    closing = ")] }".replace(" ", "")
+    pair = {"(": ")", "[": "]", "{": "}"}
+    reverse = {v: k for k, v in pair.items()}
+    stack = []
+    output = []
+    quote = None
+    triple = False
+    escaped = False
+    i = 0
+
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            output.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif triple and line.startswith(quote * 3, i):
+                output.extend(line[i + 1:i + 3])
+                i += 2
+                quote = None
+                triple = False
+            elif not triple and ch == quote:
+                quote = None
+            i += 1
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            triple = line.startswith(ch * 3, i)
+            output.append(ch)
+            if triple:
+                output.extend(line[i + 1:i + 3])
+                i += 2
+            i += 1
+            continue
+
+        if ch in opening:
+            stack.append(ch)
+            output.append(ch)
+        elif ch in closing:
+            if stack and stack[-1] == reverse[ch]:
+                stack.pop()
+                output.append(ch)
+            elif reverse[ch] in stack:
+                # Close nested unmatched openers before this closer.
+                while stack and stack[-1] != reverse[ch]:
+                    output.append(pair[stack.pop()])
+                if stack:
+                    stack.pop()
+                    output.append(ch)
+            else:
+                # A closer with no opener on this line cannot be repaired safely.
+                return None
+        else:
+            output.append(ch)
+        i += 1
+
+    if quote:
+        return None
+    while stack:
+        output.append(pair[stack.pop()])
+    fixed = "".join(output)
+    return fixed if fixed != line else None
+
+
 def _syntax_repair_candidate(lines, error):
     """Return (line_index, scratch_line, explanation, display_replacement).
 
@@ -103,6 +178,68 @@ def _syntax_repair_candidate(lines, error):
     idx = max(0, min((error.lineno or 1) - 1, max(0, len(lines) - 1)))
     current = lines[idx] if lines else ""
     stripped = current.rstrip()
+
+    # A required parameter cannot follow a parameter with a default.
+    if "non-default argument follows default argument" in message.lower() or "parameter without a default follows parameter with a default" in message.lower():
+        signature = re.match(r"^(\s*(?:async\s+)?def\s+\w+\s*\()([^()\n]*)(\)\s*:\s*)$", current)
+        if signature:
+            parts = [part.strip() for part in signature.group(2).split(",")]
+            if parts and all(part and not any(ch in part for ch in (":", "*", "/")) for part in parts):
+                required = [part for part in parts if "=" not in part]
+                optional = [part for part in parts if "=" in part]
+                if required and optional:
+                    replacement = signature.group(1) + ", ".join(required + optional) + signature.group(3)
+                    return idx, replacement, "Move required parameters before parameters with default values.", replacement
+
+    # Repair a missing indentation level after a compound header.
+    if "expected an indented block" in message.lower():
+        previous_indent = 0
+        for prior_idx in range(idx - 1, -1, -1):
+            prior = lines[prior_idx]
+            if prior.strip():
+                previous_indent = len(prior) - len(prior.lstrip())
+                break
+        replacement = " " * (previous_indent + 4) + current.lstrip()
+        if replacement != current:
+            return idx, replacement, "Indent this statement inside the preceding block.", replacement
+
+    # A single '=' is not allowed as a condition comparison.
+    if re.match(r"^\s*(?:if|elif|while)\b", current) and re.search(r"(?<![<>=!])=(?!=)", current):
+        replacement = re.sub(r"(?<![<>=!])=(?!=)", "==", current, count=1)
+        return idx, replacement, "Use '==' for comparison instead of assignment in the condition.", replacement
+
+    # A missing colon between a quoted dictionary key and quoted value.
+    dict_pair = re.search(r"([\"'])([A-Za-z_]\w*)\1\s+([\"'])", current)
+    if dict_pair and "{" in current and "}" in current:
+        replacement = current[:dict_pair.start()] + f"{dict_pair.group(1)}{dict_pair.group(2)}{dict_pair.group(1)}: " + current[dict_pair.end() - 1:]
+        return idx, replacement, "Add the missing colon between the dictionary key and its value.", replacement
+
+    # Remove a dangling 'if' at the end of a list comprehension.
+    if re.search(r"\bif\s*([\]])", current):
+        replacement = re.sub(r"\s+if\s*([\]])", r"\1", current, count=1)
+        return idx, replacement, "Remove the incomplete filter from the list comprehension.", replacement
+
+    # Repair a malformed nested exception label such as ``except:`` followed
+    # by an indented ``ZeroDivisionError:``. Keep the existing nested body valid
+    # while making the conditional explicit; the exact exception policy should
+    # be reviewed by the developer.
+    if re.match(r"^\s*ZeroDivisionError\s*:\s*$", current) and idx > 0 and re.match(r"^\s*except\s*:\s*$", lines[idx - 1]):
+        indent = re.match(r"^\s*", current).group(0)
+        replacement = indent + "if True:"
+        return idx, replacement, "The exception type is incorrectly written as a nested block; use a valid nested suite and review the except clause.", replacement
+
+    # Invalid ``return`` inside a lambda: lambdas contain an expression, not a
+    # return statement. Removing this keyword preserves the expression itself.
+    lambda_return = re.match(r"^(\s*.*?\blambda\s+[^:]+:\s*)return\s+(.+?)\s*$", current)
+    if lambda_return:
+        replacement = lambda_return.group(1) + lambda_return.group(2)
+        return idx, replacement, "A lambda must contain an expression, not a return statement; remove 'return'.", replacement
+
+    # Repair mismatched or missing closing delimiters on a single line.
+    if "does not match opening parenthesis" in message.lower() or "was never closed" in message.lower():
+        balanced = _balance_line_delimiters(current)
+        if balanced:
+            return idx, balanced, "Balance the brackets and parentheses on this line.", balanced
 
     # Common missing comma in a simple function parameter list: def f(a b):
     m = re.match(r"^(\s*(?:async\s+)?def\s+\w+\s*\()([^()]*)(\)\s*:\s*)$", current)
