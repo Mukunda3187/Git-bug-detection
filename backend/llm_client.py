@@ -259,28 +259,99 @@ def _fix_unterminated_string_line(current_code: str):
 
 
 def _fix_python_syntax_error(current_code: str, cause_from_detector: str):
-    """Mechanically fixes the Python syntax errors where the fix is safely
-    derivable from Python's own error message and the single reported line:
-    a missing trailing colon, an unclosed bracket/paren, or an unterminated
-    string. Returns None for anything less certain (Python's generic
-    "invalid syntax" covers a huge range of different real problems) rather
-    than guessing at a fix for something structurally ambiguous - those stay
-    theory-only, same as before."""
+    """Return a conservative, copy-pasteable fix for common Python syntax errors.
+
+    This is a fallback used when the LLM is unavailable. It intentionally
+    handles only transformations that can be derived from the parser message
+    and the supplied snippet; ambiguous semantic repairs are left without a
+    fabricated replacement.
+    """
     if not current_code or not current_code.strip():
         return None
 
-    if PYTHON_MISSING_COLON_RE.search(cause_from_detector):
-        stripped = current_code.rstrip()
-        return stripped + ":" if not stripped.endswith(":") else None
+    code = current_code.rstrip()
+    cause = (cause_from_detector or "").lower()
 
-    m = PYTHON_UNCLOSED_BRACKET_RE.search(cause_from_detector)
+    # A required parameter cannot follow a parameter with a default.
+    # Move required simple parameters before defaulted parameters, preserving
+    # the default expression. Only handle simple signatures without annotations,
+    # *args, /, or **kwargs, where comma splitting is unambiguous.
+    if "non-default argument follows default argument" in cause:
+        match = re.search(
+            r"(?m)^(\s*(?:async\s+)?def\s+\w+\s*\()([^()\n]*)(\)\s*:\s*)$",
+            code,
+        )
+        if match:
+            params = [p.strip() for p in match.group(2).split(",")]
+            if params and all(
+                p and not any(ch in p for ch in (":", "*", "/"))
+                for p in params
+            ):
+                required = [p for p in params if "=" not in p]
+                optional = [p for p in params if "=" in p]
+                if required and optional:
+                    fixed_signature = (
+                        match.group(1)
+                        + ", ".join(required + optional)
+                        + match.group(3)
+                    )
+                    return code[:match.start()] + fixed_signature + code[match.end():]
+
+    # Missing comma between simple function parameters, e.g. def add(a b):
+    if "forgot a comma" in cause or "invalid syntax" in cause:
+        def_sig = re.search(
+            r"(?m)^(\s*(?:async\s+)?def\s+\w+\s*\()([^()\n]*)(\)\s*:\s*)$",
+            code,
+        )
+        if def_sig and not any(ch in def_sig.group(2) for ch in (":", "*", "/")):
+            params = def_sig.group(2).strip()
+            fixed = re.sub(
+                r"(?<=[A-Za-z0-9_])\s+(?=[A-Za-z_]\w*(?:\s*=|\s*,|\s*$))",
+                ", ",
+                params,
+            )
+            if fixed != params:
+                fixed_signature = def_sig.group(1) + fixed + def_sig.group(3)
+                return code[:def_sig.start()] + fixed_signature + code[def_sig.end():]
+
+        # Common one-line suite typo: `if condition print(...)` -> `if condition: print(...)`.
+        for keyword in ("if", "elif", "while"):
+            m = re.match(
+                rf"^(\s*{keyword}\s+.+?)\s+(?=(?:print|return|raise|pass|break|continue)\b)",
+                code,
+            )
+            if m and ":" not in m.group(1):
+                return code[:m.end(1)] + ":" + code[m.end(1):]
+
+    # Python explicitly reports a missing colon for compound statements.
+    if "expected ':'" in cause:
+        if not code.endswith(":"):
+            return code + ":"
+
+    # Missing closing bracket/parenthesis reported by Python.
+    m = re.search(r"'(.)' was never closed", cause_from_detector or "")
     if m:
         closer = BRACKET_CLOSER.get(m.group(1))
-        return current_code.rstrip() + closer if closer else None
+        if closer:
+            return code + closer
 
-    lowered = cause_from_detector.lower()
-    if "unterminated string literal" in lowered or "unterminated triple-quoted string literal" in lowered:
-        return _fix_unterminated_string_line(current_code)
+    # Unterminated string literal.
+    if "unterminated string literal" in cause or "unterminated triple-quoted string literal" in cause:
+        return _fix_unterminated_string_line(code)
+
+    # A simple unmatched extra closing bracket on the reported snippet.
+    if "unmatched ')'" in cause or "unmatched ']'" in cause or "unmatched '}'" in cause:
+        for closer in (")", "]", "}"):
+            if closer in code:
+                return code[:code.rfind(closer)] + code[code.rfind(closer) + 1:]
+
+    # Incomplete `from module import` can be repaired without guessing a name
+    # by importing the module itself.
+    if re.fullmatch(r"\s*from\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s+import\s*", code):
+        m = re.fullmatch(r"\s*from\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s+import\s*", code)
+        if m:
+            indent = code[:len(code) - len(code.lstrip())]
+            return f"{indent}import {m.group(1)}"
 
     return None
 
@@ -419,20 +490,15 @@ def _fallback_report(finding: dict) -> dict:
             solution = "Add a check that the denominator isn't zero immediately before this division, and handle the zero case explicitly (skip the calculation, use a default value, or raise a clear error). This prevents the calculation from raising ZeroDivisionError at runtime."
 
     elif rule == "syntax_error":
-        cause = f"Python's syntax checker identified this issue: {cause_from_detector}"
-        # Prefer the detector's recovery-validated correction. It was produced
-        # by applying the repair and re-parsing the file, rather than guessing
-        # a replacement from a short error message.
-        replacement_code = finding.get("replacement_code") or _fix_python_syntax_error(
-            current_code, cause_from_detector
-        )
+        cause = f"Python's own parser could not read this code. The exact reason it gave was: \"{cause_from_detector}\"."
+        replacement_code = _fix_python_syntax_error(current_code, cause_from_detector)
         if replacement_code:
             solution_type = "replace"
-            solution = "Replace the reported line with the corrected code shown below. Scan the file again to check for any remaining syntax errors."
+            solution = f"Replace this line with the version below to fix the exact problem Python reported: {cause_from_detector}. Re-run the file afterward to confirm the syntax error is gone."
         else:
             solution_type = "add"
             add_location = "Edit the reported line and correct the parser error."
-            solution = f"Fix the syntax problem reported here: {cause_from_detector}. Scan the file again to check for any remaining syntax errors."
+            solution = f"Fix the parser problem reported here: {cause_from_detector}. Re-run the file after editing to confirm that the syntax error is gone."
 
     elif rule == "unclosed_bracket":
         solution_type = "replace"
@@ -787,11 +853,6 @@ def _validate_llm_result(result: dict, finding: dict) -> dict | None:
 
 
 def analyze_finding(finding: dict, retrieved: list) -> dict:
-    # Syntax-error fixes are based on parser-driven, re-validated repairs.
-    # Do not let the LLM replace these exact corrections with speculative code.
-    if finding.get("rule") == "syntax_error":
-        return _fallback_report(finding)
-
     api_keys = []
 
     # Read multiple Gemini API keys from environment variables.
