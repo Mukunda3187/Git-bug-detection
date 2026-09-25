@@ -19,6 +19,7 @@ every finding is equally certain:
                                calls it) - reported with lower confidence
 """
 import ast
+import re
 
 TERMINATING_STATEMENTS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
 
@@ -91,45 +92,145 @@ def _find_unreachable_code(body, file_path, source_lines, findings):
             _find_unreachable_code(handler.body, file_path, source_lines, findings)
 
 
+def _syntax_repair_candidate(lines, error):
+    """Return (line_index, updated_line, explanation) for safe common repairs."""
+    message = str(error.msg or "")
+    error_index = max(0, min((error.lineno or 1) - 1, max(0, len(lines) - 1)))
+    current = lines[error_index] if lines else ""
+
+    # Repair malformed function signatures even when CPython points at a later
+    # line because the open parenthesis makes the parser treat later lines as
+    # part of the signature.
+    for idx, candidate_line in enumerate(lines[:error_index + 1]):
+        candidate = candidate_line.rstrip()
+        if re.match(r"^\s*(?:async\s+)?def\s+\w+\s*\(.*:$", candidate):
+            before_colon = candidate[:-1]
+            if before_colon.count("(") > before_colon.count(")"):
+                return idx, before_colon + "):", "Add the missing ')' before the colon in this function definition."
+
+    # A compound statement header missing its trailing colon. CPython uses
+    # both "expected ':'" and the broader "invalid syntax" for these cases.
+    header_pattern = r"^\s*(?:async\s+def\s+\w+|def\s+\w+|for\b|async\s+for\b|if\b|elif\b|else\b|while\b|class\s+\w+|except\b|try\b|finally\b|with\b|async\s+with\b).*"
+    if current.strip() and re.match(header_pattern, current):
+        stripped = current.rstrip()
+        # `def greet(name:` has a colon but is missing the closing `)`.
+        if re.match(r"^\s*(?:async\s+)?def\s+\w+\s*\(.*:$", stripped):
+            before_colon = stripped[:-1]
+            if before_colon.count("(") > before_colon.count(")"):
+                return error_index, before_colon + "):", "Add the missing ')' before the colon in this function definition."
+        if not stripped.endswith(":"):
+            return error_index, stripped + ":", "Add the missing ':' at the end of this Python statement header."
+
+    # For an unclosed delimiter, Python points to the opener's line.
+    unclosed = re.search(r"'([([{])' was never closed", message)
+    if unclosed:
+        opener = unclosed.group(1)
+        close_for = {"(": ")", "[": "]", "{": "}"}
+        opener_index = error_index
+        if "line " in message:
+            # SyntaxError's line is usually already the opener line.
+            opener_index = error_index
+        return opener_index, lines[opener_index].rstrip() + close_for[opener], f"Add the missing '{close_for[opener]}' to close the '{opener}' opened on this line."
+
+    # Repair a mismatched closer by closing the older opener at its own line.
+    mismatch = re.search(r"closing parenthesis '([)\]}])' does not match opening parenthesis '([([{])' on line (\d+)", message)
+    if mismatch:
+        opener = mismatch.group(2)
+        opener_index = int(mismatch.group(3)) - 1
+        if 0 <= opener_index < len(lines):
+            close_for = {"(": ")", "[": "]", "{": "}"}
+            return opener_index, lines[opener_index].rstrip() + close_for[opener], f"Close the unclosed '{opener}' from line {opener_index + 1} before the later mismatched closer."
+
+    # An unmatched extra closing delimiter can be safely removed when it is trailing.
+    unmatched = re.search(r"unmatched '([)\]}])'", message)
+    if unmatched and current.rstrip().endswith(unmatched.group(1)):
+        closer = unmatched.group(1)
+        opener_for = {")": "(", "]": "[", "}": "{"}
+        opener = opener_for[closer]
+        # Remove the number of trailing closers that cannot be paired with an
+        # opener on this line. This treats `return x * y))` as one malformed
+        # line and produces the actually valid correction `return x * y`.
+        excess = max(1, current.count(closer) - current.count(opener))
+        updated = current.rstrip()
+        removed = 0
+        while removed < excess and updated.endswith(closer):
+            updated = updated[:-1]
+            removed += 1
+        return error_index, updated, f"Remove the {removed} unmatched extra '{closer}' character(s) at the end of this line."
+
+    # Common malformed function header: `def greet(name:` -> `def greet(name):`.
+    stripped = current.rstrip()
+    if re.match(r"^\s*(async\s+)?def\s+\w+\s*\(.*:$", stripped):
+        before_colon = stripped[:-1]
+        if before_colon.count("(") > before_colon.count(")"):
+            return error_index, before_colon + "):", "Add the missing ')' before the colon in this function definition."
+
+    # Sometimes the parser points at the first statement after the malformed header.
+    if "invalid syntax" in message or "expected ':'" in message:
+        for idx in range(error_index, max(-1, error_index - 3), -1):
+            candidate = lines[idx].rstrip()
+            if re.match(r"^\s*(async\s+)?def\s+\w+\s*\(.*:$", candidate):
+                before_colon = candidate[:-1]
+                if before_colon.count("(") > before_colon.count(")"):
+                    return idx, before_colon + "):", "Add the missing ')' before the colon in this function definition."
+
+    return None
+
+
+def _detect_syntax_errors(file_path: str, source: str):
+    """Recover from common independent syntax errors and report each repair."""
+    lines = source.splitlines()
+    if not lines:
+        lines = [""]
+    findings = []
+    seen = set()
+
+    for _ in range(30):
+        candidate_source = "\n".join(lines)
+        try:
+            ast.parse(candidate_source, filename=file_path)
+            return sorted(findings, key=lambda item: (item["line_start"], item["line_end"]))
+        except SyntaxError as error:
+            repair = _syntax_repair_candidate(lines, error)
+            if repair is None:
+                # Preserve a useful finding when automatic recovery is uncertain.
+                idx = max(0, min((error.lineno or 1) - 1, len(lines) - 1))
+                original = lines[idx]
+                key = (idx, original, str(error.msg))
+                if key not in seen:
+                    findings.append({
+                        "file": file_path, "function": None,
+                        "line_start": idx + 1, "line_end": idx + 1,
+                        "rule": "syntax_error", "error": "Syntax Error",
+                        "bug_type": "Syntax Error", "current_code": original,
+                        "replacement_code": None, "cause": str(error.msg),
+                    })
+                return findings
+
+            idx, updated_line, explanation = repair
+            if not (0 <= idx < len(lines)) or updated_line == lines[idx]:
+                return findings
+            original_line = lines[idx]
+            key = (idx, original_line, updated_line)
+            if key not in seen:
+                seen.add(key)
+                findings.append({
+                    "file": file_path, "function": None,
+                    "line_start": idx + 1, "line_end": idx + 1,
+                    "rule": "syntax_error", "error": "Syntax Error",
+                    "bug_type": "Syntax Error", "current_code": original_line,
+                    "replacement_code": updated_line, "cause": explanation,
+                })
+            lines[idx] = updated_line
+
+    return findings
+
+
 def detect(file_path: str, source: str):
     try:
         tree = ast.parse(source, filename=file_path)
-    except SyntaxError as e:
-        lines = source.splitlines()
-        error_line = max(0, min((e.lineno or 1) - 1, max(0, len(lines) - 1)))
-
-        # Include the surrounding indented block instead of only the error line.
-        # This gives the LLM enough context to repair missing brackets/colons
-        # without inventing the rest of the function.
-        start = error_line
-        while start > 0:
-            previous = lines[start - 1]
-            current = lines[start] if start < len(lines) else ""
-            if previous.strip() and (len(previous) - len(previous.lstrip()) <=
-                                     len(current) - len(current.lstrip())):
-                break
-            start -= 1
-
-        end = error_line
-        base_indent = len(lines[error_line]) - len(lines[error_line].lstrip()) if lines else 0
-        while end + 1 < len(lines):
-            nxt = lines[end + 1]
-            if nxt.strip() and len(nxt) - len(nxt.lstrip()) < base_indent:
-                break
-            end += 1
-
-        context = "\n".join(lines[start:end + 1]).strip()
-        return [{
-            "file": file_path,
-            "function": None,
-            "line_start": start + 1,
-            "line_end": end + 1,
-            "rule": "syntax_error",
-            "error": "Syntax Error",
-            "bug_type": "Syntax Error",
-            "current_code": context or (lines[error_line].strip() if lines else ""),
-            "cause": str(e.msg),
-        }]
+    except SyntaxError:
+        return _detect_syntax_errors(file_path, source)
 
     source_lines = source.splitlines()
     findings = []
