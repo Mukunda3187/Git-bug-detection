@@ -93,44 +93,111 @@ def _find_unreachable_code(body, file_path, source_lines, findings):
 
 
 def _syntax_repair_candidate(lines, error):
-    """Return (line_index, updated_line, explanation) for safe common repairs."""
+    """Return (line_index, scratch_line, explanation, display_replacement).
+
+    `scratch_line` is used only to let the parser continue and discover later
+    errors. `display_replacement` is the suggested edit shown to the user; it
+    may be None when the correct behavior cannot be inferred safely.
+    """
     message = str(error.msg or "")
-    error_index = max(0, min((error.lineno or 1) - 1, max(0, len(lines) - 1)))
-    current = lines[error_index] if lines else ""
+    idx = max(0, min((error.lineno or 1) - 1, max(0, len(lines) - 1)))
+    current = lines[idx] if lines else ""
+    stripped = current.rstrip()
 
-    # Repair malformed function signatures even when CPython points at a later
-    # line because the open parenthesis makes the parser treat later lines as
-    # part of the signature.
-    for idx, candidate_line in enumerate(lines[:error_index + 1]):
-        candidate = candidate_line.rstrip()
-        if re.match(r"^\s*(?:async\s+)?def\s+\w+\s*\(.*:$", candidate):
-            before_colon = candidate[:-1]
-            if before_colon.count("(") > before_colon.count(")"):
-                return idx, before_colon + "):", "Add the missing ')' before the colon in this function definition."
+    # Common missing comma in a simple function parameter list: def f(a b):
+    m = re.match(r"^(\s*(?:async\s+)?def\s+\w+\s*\()([^()]*)(\)\s*:\s*)$", current)
+    if m:
+        params = m.group(2)
+        fixed = re.sub(r"(?<=[A-Za-z0-9_])\s+(?=[A-Za-z_]\w*(?:\s*=|\s*,|\s*$))", ", ", params, count=1)
+        if fixed != params:
+            replacement = m.group(1) + fixed + m.group(3)
+            return idx, replacement, "A comma is missing between function parameters.", replacement
 
-    # A compound statement header missing its trailing colon. CPython uses
-    # both "expected ':'" and the broader "invalid syntax" for these cases.
-    header_pattern = r"^\s*(?:async\s+def\s+\w+|def\s+\w+|for\b|async\s+for\b|if\b|elif\b|else\b|while\b|class\s+\w+|except\b|try\b|finally\b|with\b|async\s+with\b).*"
-    if current.strip() and re.match(header_pattern, current):
-        stripped = current.rstrip()
-        # `def greet(name:` has a colon but is missing the closing `)`.
-        if re.match(r"^\s*(?:async\s+)?def\s+\w+\s*\(.*:$", stripped):
-            before_colon = stripped[:-1]
-            if before_colon.count("(") > before_colon.count(")"):
-                return error_index, before_colon + "):", "Add the missing ')' before the colon in this function definition."
-        if not stripped.endswith(":"):
-            return error_index, stripped + ":", "Add the missing ':' at the end of this Python statement header."
+        # Duplicate parameter names are rejected by Python's compiler.
+        names = re.findall(r"(?<!\*)\b([A-Za-z_]\w*)\b(?=\s*(?:=|,|$))", params)
+        seen = set()
+        parameter_parts = params.split(",")
+        seen = set()
+        for part_index, part in enumerate(parameter_parts):
+            name_match = re.search(r"^\s*(?:\*{0,2})\s*([A-Za-z_]\w*)", part)
+            if not name_match:
+                continue
+            name = name_match.group(1)
+            if name in seen:
+                renamed = name + "_2"
+                parameter_parts[part_index] = part[:name_match.start(1)] + renamed + part[name_match.end(1):]
+                fixed_params = ",".join(parameter_parts)
+                replacement = m.group(1) + fixed_params + m.group(3)
+                return idx, replacement, f"The parameter name '{name}' is repeated; rename one parameter.", replacement
+            seen.add(name)
 
-    # For an unclosed delimiter, Python points to the opener's line.
+    # Unterminated ordinary string literals (e.g. name = "Munna).
+    if "unterminated string literal" in message.lower():
+        quote = '"' if current.count('"') % 2 else "'"
+        replacement = current.rstrip() + quote
+        return idx, replacement, f"The string is missing its closing {quote} quote.", replacement
+
+    # Unclosed delimiter. Close it on its opening line so later errors can be found.
     unclosed = re.search(r"'([([{])' was never closed", message)
     if unclosed:
         opener = unclosed.group(1)
         close_for = {"(": ")", "[": "]", "{": "}"}
-        opener_index = error_index
-        if "line " in message:
-            # SyntaxError's line is usually already the opener line.
-            opener_index = error_index
-        return opener_index, lines[opener_index].rstrip() + close_for[opener], f"Add the missing '{close_for[opener]}' to close the '{opener}' opened on this line."
+        replacement = current.rstrip() + close_for[opener]
+        return idx, replacement, f"Add the missing '{close_for[opener]}' to close the '{opener}'.", replacement
+
+    # Missing comma between arguments in a simple call such as f(a=1, 2).
+    if "positional argument follows keyword argument" in message.lower():
+        call = re.match(r"^(\s*[\w.]+\s*\()(.*)(\)\s*)$", current)
+        if call:
+            args = call.group(2)
+            parts = [part.strip() for part in args.split(",")]
+            keyword_parts = [part for part in parts if "=" in part]
+            positional_parts = [part for part in parts if "=" not in part]
+            if keyword_parts and positional_parts:
+                replacement = call.group(1) + ", ".join(positional_parts + keyword_parts) + call.group(3)
+                return idx, replacement, "A positional argument appears after a keyword argument; move positional arguments first.", replacement
+
+    # Incomplete `from module import` statement. The intended symbol is unknown;
+    # use a module import as a syntactically valid suggestion, clearly labeled.
+    if re.match(r"^\s*from\s+[\w.]+\s+import\s*$", current):
+        module = re.search(r"from\s+([\w.]+)\s+import", current).group(1)
+        replacement = re.match(r"^\s*", current).group(0) + f"import {module}"
+        return idx, replacement, "The import statement has no imported name. Import the module itself or specify the required name.", replacement
+
+    # Illegal control-flow statements outside their required context. A comment
+    # lets analysis continue; no behavior-preserving edit can be inferred.
+    lowered = message.lower()
+    if "'break' outside loop" in lowered:
+        return idx, "# " + current.lstrip(), "'break' must be inside a loop. Move it into the intended loop.", None
+    if "'continue' not properly in loop" in lowered or "'continue' not supported" in lowered or "'continue' outside loop" in lowered:
+        return idx, "# " + current.lstrip(), "'continue' must be inside a loop. Move it into the intended loop.", None
+    if "'return' outside function" in lowered:
+        return idx, "# " + current.lstrip(), "'return' must be inside a function. Move it into the intended function.", None
+
+    # A malformed function header such as `def greet(name:` can make the
+    # parser point at the following line. Repair the nearest preceding header.
+    for prior_idx in range(idx, max(-1, idx - 4), -1):
+        prior = lines[prior_idx].rstrip()
+        if re.match(r"^\s*(?:async\s+)?def\s+\w+\s*\(.*:$", prior):
+            before_colon = prior[:-1]
+            if before_colon.count("(") > before_colon.count(")"):
+                replacement = before_colon + "):"
+                return prior_idx, replacement, "Add the missing ')' before the colon in the function definition.", replacement
+
+    # Missing colon after a compound statement, including an inline suite such
+    # as `if True print('Hello')`.
+    header = re.match(r"^(\s*(?:if|elif|for|while|def|class|with|except|finally|try|else|async\s+for|async\s+def|async\s+with)\b)(.*)$", current)
+    if header and not stripped.endswith(":"):
+        tail = header.group(2).strip()
+        if header.group(1).lstrip().startswith(("if", "elif", "for", "while")):
+            # A simple inline body after a condition: split at the first statement-like token.
+            inline = re.match(r"^(.+?)\s+(print\s*\(|return\b|pass\b|raise\b|break\b|continue\b|[A-Za-z_]\w*\s*=)", tail)
+            if inline:
+                condition, body = inline.group(1).rstrip(), tail[inline.end(1):].strip()
+                replacement = header.group(1) + " " + condition + ": " + body
+                return idx, replacement, "Add a colon before the inline statement in the compound header.", replacement
+        replacement = stripped + ":"
+        return idx, replacement, "Add the missing ':' at the end of the compound statement header.", replacement
 
     # Repair a mismatched closer by closing the older opener at its own line.
     mismatch = re.search(r"closing parenthesis '([)\]}])' does not match opening parenthesis '([([{])' on line (\d+)", message)
@@ -139,92 +206,71 @@ def _syntax_repair_candidate(lines, error):
         opener_index = int(mismatch.group(3)) - 1
         if 0 <= opener_index < len(lines):
             close_for = {"(": ")", "[": "]", "{": "}"}
-            return opener_index, lines[opener_index].rstrip() + close_for[opener], f"Close the unclosed '{opener}' from line {opener_index + 1} before the later mismatched closer."
+            replacement = lines[opener_index].rstrip() + close_for[opener]
+            return opener_index, replacement, f"Close the unclosed '{opener}' on line {opener_index + 1}.", replacement
 
-    # An unmatched extra closing delimiter can be safely removed when it is trailing.
+    # Unmatched extra closing delimiter at the end of a line.
     unmatched = re.search(r"unmatched '([)\]}])'", message)
-    if unmatched and current.rstrip().endswith(unmatched.group(1)):
+    if unmatched and stripped.endswith(unmatched.group(1)):
         closer = unmatched.group(1)
-        opener_for = {")": "(", "]": "[", "}": "{"}
-        opener = opener_for[closer]
-        # Remove the number of trailing closers that cannot be paired with an
-        # opener on this line. This treats `return x * y))` as one malformed
-        # line and produces the actually valid correction `return x * y`.
-        excess = max(1, current.count(closer) - current.count(opener))
-        updated = current.rstrip()
-        removed = 0
-        while removed < excess and updated.endswith(closer):
-            updated = updated[:-1]
-            removed += 1
-        return error_index, updated, f"Remove the {removed} unmatched extra '{closer}' character(s) at the end of this line."
-
-    # Common malformed function header: `def greet(name:` -> `def greet(name):`.
-    stripped = current.rstrip()
-    if re.match(r"^\s*(async\s+)?def\s+\w+\s*\(.*:$", stripped):
-        before_colon = stripped[:-1]
-        if before_colon.count("(") > before_colon.count(")"):
-            return error_index, before_colon + "):", "Add the missing ')' before the colon in this function definition."
-
-    # Sometimes the parser points at the first statement after the malformed header.
-    if "invalid syntax" in message or "expected ':'" in message:
-        for idx in range(error_index, max(-1, error_index - 3), -1):
-            candidate = lines[idx].rstrip()
-            if re.match(r"^\s*(async\s+)?def\s+\w+\s*\(.*:$", candidate):
-                before_colon = candidate[:-1]
-                if before_colon.count("(") > before_colon.count(")"):
-                    return idx, before_colon + "):", "Add the missing ')' before the colon in this function definition."
+        opener = {')': '(', ']': '[', '}': '{'}[closer]
+        excess = max(1, stripped.count(closer) - stripped.count(opener))
+        replacement = stripped[:-excess] if excess <= len(stripped) else stripped
+        return idx, replacement, f"Remove {excess} unmatched extra '{closer}' character(s).", replacement
 
     return None
 
 
 def _detect_syntax_errors(file_path: str, source: str):
-    """Recover from common independent syntax errors and report each repair."""
-    lines = source.splitlines()
-    if not lines:
-        lines = [""]
+    """Find multiple syntax/compile errors by repairing a scratch copy iteratively."""
+    lines = source.splitlines() or [""]
     findings = []
     seen = set()
 
-    for _ in range(30):
+    for _ in range(40):
         candidate_source = "\n".join(lines)
         try:
-            ast.parse(candidate_source, filename=file_path)
+            compile(candidate_source, file_path, "exec")
             return sorted(findings, key=lambda item: (item["line_start"], item["line_end"]))
         except SyntaxError as error:
             repair = _syntax_repair_candidate(lines, error)
             if repair is None:
-                # Preserve a useful finding when automatic recovery is uncertain.
                 idx = max(0, min((error.lineno or 1) - 1, len(lines) - 1))
                 original = lines[idx]
                 key = (idx, original, str(error.msg))
-                if key not in seen:
-                    findings.append({
-                        "file": file_path, "function": None,
-                        "line_start": idx + 1, "line_end": idx + 1,
-                        "rule": "syntax_error", "error": "Syntax Error",
-                        "bug_type": "Syntax Error", "current_code": original,
-                        "replacement_code": None, "cause": str(error.msg),
-                    })
-                return findings
-
-            idx, updated_line, explanation = repair
-            if not (0 <= idx < len(lines)) or updated_line == lines[idx]:
-                return findings
-            original_line = lines[idx]
-            key = (idx, original_line, updated_line)
-            if key not in seen:
+                if key in seen:
+                    return findings
                 seen.add(key)
                 findings.append({
                     "file": file_path, "function": None,
                     "line_start": idx + 1, "line_end": idx + 1,
                     "rule": "syntax_error", "error": "Syntax Error",
-                    "bug_type": "Syntax Error", "current_code": original_line,
-                    "replacement_code": updated_line, "cause": explanation,
+                    "bug_type": "Syntax Error", "current_code": original,
+                    "replacement_code": None, "cause": str(error.msg),
                 })
-            lines[idx] = updated_line
+                # Neutralize only the scratch copy so compilation can expose the next issue.
+                lines[idx] = "# " + original.lstrip()
+                continue
+
+            idx, scratch_line, explanation, display_replacement = repair
+            if not (0 <= idx < len(lines)) or scratch_line == lines[idx]:
+                return findings
+            original_line = lines[idx]
+            key = (idx, original_line, explanation)
+            if key in seen:
+                return findings
+            seen.add(key)
+            findings.append({
+                "file": file_path, "function": None,
+                "line_start": idx + 1, "line_end": idx + 1,
+                "rule": "syntax_error", "error": "Syntax Error",
+                "bug_type": "Syntax Error", "current_code": original_line,
+                "replacement_code": display_replacement,
+                "cause": explanation,
+            })
+            lines[idx] = scratch_line
 
     return findings
-
 
 def detect(file_path: str, source: str):
     try:
