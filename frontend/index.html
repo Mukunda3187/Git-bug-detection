@@ -479,6 +479,12 @@
     }
     pre.code-block.removed { background: var(--removed-bg); border: 1px solid var(--removed-border); color: #ffe4e6; }
     pre.code-block.added { background: var(--added-bg); border: 1px solid var(--added-border); color: #d1fae5; }
+    .code-toolbar { display: flex; justify-content: flex-end; margin-bottom: 6px; }
+    .code-copy-btn { border: 1px solid var(--border); background: var(--panel-raised); color: var(--text); border-radius: 7px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
+    .code-copy-btn:hover { border-color: var(--border-focus); color: var(--accent-light); }
+    .code-wrap { min-width: 0; }
+    pre.code-block.collapsed { max-height: 8.5em; overflow: hidden; }
+    .code-toggle { margin-top: 7px; border: 0; background: transparent; color: var(--accent-light); cursor: pointer; font-size: 13px; }
 
     .simple-note {
       padding: 12px 14px;
@@ -659,11 +665,50 @@ function escapeHtml(str) {
     .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
-function renderCodeBlock(code, cssClass) {
+function renderCodeBlock(code, cssClass, options = {}) {
   if (!code) return "";
   const lines = code.split("\n");
   const body = lines.map(l => escapeHtml(l) || " ").join("\n");
-  return `<pre class="code-block ${cssClass}">${body}</pre>`;
+  const collapsible = lines.length > 5;
+  const copyButton = options.copy
+    ? `<div class="code-toolbar"><button type="button" class="code-copy-btn" onclick="copyCodeFromBlock(this)">Copy</button></div>`
+    : "";
+  const preClass = `code-block ${cssClass}${collapsible ? " collapsed" : ""}`;
+  const toggle = collapsible
+    ? `<button type="button" class="code-toggle" onclick="toggleCodeBlock(this)">See more</button>`
+    : "";
+  return `<div class="code-wrap">${copyButton}<pre class="${preClass}">${body}</pre>${toggle}</div>`;
+}
+
+function toggleCodeBlock(button) {
+  const pre = button.previousElementSibling;
+  if (!pre) return;
+  const collapsed = pre.classList.toggle("collapsed");
+  button.textContent = collapsed ? "See more" : "See less";
+}
+
+async function copyCodeFromBlock(button) {
+  const wrapper = button.closest(".code-wrap");
+  const pre = wrapper ? wrapper.querySelector("pre.code-block") : null;
+  if (!pre) return;
+  const originalText = button.textContent;
+  try {
+    await navigator.clipboard.writeText(pre.textContent);
+    button.textContent = "Copied!";
+  } catch (error) {
+    const textarea = document.createElement("textarea");
+    textarea.value = pre.textContent;
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand("copy");
+      button.textContent = "Copied!";
+    } catch (copyError) {
+      button.textContent = "Copy failed";
+    }
+    textarea.remove();
+  }
+  setTimeout(() => { button.textContent = originalText; }, 1500);
 }
 
 function renderSolutionBlock(bug) {
@@ -672,7 +717,7 @@ function renderSolutionBlock(bug) {
     : "";
 
   const code = bug.replacement_code
-    ? renderCodeBlock(bug.replacement_code, "added")
+    ? renderCodeBlock(bug.replacement_code, "added", { copy: true })
     : "";
 
   if (bug.solution_type === "add") {
