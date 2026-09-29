@@ -4,7 +4,7 @@ Entry point for the Git Bug Detection backend.
 
 Flow:
 GitHub URL -> validate -> download selected source files -> detect bugs
--> RAG retrieval -> bounded Gemini analysis -> build report.
+-> RAG retrieval -> Gemini analysis -> build report.
 """
 
 import os
@@ -63,8 +63,6 @@ DETECTORS_BY_EXTENSION = {
     ".php": detect_cfamily,
 }
 
-# Resource limits for a single scan.
-MAX_FINDINGS_TO_ANALYZE = 15
 MAX_PARALLEL_WORKERS = 2
 
 
@@ -173,13 +171,8 @@ def scan_repo(req: ScanRequest):
         print(f"[scan] Files discovered: {len(files)}")
         print(f"[scan] Findings detected: {len(pending)}")
 
-        if len(pending) > MAX_FINDINGS_TO_ANALYZE:
-            print(
-                f"[scan] Limiting AI analysis to "
-                f"{MAX_FINDINGS_TO_ANALYZE} findings."
-            )
-
-        selected_findings = pending[:MAX_FINDINGS_TO_ANALYZE]
+        # Analyze every detected finding without a fixed count limit.
+        selected_findings = pending
 
         def _analyze_one(finding, relative_path):
             query_text = (
@@ -314,13 +307,6 @@ def scan_repo(req: ScanRequest):
 
         overall_confidence = _compute_confidence(bug_reports)
 
-        status_message = "Completed"
-        if len(pending) > len(selected_findings):
-            status_message = (
-                f"Completed with a limit of {MAX_FINDINGS_TO_ANALYZE} "
-                f"findings analyzed out of {len(pending)} detected."
-            )
-
         return ScanResult(
             summary=ScanSummary(
                 repo=f"{status.owner}/{status.name}",
@@ -333,7 +319,7 @@ def scan_repo(req: ScanRequest):
                     else "Low Confidence"
                 ),
                 error_level=_compute_error_level(bug_reports),
-                scan_status=status_message,
+                scan_status="Completed",
                 ai_notice=ai_notice,
             ),
             bugs=bug_reports,
