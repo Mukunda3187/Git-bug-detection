@@ -1,15 +1,11 @@
 
 """
 Source file scanner for the Git Bug Detection project.
-
-Finds supported source files, skips unnecessary directories and binary
-files, and avoids reading oversized files into memory.
 """
 
 import os
 
 
-# Supported programming-language extensions.
 SOURCE_EXTENSIONS = {
     ".py", ".pyi",
     ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
@@ -19,7 +15,6 @@ SOURCE_EXTENSIONS = {
     ".kt", ".kts", ".swift", ".scala", ".sql",
 }
 
-# Directories that should not be scanned.
 SKIP_DIRS = {
     ".git",
     ".github",
@@ -44,7 +39,6 @@ SKIP_DIRS = {
     ".ruff_cache",
 }
 
-# Files that are usually generated or not useful for source analysis.
 SKIP_SUFFIXES = (
     ".min.js",
     ".min.css",
@@ -66,11 +60,8 @@ SKIP_SUFFIXES = (
     ".eot",
 )
 
-MAX_FILE_SIZE = 300_000  # 300 KB
-
 
 def _is_skipped_directory(path_parts):
-    """Return True if any directory component should be skipped."""
     return any(
         part.lower() in SKIP_DIRS
         for part in path_parts
@@ -78,7 +69,6 @@ def _is_skipped_directory(path_parts):
 
 
 def _is_supported_source_file(filename):
-    """Check whether a filename has a supported source extension."""
     lower_name = filename.lower()
 
     if lower_name.endswith(SKIP_SUFFIXES):
@@ -90,11 +80,8 @@ def _is_supported_source_file(filename):
 
 
 def find_source_files(root_path: str):
-    """
-    Return source file paths under root_path.
+    """Return supported source files without a file-size limit."""
 
-    Skips generated directories, unsupported file types, and oversized files.
-    """
     found = []
 
     if not root_path or not os.path.isdir(root_path):
@@ -102,7 +89,6 @@ def find_source_files(root_path: str):
 
     for dirpath, dirnames, filenames in os.walk(root_path):
 
-        # Prune excluded directories before os.walk enters them.
         dirnames[:] = sorted(
             directory
             for directory in dirnames
@@ -120,7 +106,7 @@ def find_source_files(root_path: str):
             except OSError:
                 continue
 
-            if file_size <= 0 or file_size > MAX_FILE_SIZE:
+            if file_size <= 0:
                 continue
 
             found.append(full_path)
@@ -132,6 +118,7 @@ def find_source_files(root_path: str):
 
 def is_binary_file(path: str) -> bool:
     """Return True if a file appears to contain binary data."""
+
     try:
         with open(path, "rb") as handle:
             chunk = handle.read(8192)
@@ -139,7 +126,6 @@ def is_binary_file(path: str) -> bool:
         if not chunk:
             return False
 
-        # Null bytes usually indicate binary content.
         if b"\x00" in chunk:
             return True
 
@@ -156,18 +142,9 @@ def is_binary_file(path: str) -> bool:
 
 
 def read_file_safely(path: str) -> str:
-    """
-    Read a source file as UTF-8.
+    """Read a source file without a file-size limit."""
 
-    Returns an empty string for binary, oversized, or unreadable files.
-    """
     if not path:
-        return ""
-
-    try:
-        if os.path.getsize(path) > MAX_FILE_SIZE:
-            return ""
-    except OSError:
         return ""
 
     if is_binary_file(path):
