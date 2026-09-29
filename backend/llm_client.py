@@ -221,9 +221,13 @@ CATCH_LOG_STATEMENT_BY_EXTENSION = {
 # optionally followed by attribute access (.name) or indexing ([key]).
 # Deliberately does NOT match a parenthesized expression, a function call,
 # or an arithmetic expression on the right of the '/' - for "x / (a + b)" or
-# "x / get_count()" there's no single safe variable name to point at, so
+# "x / (a + b)" there's no single safe variable name to point at, so
 # _extract_division_denominator returns None for those rather than guessing.
-DIVISION_DENOMINATOR_RE = re.compile(r"/\s*([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*|\[[^\]\[]+\])*)")
+# The third alternative, \([^()]*\), handles a function-call denominator like
+# "total / len(values)" - capturing just "len" and suggesting "if len != 0:"
+# would be actively wrong (checking whether a function itself is non-zero
+# means nothing), so the call's parens have to be captured too.
+DIVISION_DENOMINATOR_RE = re.compile(r"/\s*([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*|\[[^\]\[]+\]|\([^()]*\))*)")
 
 PYTHON_MISSING_COLON_RE = re.compile(r"expected ':'")
 PYTHON_UNCLOSED_BRACKET_RE = re.compile(r"'(.)' was never closed")
@@ -231,13 +235,31 @@ PYTHON_UNCLOSED_BRACKET_RE = re.compile(r"'(.)' was never closed")
 
 def _extract_division_denominator(current_code: str):
     """Pulls the real denominator out of a simple division expression
-    (e.g. "total / count" -> "count", "x / self.n" -> "self.n"), so the
-    suggested zero-check names the actual variable instead of a generic
-    placeholder every division-by-zero finding used to show identically."""
+    (e.g. "total / count" -> "count", "x / self.n" -> "self.n",
+    "total / len(values)" -> "len(values)"), so the suggested zero-check
+    names the actual expression instead of a generic placeholder every
+    division-by-zero finding used to show identically. Verifies the
+    captured text has balanced parens before using it - the regex's
+    \\([^()]*\\) only handles one level of nesting, so a denominator with a
+    nested call (e.g. "helper(a, (b+c))") would otherwise capture a
+    truncated, syntactically broken fragment. Better to say nothing specific
+    for that rare case than to hand back code that doesn't even parse."""
     if not current_code:
         return None
     m = DIVISION_DENOMINATOR_RE.search(current_code)
-    return m.group(1) if m else None
+    if not m:
+        return None
+    candidate = m.group(1)
+    if candidate.count("(") != candidate.count(")"):
+        return None
+    # The regex above can only consume one level of call parens, so for
+    # "helper(a, (b+c))" it stops at just "helper" - a balanced, plausible-
+    # looking capture that's actually a truncated function name. The tell is
+    # that the very next character in the source is an unconsumed '(' -
+    # a real bare-variable denominator never has one directly after it.
+    if current_code[m.end(1):m.end(1) + 1] == "(":
+        return None
+    return candidate
 
 
 def _fix_unterminated_string_line(current_code: str):
@@ -584,12 +606,25 @@ def _fallback_report(finding: dict) -> dict:
         m = UNCLOSED_CHAR_RE.search(error_text)
         opener = m.group(1) if m else "{"
         closer = BRACKET_CLOSER.get(opener, "}")
-        if current_code.strip():
+        # Only '(' and '[' get a same-line mechanical fix. A '{' almost
+        # always opens a multi-line block (a class, function, if/for/while
+        # body) that extends across lines this detector hasn't shown us -
+        # appending '}' right after the opening line would "fix" e.g.
+        # "public class Foo {" into "public class Foo {}", which silently
+        # deletes every real method that was supposed to follow. '(' and '['
+        # are much more often a single call/array-literal that got cut off
+        # mid-line (e.g. "print(message" -> "print(message)"), where the
+        # rest of the expression really is already on that same line.
+        if opener in "([" and current_code.strip() and not current_code.rstrip().endswith(","):
             replacement_code = current_code.rstrip() + closer
-        solution = (
-            f"Add the missing '{closer}' to close the '{opener}' opened by this code. "
-            f"Place it where the block or expression ends so the brackets are balanced."
-        )
+            solution = f"Add the missing '{closer}' to close the '{opener}' opened by this code, using the line below."
+        else:
+            solution = (
+                f"Add the missing '{closer}' to close the '{opener}' opened by this code. "
+                f"This opens a block that spans multiple lines, so the fix isn't a same-line edit - "
+                f"find where that block is actually meant to end (the end of this class/function/if/loop body) "
+                f"and add '{closer}' there."
+            )
 
     elif rule == "mismatched_bracket":
         solution_type = "replace"
