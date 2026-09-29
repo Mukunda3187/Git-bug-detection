@@ -27,10 +27,7 @@ RAW_TIMEOUT = 25
 MAX_ISSUES = 30
 MAX_PULL_REQUESTS = 30
 
-# Resource limits for repository scanning.
-MAX_SOURCE_FILES = 250
-MAX_FILE_BYTES = 300_000
-MAX_TOTAL_BYTES = 12_000_000
+# Download concurrency setting.
 DOWNLOAD_WORKERS = 8
 
 SOURCE_EXTENSIONS = {
@@ -184,38 +181,14 @@ def _candidate_files(tree):
         if not isinstance(size, int) or size <= 0:
             continue
 
-        if size > MAX_FILE_BYTES:
-            continue
-
         candidates.append({
             "path": path,
             "size": size,
         })
 
-    # Prefer normal application source over test files when the limit is hit.
-    def sort_key(item):
-        path = item["path"].lower()
-        is_test = (
-            "/test/" in f"/{path}/"
-            or "/tests/" in f"/{path}/"
-            or path.startswith(("test_", "tests/"))
-        )
-        return (is_test, path.count("/"), path)
-
-    candidates.sort(key=sort_key)
-
-    selected = []
-    total_bytes = 0
-
-    for item in candidates:
-        if len(selected) >= MAX_SOURCE_FILES:
-            break
-
-        if total_bytes + item["size"] > MAX_TOTAL_BYTES:
-            continue
-
-        selected.append(item)
-        total_bytes += item["size"]
+    # Include every supported source file found in the repository.
+    selected = candidates
+    total_bytes = sum(item["size"] for item in selected)
 
     print(
         f"[github] Selected {len(selected)} source files "
@@ -249,10 +222,6 @@ def _download_one_file(owner, repo, branch, item, root_path):
 
     content = response.content
 
-    if len(content) > MAX_FILE_BYTES:
-        print(f"[github] Skipping oversized file: {path}")
-        return False
-
     # Reject binary content.
     if b"\x00" in content:
         return False
@@ -273,7 +242,7 @@ def _download_one_file(owner, repo, branch, item, root_path):
 
 def download_repo(repo_url: str, default_branch=None):
     """
-    Download a bounded set of source files.
+    Download all supported source files.
 
     Returns:
         (repo_path, temp_root)
