@@ -1,5 +1,7 @@
 # RAG-Enhanced LLM for GitHub Bug Detection and Recovery
 
+link:- https://git-bug-detection.onrender.com/
+
 A mini project that scans a public GitHub repository, finds candidate bugs
 using real static analysis, retrieves similar historical bugs/fixes from a
 knowledge base (BugsInPy, Bugs2Fix, RunBugRun) using RAG, and asks an LLM
