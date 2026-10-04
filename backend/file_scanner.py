@@ -1,159 +1,453 @@
-
 """
-Source file scanner for the Git Bug Detection project.
+Source-file scanner for Git Bug Detection.
+
+This module discovers ALL supported source-code files inside a downloaded
+GitHub repository.
+
+There is intentionally NO fixed file-count limit.
+
+There is intentionally NO artificial source-file-size limit here.
+
+Large files are still handled safely:
+- binary files are skipped
+- unreadable files are skipped
+- generated/dependency directories are skipped
+- files are read only when the main scan actually needs their contents
 """
 
 import os
 
 
-SOURCE_EXTENSIONS = {
-    ".py", ".pyi",
-    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+# ============================================================
+# SUPPORTED SOURCE EXTENSIONS
+# ============================================================
+
+SUPPORTED_EXTENSIONS = {
+    # Python
+    ".py",
+    ".pyi",
+
+    # JavaScript / TypeScript
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+
+    # Java
     ".java",
-    ".c", ".h", ".cpp", ".hpp", ".cc", ".hh",
-    ".cs", ".go", ".php", ".rb", ".rs",
-    ".kt", ".kts", ".swift", ".scala", ".sql",
+
+    # C / C++
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".cc",
+    ".hh",
+    ".cxx",
+    ".hxx",
+
+    # C#
+    ".cs",
+
+    # Go
+    ".go",
+
+    # PHP
+    ".php",
+
+    # Ruby
+    ".rb",
+
+    # Rust
+    ".rs",
+
+    # Kotlin
+    ".kt",
+    ".kts",
+
+    # Swift
+    ".swift",
+
+    # Scala
+    ".scala",
+
+    # SQL
+    ".sql",
+
+    # Shell
+    ".sh",
+    ".bash",
+
+    # Dart
+    ".dart",
+
+    # R
+    ".r",
+
+    # Lua
+    ".lua",
+
+    # Perl
+    ".pl",
+    ".pm",
+
+    # Objective-C
+    ".m",
+    ".mm",
+
+    # Groovy
+    ".groovy",
+
+    # Elixir
+    ".ex",
+    ".exs",
+
+    # Haskell
+    ".hs",
+
+    # Julia
+    ".jl",
 }
 
-SKIP_DIRS = {
+
+# ============================================================
+# DIRECTORIES THAT SHOULD NOT BE SCANNED
+# ============================================================
+
+IGNORED_FOLDERS = {
     ".git",
     ".github",
     ".idea",
     ".vscode",
+
     "__pycache__",
-    ".venv",
-    "venv",
-    "env",
+
     "node_modules",
+
+    "venv",
+    ".venv",
+    "env",
+
     "dist",
     "build",
-    "coverage",
-    ".next",
-    ".nuxt",
-    "vendor",
+    "out",
+
     "target",
-    "site-packages",
-    "bower_components",
+
+    "vendor",
+
+    "coverage",
+
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".tox",
+
+    ".gradle",
+    ".terraform",
+
+    ".next",
+    ".nuxt",
+
+    ".angular",
+
+    "bower_components",
+
+    "site-packages",
+
+    "bin",
+    "obj",
 }
 
-SKIP_SUFFIXES = (
+
+# ============================================================
+# GENERATED / MINIFIED FILE NAMES
+# ============================================================
+
+IGNORED_FILE_SUFFIXES = (
     ".min.js",
-    ".min.css",
+    ".min.ts",
     ".map",
-    ".lock",
-    ".svg",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".ico",
-    ".pdf",
-    ".zip",
-    ".gz",
-    ".tar",
-    ".woff",
-    ".woff2",
-    ".ttf",
-    ".eot",
 )
 
 
-def _is_skipped_directory(path_parts):
-    return any(
-        part.lower() in SKIP_DIRS
-        for part in path_parts
-    )
+# ============================================================
+# PATH HELPERS
+# ============================================================
+
+def _is_ignored_directory(name: str) -> bool:
+    """
+    Check whether a directory should be excluded.
+    """
+
+    if not name:
+        return True
+
+    if name in IGNORED_FOLDERS:
+        return True
+
+    # Hidden build/cache directories that are not useful
+    # for repository source analysis.
+    if name.startswith(".") and name not in {
+        ".config",
+    }:
+        return True
+
+    return False
 
 
-def _is_supported_source_file(filename):
-    lower_name = filename.lower()
+def _is_supported_file(filename: str) -> bool:
+    """
+    Return True when the filename represents a supported source file.
+    """
 
-    if lower_name.endswith(SKIP_SUFFIXES):
+    if not filename:
         return False
 
-    _, extension = os.path.splitext(lower_name)
+    lower_name = filename.lower()
 
-    return extension in SOURCE_EXTENSIONS
+    for suffix in IGNORED_FILE_SUFFIXES:
 
+        if lower_name.endswith(suffix):
+            return False
+
+    _, extension = os.path.splitext(
+        lower_name
+    )
+
+    return extension in SUPPORTED_EXTENSIONS
+
+
+# ============================================================
+# BINARY FILE DETECTION
+# ============================================================
+
+def _is_binary_file(path: str) -> bool:
+    """
+    Check whether a file appears to be binary.
+
+    Only a small initial portion is read, so this does not load
+    the entire file into memory.
+    """
+
+    try:
+
+        with open(
+            path,
+            "rb",
+        ) as handle:
+
+            sample = handle.read(
+                8192
+            )
+
+    except OSError:
+
+        return True
+
+    if not sample:
+        return False
+
+    # A NULL byte is a strong indication of binary content.
+    if b"\x00" in sample:
+        return True
+
+    # UTF-8 validation.
+    try:
+
+        sample.decode(
+            "utf-8"
+        )
+
+    except UnicodeDecodeError:
+
+        return True
+
+    return False
+
+
+# ============================================================
+# FIND SOURCE FILES
+# ============================================================
 
 def find_source_files(root_path: str):
-    """Return supported source files without a file-size limit."""
+    """
+    Find ALL supported source files in the repository.
+
+    No fixed file-count limit is applied.
+
+    Returns:
+        List of absolute file paths.
+    """
 
     found = []
 
-    if not root_path or not os.path.isdir(root_path):
+    if not root_path:
         return found
 
-    for dirpath, dirnames, filenames in os.walk(root_path):
+    if not os.path.isdir(root_path):
+        return found
 
-        dirnames[:] = sorted(
-            directory
-            for directory in dirnames
-            if directory.lower() not in SKIP_DIRS
-        )
+    for dirpath, dirnames, filenames in os.walk(
+        root_path,
+        topdown=True,
+    ):
 
-        for filename in sorted(filenames):
-            if not _is_supported_source_file(filename):
+        # ----------------------------------------------------
+        # PRUNE IGNORED DIRECTORIES
+        # ----------------------------------------------------
+
+        dirnames[:] = [
+            dirname
+
+            for dirname in dirnames
+
+            if not _is_ignored_directory(
+                dirname
+            )
+        ]
+
+        # ----------------------------------------------------
+        # PROCESS FILES
+        # ----------------------------------------------------
+
+        for filename in filenames:
+
+            if not _is_supported_file(
+                filename
+            ):
                 continue
 
-            full_path = os.path.join(dirpath, filename)
+            full_path = os.path.join(
+                dirpath,
+                filename,
+            )
+
+            # ------------------------------------------------
+            # BASIC FILE VALIDATION
+            # ------------------------------------------------
 
             try:
-                file_size = os.path.getsize(full_path)
+
+                if not os.path.isfile(
+                    full_path
+                ):
+                    continue
+
+                # Ignore broken/special files.
+                if os.path.islink(
+                    full_path
+                ):
+                    continue
+
             except OSError:
                 continue
 
-            if file_size <= 0:
+            # ------------------------------------------------
+            # BINARY CHECK
+            # ------------------------------------------------
+
+            if _is_binary_file(
+                full_path
+            ):
                 continue
 
-            found.append(full_path)
+            found.append(
+                full_path
+            )
 
-    print(f"[scanner] Found {len(found)} supported source files.")
+    # Stable ordering makes:
+    # - bug numbering predictable
+    # - scan results reproducible
+    # - second scans easier to compare
+    found.sort(
+        key=lambda path: os.path.relpath(
+            path,
+            root_path,
+        ).lower()
+    )
+
+    print(
+        "[scanner] Source files found: "
+        f"{len(found)}"
+    )
 
     return found
 
 
-def is_binary_file(path: str) -> bool:
-    """Return True if a file appears to contain binary data."""
-
-    try:
-        with open(path, "rb") as handle:
-            chunk = handle.read(8192)
-
-        if not chunk:
-            return False
-
-        if b"\x00" in chunk:
-            return True
-
-        suspicious = sum(
-            1
-            for byte in chunk
-            if byte < 9 or 13 < byte < 32
-        )
-
-        return (suspicious / len(chunk)) > 0.30
-
-    except OSError:
-        return True
-
+# ============================================================
+# SAFE FILE READING
+# ============================================================
 
 def read_file_safely(path: str) -> str:
-    """Read a source file without a file-size limit."""
+    """
+    Read a source file as UTF-8.
+
+    The file is read only when requested by the scan worker.
+
+    Invalid UTF-8 bytes are ignored rather than crashing the
+    entire repository scan.
+    """
 
     if not path:
         return ""
 
-    if is_binary_file(path):
+    try:
+
+        if not os.path.isfile(
+            path
+        ):
+            return ""
+
+    except OSError:
         return ""
 
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+        ) as handle:
+
             return handle.read()
 
-    except OSError as exc:
-        print(f"[scanner] Could not read {path}: {exc}")
+    except (
+        OSError,
+        UnicodeError,
+    ):
+
         return ""
+
+
+# ============================================================
+# RELATIVE PATH HELPER
+# ============================================================
+
+def relative_source_path(
+    root_path: str,
+    file_path: str,
+) -> str:
+    """
+    Return a normalized repository-relative path.
+    """
+
+    try:
+
+        return os.path.relpath(
+            file_path,
+            root_path,
+        ).replace(
+            os.sep,
+            "/",
+        )
+
+    except (
+        ValueError,
+        TypeError,
+    ):
+
+        return file_path
