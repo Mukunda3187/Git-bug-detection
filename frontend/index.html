@@ -358,38 +358,6 @@
       background: var(--warn-bg);
     }
 
-    .progress-wrapper {
-      width: min(700px, 100%);
-      margin: 16px auto 0;
-    }
-
-    .progress-track {
-      width: 100%;
-      height: 8px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.06);
-      overflow: hidden;
-      border: 1px solid var(--border);
-    }
-
-    .progress-fill {
-      height: 100%;
-      width: 0%;
-      background: linear-gradient(90deg, #9333ea, #8b5cf6);
-      border-radius: inherit;
-      transition: width 0.35s ease;
-    }
-
-    .progress-text {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      margin-top: 7px;
-      color: var(--text-dim);
-      font-size: 12px;
-      font-family: 'JetBrains Mono', monospace;
-    }
-
     .summary-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -430,19 +398,16 @@
       font-weight: 600;
     }
 
-    .num.confidence-high {
-      color: var(--added);
-      text-shadow: 0 0 16px rgba(16, 185, 129, 0.3);
+    .confidence-high {
+      color: var(--added) !important;
     }
 
-    .num.confidence-medium {
-      color: var(--warn);
-      text-shadow: 0 0 16px rgba(245, 158, 11, 0.3);
+    .confidence-medium {
+      color: var(--warn) !important;
     }
 
-    .num.confidence-low {
-      color: var(--removed);
-      text-shadow: 0 0 16px rgba(244, 63, 94, 0.4);
+    .confidence-low {
+      color: var(--removed) !important;
     }
 
     .error-level-pill {
@@ -990,16 +955,26 @@
 </div>
 
 <script>
+
 const API_BASE = "";
 
 let progressTimer = null;
+
+
+/* =========================================================
+   BASIC HELPERS
+========================================================= */
 
 function setSample(url) {
   document.getElementById("repo-url").value = url;
 }
 
+
 function escapeHtml(str) {
-  if (str === null || str === undefined) return "";
+
+  if (str === null || str === undefined) {
+    return "";
+  }
 
   return String(str)
     .replaceAll("&", "&amp;")
@@ -1010,18 +985,31 @@ function escapeHtml(str) {
 }
 
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
 /* =========================================================
    PROGRESS
 ========================================================= */
 
 function startProgress() {
-  const line = document.getElementById("status-line");
+
+  const line =
+    document.getElementById("status-line");
 
   line.innerHTML = `
     <div style="width:100%; text-align:center;">
+
       <div class="scanning-indicator">
+
         <div class="radar-spinner"></div>
-        <span id="scan-status-text">Starting scan...</span>
+
+        <span id="scan-status-text">
+          Starting scan...
+        </span>
+
       </div>
 
       <div style="
@@ -1033,6 +1021,7 @@ function startProgress() {
         border-radius:999px;
         overflow:hidden;
       ">
+
         <div
           id="scan-progress-bar"
           style="
@@ -1042,6 +1031,7 @@ function startProgress() {
             transition:width .4s ease;
           "
         ></div>
+
       </div>
 
       <div
@@ -1054,32 +1044,46 @@ function startProgress() {
       >
         0%
       </div>
+
     </div>
   `;
 }
 
 
 function updateProgress(data) {
-  const progress = Math.max(
-    0,
-    Math.min(100, Number(data.progress || 0))
-  );
+
+  const progress =
+    Math.max(
+      0,
+      Math.min(
+        100,
+        Number(data.progress || 0)
+      )
+    );
 
   const bar =
-    document.getElementById("scan-progress-bar");
+    document.getElementById(
+      "scan-progress-bar"
+    );
 
   const percent =
-    document.getElementById("scan-progress-percent");
+    document.getElementById(
+      "scan-progress-percent"
+    );
 
   const text =
-    document.getElementById("scan-status-text");
+    document.getElementById(
+      "scan-status-text"
+    );
 
   if (bar) {
-    bar.style.width = progress + "%";
+    bar.style.width =
+      progress + "%";
   }
 
   if (percent) {
-    percent.textContent = progress + "%";
+    percent.textContent =
+      progress + "%";
   }
 
   if (text) {
@@ -1092,14 +1096,20 @@ function updateProgress(data) {
 
 
 function stopProgress(message = "") {
+
   clearInterval(progressTimer);
 
   const line =
-    document.getElementById("status-line");
+    document.getElementById(
+      "status-line"
+    );
 
-  if (!line) return;
+  if (!line) {
+    return;
+  }
 
   if (message) {
+
     line.innerHTML = `
       <span style="
         color:var(--text-dim);
@@ -1108,9 +1118,963 @@ function stopProgress(message = "") {
         ${escapeHtml(message)}
       </span>
     `;
+
   } else {
+
     line.innerHTML = "";
+
   }
+}
+
+
+/* =========================================================
+   STATUS
+========================================================= */
+
+function showError(message) {
+
+  const holder =
+    document.getElementById(
+      "status-banner-holder"
+    );
+
+  holder.innerHTML = `
+    <div class="status-banner error">
+      ${escapeHtml(message)}
+    </div>
+  `;
+}
+
+
+function showSuccess(message) {
+
+  const holder =
+    document.getElementById(
+      "status-banner-holder"
+    );
+
+  holder.innerHTML = `
+    <div class="status-banner ok">
+      ${escapeHtml(message)}
+    </div>
+  `;
+}
+
+
+/* =========================================================
+   CODE BLOCK
+========================================================= */
+
+function renderCodeBlock(
+  code,
+  cssClass = "",
+  options = {}
+) {
+
+  if (!code) {
+    return "";
+  }
+
+  const lines =
+    String(code).split("\n");
+
+  const escapedCode =
+    lines
+      .map(
+        line =>
+          escapeHtml(line) || " "
+      )
+      .join("\n");
+
+  const shouldCollapse =
+    lines.length > 5;
+
+  const copyButton =
+    options.copy
+      ? `
+        <div class="code-toolbar">
+
+          <button
+            type="button"
+            class="code-copy-btn"
+            onclick="copyCodeFromBlock(this)"
+          >
+            Copy
+          </button>
+
+        </div>
+      `
+      : "";
+
+  const toggleButton =
+    shouldCollapse
+      ? `
+        <button
+          type="button"
+          class="code-toggle"
+          onclick="toggleCodeBlock(this)"
+        >
+          See more
+        </button>
+      `
+      : "";
+
+  return `
+    <div class="code-wrap">
+
+      ${copyButton}
+
+      <pre class="code-block ${cssClass}${
+        shouldCollapse
+          ? " collapsed"
+          : ""
+      }">${escapedCode}</pre>
+
+      ${toggleButton}
+
+    </div>
+  `;
+}
+
+
+function toggleCodeBlock(button) {
+
+  const pre =
+    button.previousElementSibling;
+
+  if (!pre) {
+    return;
+  }
+
+  const collapsed =
+    pre.classList.toggle(
+      "collapsed"
+    );
+
+  button.textContent =
+    collapsed
+      ? "See more"
+      : "See less";
+}
+
+
+async function copyCodeFromBlock(button) {
+
+  const wrapper =
+    button.closest(
+      ".code-wrap"
+    );
+
+  const pre =
+    wrapper
+      ? wrapper.querySelector(
+          "pre.code-block"
+        )
+      : null;
+
+  if (!pre) {
+    return;
+  }
+
+  const original =
+    button.textContent;
+
+  try {
+
+    await navigator.clipboard.writeText(
+      pre.textContent
+    );
+
+    button.textContent =
+      "Copied!";
+
+  } catch (error) {
+
+    const textarea =
+      document.createElement(
+        "textarea"
+      );
+
+    textarea.value =
+      pre.textContent;
+
+    document.body.appendChild(
+      textarea
+    );
+
+    textarea.select();
+
+    try {
+
+      document.execCommand(
+        "copy"
+      );
+
+      button.textContent =
+        "Copied!";
+
+    } catch (e) {
+
+      button.textContent =
+        "Copy failed";
+
+    }
+
+    textarea.remove();
+  }
+
+  setTimeout(() => {
+
+    button.textContent =
+      original;
+
+  }, 1500);
+}
+
+
+/* =========================================================
+   DISPLAY HELPERS
+========================================================= */
+
+function confidenceClass(value) {
+
+  const confidence =
+    Number(value ?? 0);
+
+  if (confidence >= 80) {
+    return "confidence-high";
+  }
+
+  if (confidence >= 50) {
+    return "confidence-medium";
+  }
+
+  return "confidence-low";
+}
+
+
+function errorLevelClass(level) {
+
+  if (level === "Less Errors") {
+    return "less";
+  }
+
+  if (level === "Medium Errors") {
+    return "medium";
+  }
+
+  return "more";
+}
+
+
+function typeClass(type) {
+
+  const value =
+    String(type || "")
+      .toLowerCase();
+
+  if (value.includes("syntax")) {
+    return "type-syntax";
+  }
+
+  if (
+    value.includes("unnecessary") ||
+    value.includes("unused") ||
+    value.includes("dead") ||
+    value.includes("redundant")
+  ) {
+    return "type-unnecessary";
+  }
+
+  if (value.includes("runtime")) {
+    return "type-runtime";
+  }
+
+  return "";
+}
+
+
+function typeIcon(type) {
+
+  const value =
+    String(type || "")
+      .toLowerCase();
+
+  if (value.includes("syntax")) {
+    return "🔴";
+  }
+
+  if (
+    value.includes("unnecessary") ||
+    value.includes("unused") ||
+    value.includes("dead") ||
+    value.includes("redundant")
+  ) {
+    return "🟡";
+  }
+
+  if (value.includes("runtime")) {
+    return "🟣";
+  }
+
+  return "🟠";
+}
+
+
+/* =========================================================
+   HISTORICAL BUGS
+========================================================= */
+
+function toggleHistory(id) {
+
+  const panel =
+    document.getElementById(
+      "history-" + id
+    );
+
+  const toggle =
+    document.getElementById(
+      "toggle-" + id
+    );
+
+  if (!panel) {
+    return;
+  }
+
+  const hidden =
+    panel.style.display === "none" ||
+    panel.style.display === "";
+
+  panel.style.display =
+    hidden
+      ? "block"
+      : "none";
+
+  if (toggle) {
+
+    toggle.textContent =
+      hidden
+        ? "▴ See less"
+        : "▾ See more — similar bug in our dataset";
+  }
+}
+
+
+/* =========================================================
+   SOLUTION
+========================================================= */
+
+function renderSolutionBlock(bug) {
+
+  const solutionText =
+    bug.solution
+      ? `
+        <div class="solution-note">
+          ${escapeHtml(
+            bug.solution
+          )}
+        </div>
+      `
+      : "";
+
+  const replacementCode =
+    bug.replacement_code
+      ? renderCodeBlock(
+          bug.replacement_code,
+          "added",
+          {
+            copy: true
+          }
+        )
+      : "";
+
+  if (
+    bug.solution_type ===
+    "add"
+  ) {
+
+    return `
+      ${replacementCode}
+
+      ${
+        bug.add_location
+          ? `
+            <div class="solution-action">
+              ${escapeHtml(
+                bug.add_location
+              )}
+            </div>
+          `
+          : ""
+      }
+
+      ${solutionText}
+    `;
+  }
+
+
+  if (
+    bug.solution_type ===
+    "remove"
+  ) {
+
+    return `
+      ${
+        replacementCode
+          ? `
+            <div class="solution-code-label">
+              Remove this code
+            </div>
+
+            ${replacementCode}
+          `
+          : ""
+      }
+
+      ${solutionText}
+    `;
+  }
+
+
+  if (
+    bug.solution_type ===
+    "create_file"
+  ) {
+
+    return `
+      ${
+        bug.new_file_path
+          ? `
+            <div class="location-line solution-file">
+              ${escapeHtml(
+                bug.new_file_path
+              )}
+            </div>
+          `
+          : ""
+      }
+
+      ${replacementCode}
+
+      ${solutionText}
+    `;
+  }
+
+
+  return `
+    ${
+      replacementCode
+        ? `
+          <div class="solution-code-label">
+            Replace with this code
+          </div>
+
+          ${replacementCode}
+        `
+        : ""
+    }
+
+    ${solutionText}
+  `;
+}
+
+
+/* =========================================================
+   BUG CARD
+========================================================= */
+
+function renderBugCard(bug) {
+
+  const bugType =
+    bug.bug_type ||
+    "Other";
+
+  const typeCss =
+    typeClass(
+      bugType
+    );
+
+  const confidenceCss =
+    confidenceClass(
+      bug.confidence
+    );
+
+  let lineText = "";
+
+  if (bug.line_note) {
+
+    lineText =
+      bug.line_note;
+
+  } else if (
+    bug.line_start
+  ) {
+
+    lineText =
+      `Line${
+        bug.line_end &&
+        bug.line_end !==
+          bug.line_start
+          ? "s"
+          : ""
+      } ${bug.line_start}`;
+
+    if (
+      bug.line_end &&
+      bug.line_end !==
+        bug.line_start
+    ) {
+
+      lineText +=
+        `-${bug.line_end}`;
+    }
+  }
+
+
+  /* Historical RAG results */
+
+  let historicalHtml =
+    "";
+
+  if (
+    Array.isArray(
+      bug.retrieved_bugs
+    ) &&
+    bug.retrieved_bugs.length > 0
+  ) {
+
+    historicalHtml = `
+
+      <div
+        class="see-more-toggle"
+        id="toggle-${escapeHtml(
+          bug.id
+        )}"
+        onclick="toggleHistory('${escapeHtml(
+          bug.id
+        )}')"
+      >
+        ▾ See more — similar bug in our dataset
+      </div>
+
+      <div
+        class="historical-bugs"
+        id="history-${escapeHtml(
+          bug.id
+        )}"
+        style="display:none;"
+      >
+
+        ${
+          bug.retrieved_bugs
+            .map(item => `
+
+              <div class="history-item">
+
+                <div class="history-top">
+
+                  <span class="history-source">
+                    ${escapeHtml(
+                      item.dataset_source ||
+                      "Historical Dataset"
+                    )}
+                  </span>
+
+                  <span class="history-sim">
+                    ${Number(
+                      item.similarity ||
+                      0
+                    )}% similar
+                  </span>
+
+                </div>
+
+                ${
+                  item.bug_type
+                    ? `
+                      <div class="history-type">
+                        ${escapeHtml(
+                          item.bug_type
+                        )}
+                      </div>
+                    `
+                    : ""
+                }
+
+                ${
+                  item.bug_description
+                    ? `
+                      <div class="history-desc">
+                        ${escapeHtml(
+                          item.bug_description
+                        )}
+                      </div>
+                    `
+                    : ""
+                }
+
+                ${
+                  item.solution
+                    ? `
+                      <div class="history-solution">
+                        <b>How it was fixed:</b>
+                        ${escapeHtml(
+                          item.solution
+                        )}
+                      </div>
+                    `
+                    : ""
+                }
+
+              </div>
+
+            `)
+            .join("")
+        }
+
+      </div>
+    `;
+  }
+
+
+  return `
+
+    <div class="bug-card ${typeCss}">
+
+      <div class="bug-head">
+
+        <div class="bug-title">
+
+          <span>
+            ${typeIcon(
+              bugType
+            )}
+          </span>
+
+          <span class="bug-number">
+            Bug ${escapeHtml(
+              bug.number
+            )}
+          </span>
+
+          <span>
+            ${escapeHtml(
+              bug.error ||
+              "Possible issue"
+            )}
+          </span>
+
+        </div>
+
+
+        <div class="badge-row">
+
+          <span class="badge ${typeCss}">
+            ${escapeHtml(
+              bugType
+            )}
+          </span>
+
+          <span class="badge ${confidenceCss}">
+            ${Number(
+              bug.confidence ||
+              0
+            )}%
+          </span>
+
+        </div>
+
+      </div>
+
+
+      <div class="bug-body">
+
+
+        <div>
+
+          <div class="field-label">
+            Location
+          </div>
+
+          <div class="location-line">
+
+            ${escapeHtml(
+              bug.file ||
+              ""
+            )}
+
+            ${
+              lineText
+                ? `
+                  &nbsp;—&nbsp;
+                  ${escapeHtml(
+                    lineText
+                  )}
+                `
+                : ""
+            }
+
+          </div>
+
+        </div>
+
+
+        <div>
+
+          <div class="field-label">
+            Cause
+          </div>
+
+          <div class="cause-text">
+            ${escapeHtml(
+              bug.cause ||
+              ""
+            )}
+          </div>
+
+        </div>
+
+
+        ${
+          bug.why_occurs
+            ? `
+              <div>
+
+                <div class="field-label">
+                  Why it occurs
+                </div>
+
+                <div class="explanation-text">
+                  ${escapeHtml(
+                    bug.why_occurs
+                  )}
+                </div>
+
+              </div>
+            `
+            : ""
+        }
+
+
+        ${
+          bug.current_code
+            ? `
+              <div>
+
+                <div class="field-label">
+                  Error Code
+                </div>
+
+                ${renderCodeBlock(
+                  bug.current_code,
+                  "removed"
+                )}
+
+              </div>
+            `
+            : ""
+        }
+
+
+        <div>
+
+          <div class="field-label">
+            Solution
+          </div>
+
+          ${renderSolutionBlock(
+            bug
+          )}
+
+        </div>
+
+
+        ${
+          bug.explanation
+            ? `
+              <div>
+
+                <div class="field-label">
+                  Explanation
+                </div>
+
+                <div class="explanation-text">
+                  ${escapeHtml(
+                    bug.explanation
+                  )}
+                </div>
+
+              </div>
+            `
+            : ""
+        }
+
+
+        ${historicalHtml}
+
+      </div>
+
+    </div>
+  `;
+}
+
+
+/* =========================================================
+   SUMMARY
+========================================================= */
+
+function renderSummary(summary) {
+
+  const holder =
+    document.getElementById(
+      "summary-holder"
+    );
+
+  if (!holder) {
+    return;
+  }
+
+
+  const files =
+    Number(
+      summary.files_scanned ??
+      summary.total_files ??
+      0
+    );
+
+  const bugs =
+    Number(
+      summary.bugs_found ??
+      0
+    );
+
+  const unnecessary =
+    Number(
+      summary.unnecessary_code_found ??
+      0
+    );
+
+  const confidence =
+    Number(
+      summary.confidence ??
+      100
+    );
+
+  const errorLevel =
+    summary.error_level ||
+    "Less Errors";
+
+
+  holder.innerHTML = `
+
+    <div class="summary-grid">
+
+      <div class="summary-cell">
+
+        <div class="num">
+          ${files}
+        </div>
+
+        <div class="label">
+          Files scanned
+        </div>
+
+      </div>
+
+
+      <div class="summary-cell">
+
+        <div class="num">
+          ${bugs}
+        </div>
+
+        <div class="label">
+          Possible bugs
+        </div>
+
+      </div>
+
+
+      <div class="summary-cell">
+
+        <div class="num ${confidenceClass(
+          confidence
+        )}">
+          ${confidence}%
+        </div>
+
+        <div class="label">
+          Confidence
+        </div>
+
+      </div>
+
+
+      <div class="summary-cell">
+
+        <div
+          class="error-level-pill ${errorLevelClass(
+            errorLevel
+          )}"
+        >
+          ${escapeHtml(
+            errorLevel
+          )}
+        </div>
+
+        <div
+          class="label"
+          style="margin-top:8px;"
+        >
+          Issue level
+        </div>
+
+      </div>
+
+    </div>
+  `;
+}
+
+
+/* =========================================================
+   API — GET SCAN STATUS
+========================================================= */
+
+async function getScanStatus(
+  scanId
+) {
+
+  const response =
+    await fetch(
+      `${API_BASE}/api/scan/${encodeURIComponent(
+        scanId
+      )}`,
+      {
+        method: "GET",
+        cache: "no-store"
+      }
+    );
+
+
+  if (!response.ok) {
+
+    let detail = "";
+
+    try {
+      detail =
+        await response.text();
+    } catch (e) {}
+
+
+    throw new Error(
+      `Unable to get scan status (HTTP ${
+        response.status
+      }). ${detail}`
+    );
+  }
+
+
+  return await response.json();
 }
 
 
@@ -1118,74 +2082,73 @@ function stopProgress(message = "") {
    POLLING
 ========================================================= */
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+async function pollScan(
+  scanId
+) {
 
-
-async function getScanStatus(scanId) {
-  const response = await fetch(
-    `${API_BASE}/api/scan/${encodeURIComponent(scanId)}`,
-    {
-      method: "GET",
-      cache: "no-store"
-    }
-  );
-
-  if (!response.ok) {
-    let detail = "";
-
-    try {
-      detail = await response.text();
-    } catch (e) {}
-
-    throw new Error(
-      `Unable to get scan status (HTTP ${response.status}). ${detail}`
-    );
-  }
-
-  return await response.json();
-}
-
-
-async function pollScan(scanId) {
   while (true) {
-    const data = await getScanStatus(scanId);
 
-    console.log("Scan status:", data);
+    const data =
+      await getScanStatus(
+        scanId
+      );
 
-    updateProgress(data);
+
+    console.log(
+      "Scan status:",
+      data
+    );
+
+
+    updateProgress(
+      data
+    );
+
 
     const status =
-      String(data.status || "").toLowerCase();
+      String(
+        data.status ||
+        ""
+      ).toLowerCase();
 
-    /* ---------- COMPLETED ---------- */
+
+    /* COMPLETED */
 
     if (
       status === "completed" ||
       status === "complete" ||
       status === "success"
     ) {
+
       if (!data.result) {
+
         throw new Error(
           "Scan completed but backend returned no result."
         );
       }
 
-      stopProgress("Analysis completed.");
 
-      renderCompletedScan(data.result);
+      stopProgress(
+        "Analysis completed."
+      );
+
+
+      renderCompletedScan(
+        data.result
+      );
+
 
       return;
     }
 
 
-    /* ---------- FAILED ---------- */
+    /* FAILED */
 
     if (
       status === "failed" ||
       status === "error"
     ) {
+
       throw new Error(
         data.error ||
         data.message ||
@@ -1194,9 +2157,11 @@ async function pollScan(scanId) {
     }
 
 
-    /* Poll every 2 seconds */
+    /* KEEP POLLING */
 
-    await sleep(2000);
+    await sleep(
+      2000
+    );
   }
 }
 
@@ -1205,20 +2170,26 @@ async function pollScan(scanId) {
    DISPLAY COMPLETED RESULT
 ========================================================= */
 
-function renderCompletedScan(data) {
+function renderCompletedScan(
+  data
+) {
+
   const bannerHolder =
-    document.getElementById("status-banner-holder");
+    document.getElementById(
+      "status-banner-holder"
+    );
 
   const resultsHolder =
-    document.getElementById("results-holder");
+    document.getElementById(
+      "results-holder"
+    );
 
-  const summaryHolder =
-    document.getElementById("summary-holder");
 
+  if (
+    !data ||
+    !data.summary
+  ) {
 
-  /* Safety check */
-
-  if (!data || !data.summary) {
     bannerHolder.innerHTML = `
       <div class="status-banner error">
         Invalid scan result returned by server.
@@ -1229,23 +2200,28 @@ function renderCompletedScan(data) {
   }
 
 
-  const summary = data.summary;
+  const summary =
+    data.summary;
 
   const bugs =
-    Array.isArray(data.bugs)
+    Array.isArray(
+      data.bugs
+    )
       ? data.bugs
       : [];
 
 
-  /* Backend scan error */
-
   if (
     summary.scan_status &&
-    summary.scan_status !== "Completed"
+    summary.scan_status !==
+      "Completed"
   ) {
+
     bannerHolder.innerHTML = `
       <div class="status-banner error">
-        ${escapeHtml(summary.scan_status)}
+        ${escapeHtml(
+          summary.scan_status
+        )}
       </div>
     `;
 
@@ -1253,34 +2229,39 @@ function renderCompletedScan(data) {
   }
 
 
-  /* Successful scan */
-
   bannerHolder.innerHTML = `
     <div class="status-banner ok">
-      Scan Status: Completed — ${escapeHtml(summary.repo || "")}
+      Scan Status: Completed —
+      ${escapeHtml(
+        summary.repo || ""
+      )}
     </div>
   `;
 
 
-  /* Optional AI notice */
+  if (
+    summary.ai_notice
+  ) {
 
-  if (summary.ai_notice) {
     bannerHolder.innerHTML += `
       <div class="status-banner warn">
-        ⚠ ${escapeHtml(summary.ai_notice)}
+        ⚠ ${escapeHtml(
+          summary.ai_notice
+        )}
       </div>
     `;
   }
 
 
-  /* Summary */
+  renderSummary(
+    summary
+  );
 
-  renderSummary(summary);
 
+  if (
+    bugs.length === 0
+  ) {
 
-  /* No bugs */
-
-  if (bugs.length === 0) {
     resultsHolder.innerHTML = `
       <div class="empty-state">
         No candidate issues found in the scanned files.
@@ -1293,10 +2274,12 @@ function renderCompletedScan(data) {
   }
 
 
-  /* Bug cards */
-
   resultsHolder.innerHTML =
-    bugs.map(renderBugCard).join("");
+    bugs
+      .map(
+        renderBugCard
+      )
+      .join("");
 }
 
 
@@ -1305,163 +2288,208 @@ function renderCompletedScan(data) {
 ========================================================= */
 
 async function scanRepo() {
+
   const url =
     document
-      .getElementById("repo-url")
+      .getElementById(
+        "repo-url"
+      )
       .value
       .trim();
 
+
   const btn =
-    document.getElementById("scan-btn");
+    document.getElementById(
+      "scan-btn"
+    );
+
 
   const bannerHolder =
-    document.getElementById("status-banner-holder");
+    document.getElementById(
+      "status-banner-holder"
+    );
+
 
   const resultsHolder =
-    document.getElementById("results-holder");
+    document.getElementById(
+      "results-holder"
+    );
+
 
   const summaryHolder =
-    document.getElementById("summary-holder");
+    document.getElementById(
+      "summary-holder"
+    );
 
 
-  /* Clear previous scan */
+  /* Clear old result */
 
-  bannerHolder.innerHTML = "";
-  resultsHolder.innerHTML = "";
-  summaryHolder.innerHTML = "";
+  bannerHolder.innerHTML =
+    "";
+
+  resultsHolder.innerHTML =
+    "";
+
+  summaryHolder.innerHTML =
+    "";
 
 
-  /* Validate input */
+  /* Validate URL */
 
   if (!url) {
-    bannerHolder.innerHTML = `
-      <div class="status-banner error">
-        Enter a GitHub repository URL first.
-      </div>
-    `;
+
+    showError(
+      "Enter a GitHub repository URL first."
+    );
 
     return;
   }
 
 
-  btn.disabled = true;
+  btn.disabled =
+    true;
+
 
   startProgress();
 
 
   try {
-    /* =============================================
-       START BACKGROUND SCAN
-    ============================================= */
 
-    const response = await fetch(
-      `${API_BASE}/api/scan`,
-      {
-        method: "POST",
+    /* =========================================
+       START SCAN
+    ========================================= */
 
-        headers: {
-          "Content-Type": "application/json"
-        },
+    const response =
+      await fetch(
+        `${API_BASE}/api/scan`,
+        {
+          method: "POST",
 
-        body: JSON.stringify({
-          repo_url: url
-        })
-      }
-    );
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+
+          body: JSON.stringify({
+            repo_url: url
+          })
+        }
+      );
 
 
     if (!response.ok) {
-      let detail = "";
+
+      let detail =
+        "";
 
       try {
-        detail = await response.text();
+
+        detail =
+          await response.text();
+
       } catch (e) {}
 
+
       throw new Error(
-        `Server error (HTTP ${response.status}). ${detail}`
+        `Server error (HTTP ${
+          response.status
+        }). ${detail}`
       );
     }
 
 
-    const data = await response.json();
+    const data =
+      await response.json();
 
-    console.log("Start scan response:", data);
+
+    console.log(
+      "Start scan response:",
+      data
+    );
 
 
-    /* =============================================
-       COMPATIBILITY WITH OLD BACKEND
-    =============================================
-
-       Old backend:
-       {
-           summary: {...},
-           bugs: [...]
-       }
-
-       New backend:
-       {
-           scan_id: "...",
-           status: "queued",
-           progress: 0
-       }
-
-    ============================================= */
-
+    /* =========================================
+       OLD BACKEND COMPATIBILITY
+    ========================================= */
 
     if (
       data.summary &&
-      Array.isArray(data.bugs)
+      Array.isArray(
+        data.bugs
+      )
     ) {
-      stopProgress("Analysis completed.");
 
-      renderCompletedScan(data);
+      stopProgress(
+        "Analysis completed."
+      );
+
+
+      renderCompletedScan(
+        data
+      );
+
 
       return;
     }
 
 
-    /* =============================================
-       NEW BACKGROUND SCAN
-    ============================================= */
+    /* =========================================
+       NEW BACKGROUND BACKEND
+    ========================================= */
 
-    const scanId = data.scan_id;
+    const scanId =
+      data.scan_id;
 
 
     if (!scanId) {
+
       throw new Error(
         "Backend did not return a scan ID."
       );
     }
 
 
-    updateProgress(data);
+    updateProgress(
+      data
+    );
 
 
-    /* Start polling */
-
-    await pollScan(scanId);
+    await pollScan(
+      scanId
+    );
 
   }
 
   catch (error) {
-    console.error(error);
 
-    stopProgress("");
+    console.error(
+      "Scan error:",
+      error
+    );
+
+
+    stopProgress();
+
 
     bannerHolder.innerHTML = `
       <div class="status-banner error">
         Request failed:
         ${escapeHtml(
-          error && error.message
+          error &&
+          error.message
             ? error.message
             : String(error)
         )}
       </div>
     `;
+
   }
 
   finally {
-    btn.disabled = false;
+
+    btn.disabled =
+      false;
+
   }
 }
 
@@ -1471,13 +2499,22 @@ async function scanRepo() {
 ========================================================= */
 
 document
-  .getElementById("repo-url")
+  .getElementById(
+    "repo-url"
+  )
   .addEventListener(
     "keydown",
     event => {
-      if (event.key === "Enter") {
+
+      if (
+        event.key ===
+        "Enter"
+      ) {
+
         scanRepo();
+
       }
+
     }
   );
 
