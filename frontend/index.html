@@ -990,35 +990,16 @@
 </div>
 
 <script>
-
 const API_BASE = "";
 
-let pollingTimer = null;
 let progressTimer = null;
 
-const progressSteps = [
-  "Starting scan...",
-  "Validating repository...",
-  "Downloading repository...",
-  "Reading source files...",
-  "Analyzing code...",
-  "Searching historical bugs...",
-  "Generating recovery suggestions..."
-];
-
-
 function setSample(url) {
-
   document.getElementById("repo-url").value = url;
-
 }
 
-
 function escapeHtml(str) {
-
-  if (str === null || str === undefined) {
-    return "";
-  }
+  if (str === null || str === undefined) return "";
 
   return String(str)
     .replaceAll("&", "&amp;")
@@ -1026,830 +1007,280 @@ function escapeHtml(str) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
-
 }
 
 
-function startProgress() {
+/* =========================================================
+   PROGRESS
+========================================================= */
 
+function startProgress() {
   const line = document.getElementById("status-line");
 
-  let stepIndex = 0;
-
   line.innerHTML = `
-    <div style="width:100%; display:flex; flex-direction:column; align-items:center;">
+    <div style="width:100%; text-align:center;">
       <div class="scanning-indicator">
         <div class="radar-spinner"></div>
-        <span id="step-text">${progressSteps[0]}</span>
+        <span id="scan-status-text">Starting scan...</span>
       </div>
 
-      <div class="progress-wrapper">
+      <div style="
+        width:100%;
+        max-width:650px;
+        height:8px;
+        margin:15px auto 0;
+        background:rgba(255,255,255,0.06);
+        border-radius:999px;
+        overflow:hidden;
+      ">
+        <div
+          id="scan-progress-bar"
+          style="
+            width:0%;
+            height:100%;
+            background:linear-gradient(90deg,#9333ea,#8b5cf6);
+            transition:width .4s ease;
+          "
+        ></div>
+      </div>
 
-        <div class="progress-track">
-          <div
-            id="progress-fill"
-            class="progress-fill"
-          ></div>
-        </div>
-
-        <div class="progress-text">
-          <span id="progress-message">Starting scan...</span>
-          <span id="progress-percent">0%</span>
-        </div>
-
+      <div
+        id="scan-progress-percent"
+        style="
+          margin-top:7px;
+          font-size:12px;
+          color:var(--text-dim);
+        "
+      >
+        0%
       </div>
     </div>
   `;
-
-  clearInterval(progressTimer);
-
-  progressTimer = setInterval(() => {
-
-    stepIndex++;
-
-    if (stepIndex >= progressSteps.length) {
-      stepIndex = progressSteps.length - 1;
-    }
-
-    const stepText = document.getElementById("step-text");
-
-    if (stepText) {
-      stepText.textContent = progressSteps[stepIndex];
-    }
-
-  }, 2500);
-
 }
 
 
 function updateProgress(data) {
+  const progress = Math.max(
+    0,
+    Math.min(100, Number(data.progress || 0))
+  );
 
-  const percent = Number(data.progress || 0);
+  const bar =
+    document.getElementById("scan-progress-bar");
 
-  const fill = document.getElementById("progress-fill");
+  const percent =
+    document.getElementById("scan-progress-percent");
 
-  const percentText = document.getElementById("progress-percent");
+  const text =
+    document.getElementById("scan-status-text");
 
-  const message = document.getElementById("progress-message");
-
-  if (fill) {
-    fill.style.width = Math.max(0, Math.min(100, percent)) + "%";
+  if (bar) {
+    bar.style.width = progress + "%";
   }
 
-  if (percentText) {
-    percentText.textContent = percent + "%";
+  if (percent) {
+    percent.textContent = progress + "%";
   }
 
-  if (message) {
-
-    let text = data.message || data.status || "Processing...";
-
-    if (data.result && data.result.summary) {
-
-      const summary = data.result.summary;
-
-      if (summary.total_files) {
-
-        text =
-          `Analyzing files: ${summary.files_completed || 0}/${summary.total_files}`;
-
-      }
-
-    }
-
-    message.textContent = text;
+  if (text) {
+    text.textContent =
+      data.message ||
+      data.status ||
+      "Scanning repository...";
   }
-
 }
 
 
-function stopProgress(finalText = "") {
-
+function stopProgress(message = "") {
   clearInterval(progressTimer);
 
-  progressTimer = null;
+  const line =
+    document.getElementById("status-line");
 
-  const line = document.getElementById("status-line");
+  if (!line) return;
 
-  if (!line) {
-    return;
-  }
-
-  if (finalText) {
-
+  if (message) {
     line.innerHTML = `
-      <span
-        style="
-          color:var(--text-dim);
-          font-size:14px;
-        "
-      >
-        ${escapeHtml(finalText)}
+      <span style="
+        color:var(--text-dim);
+        font-size:14px;
+      ">
+        ${escapeHtml(message)}
       </span>
     `;
-
   } else {
-
     line.innerHTML = "";
-
   }
-
 }
 
 
-function showBanner(type, message) {
+/* =========================================================
+   POLLING
+========================================================= */
 
-  const holder = document.getElementById("status-banner-holder");
-
-  holder.innerHTML = `
-    <div class="status-banner ${type}">
-      ${escapeHtml(message)}
-    </div>
-  `;
-
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 
-function renderCodeBlock(code, cssClass, options = {}) {
+async function getScanStatus(scanId) {
+  const response = await fetch(
+    `${API_BASE}/api/scan/${encodeURIComponent(scanId)}`,
+    {
+      method: "GET",
+      cache: "no-store"
+    }
+  );
 
-  if (!code) {
-    return "";
-  }
-
-  const lines = String(code).split("\n");
-
-  const body = lines
-    .map(line => escapeHtml(line) || " ")
-    .join("\n");
-
-  const collapsible = lines.length > 5;
-
-  const copyButton = options.copy
-    ? `
-      <div class="code-toolbar">
-        <button
-          type="button"
-          class="code-copy-btn"
-          onclick="copyCodeFromBlock(this)"
-        >
-          Copy
-        </button>
-      </div>
-    `
-    : "";
-
-  const preClass =
-    `code-block ${cssClass}${collapsible ? " collapsed" : ""}`;
-
-  const toggle = collapsible
-    ? `
-      <button
-        type="button"
-        class="code-toggle"
-        onclick="toggleCodeBlock(this)"
-      >
-        See more
-      </button>
-    `
-    : "";
-
-  return `
-    <div class="code-wrap">
-      ${copyButton}
-      <pre class="${preClass}">${body}</pre>
-      ${toggle}
-    </div>
-  `;
-
-}
-
-
-function toggleCodeBlock(button) {
-
-  const pre = button.previousElementSibling;
-
-  if (!pre) {
-    return;
-  }
-
-  const collapsed =
-    pre.classList.toggle("collapsed");
-
-  button.textContent =
-    collapsed ? "See more" : "See less";
-
-}
-
-
-async function copyCodeFromBlock(button) {
-
-  const wrapper =
-    button.closest(".code-wrap");
-
-  const pre =
-    wrapper
-      ? wrapper.querySelector("pre.code-block")
-      : null;
-
-  if (!pre) {
-    return;
-  }
-
-  const originalText =
-    button.textContent;
-
-  try {
-
-    await navigator.clipboard.writeText(
-      pre.textContent
-    );
-
-    button.textContent = "Copied!";
-
-  } catch (error) {
-
-    const textarea =
-      document.createElement("textarea");
-
-    textarea.value =
-      pre.textContent;
-
-    document.body.appendChild(textarea);
-
-    textarea.select();
+  if (!response.ok) {
+    let detail = "";
 
     try {
+      detail = await response.text();
+    } catch (e) {}
 
-      document.execCommand("copy");
+    throw new Error(
+      `Unable to get scan status (HTTP ${response.status}). ${detail}`
+    );
+  }
 
-      button.textContent = "Copied!";
+  return await response.json();
+}
 
-    } catch (copyError) {
 
-      button.textContent = "Copy failed";
+async function pollScan(scanId) {
+  while (true) {
+    const data = await getScanStatus(scanId);
 
+    console.log("Scan status:", data);
+
+    updateProgress(data);
+
+    const status =
+      String(data.status || "").toLowerCase();
+
+    /* ---------- COMPLETED ---------- */
+
+    if (
+      status === "completed" ||
+      status === "complete" ||
+      status === "success"
+    ) {
+      if (!data.result) {
+        throw new Error(
+          "Scan completed but backend returned no result."
+        );
+      }
+
+      stopProgress("Analysis completed.");
+
+      renderCompletedScan(data.result);
+
+      return;
     }
 
-    textarea.remove();
 
-  }
-
-  setTimeout(() => {
-
-    button.textContent = originalText;
-
-  }, 1500);
-
-}
-
-
-function renderSolutionBlock(bug) {
-
-  const solutionText = bug.solution
-    ? `
-      <div class="solution-note">
-        ${escapeHtml(bug.solution)}
-      </div>
-    `
-    : "";
-
-  const code = bug.replacement_code
-    ? renderCodeBlock(
-        bug.replacement_code,
-        "added",
-        { copy: true }
-      )
-    : "";
-
-  if (bug.solution_type === "add") {
-
-    return `
-      ${code}
-
-      ${
-        bug.add_location
-          ? `
-            <div class="solution-action">
-              ${escapeHtml(bug.add_location)}
-            </div>
-          `
-          : ""
-      }
-
-      ${solutionText}
-    `;
-
-  }
-
-  if (bug.solution_type === "remove") {
-
-    return `
-      ${
-        code
-          ? `
-            <div class="solution-code-label">
-              Remove this code
-            </div>
-
-            ${code}
-          `
-          : ""
-      }
-
-      ${solutionText}
-    `;
-
-  }
-
-  if (bug.solution_type === "create_file") {
-
-    return `
-      ${
-        bug.new_file_path
-          ? `
-            <div class="location-line solution-file">
-              ${escapeHtml(bug.new_file_path)}
-            </div>
-          `
-          : ""
-      }
-
-      ${code}
-
-      ${solutionText}
-    `;
-
-  }
-
-  return `
-    ${
-      code
-        ? `
-          <div class="solution-code-label">
-            Replace with this code
-          </div>
-
-          ${code}
-        `
-        : ""
-    }
-
-    ${solutionText}
-  `;
-
-}
-
-
-function toggleHistory(id) {
-
-  const panel =
-    document.getElementById("history-" + id);
-
-  const toggle =
-    document.getElementById("toggle-" + id);
-
-  if (!panel) {
-    return;
-  }
-
-  const isHidden =
-    panel.style.display === "none" ||
-    !panel.style.display;
-
-  panel.style.display =
-    isHidden ? "block" : "none";
-
-  if (toggle) {
-
-    toggle.textContent =
-      isHidden
-        ? "▴ See less"
-        : "▾ See more — similar bug in our dataset";
-
-  }
-
-}
-
-
-function typeClass(bugType) {
-
-  const t =
-    (bugType || "").toLowerCase();
-
-  if (t.includes("syntax")) {
-    return "type-syntax";
-  }
-
-  if (
-    t.includes("unnecessary") ||
-    t.includes("dead code") ||
-    t.includes("unused code") ||
-    t.includes("redundant")
-  ) {
-    return "type-unnecessary";
-  }
-
-  if (t.includes("runtime")) {
-    return "type-runtime";
-  }
-
-  return "";
-
-}
-
-
-function typeIcon(bugType) {
-
-  const t =
-    (bugType || "").toLowerCase();
-
-  if (t.includes("syntax")) {
-    return "🔴";
-  }
-
-  if (
-    t.includes("unnecessary") ||
-    t.includes("dead code") ||
-    t.includes("unused code") ||
-    t.includes("redundant")
-  ) {
-    return "🟡";
-  }
-
-  if (t.includes("runtime")) {
-    return "🟣";
-  }
-
-  return "🟠";
-
-}
-
-
-function confidenceClass(confidence) {
-
-  const value =
-    Number(confidence || 0);
-
-  if (value >= 80) {
-    return "confidence-high";
-  }
-
-  if (value >= 50) {
-    return "confidence-medium";
-  }
-
-  return "confidence-low";
-
-}
-
-
-function renderBugCard(bug) {
-
-  const lineText = bug.line_note
-    ? bug.line_note
-    : (
-        bug.line_start
-          ? `Line${bug.line_end && bug.line_end !== bug.line_start ? "s" : ""} ${
-              bug.line_start
-            }${
-              bug.line_end &&
-              bug.line_end !== bug.line_start
-                ? "-" + bug.line_end
-                : ""
-            }`
-          : ""
+    /* ---------- FAILED ---------- */
+
+    if (
+      status === "failed" ||
+      status === "error"
+    ) {
+      throw new Error(
+        data.error ||
+        data.message ||
+        "Repository scan failed."
       );
+    }
 
-  const cClass =
-    confidenceClass(bug.confidence);
 
-  const tClass =
-    typeClass(bug.bug_type);
+    /* Poll every 2 seconds */
 
-  const retrievedSection =
-    bug.retrieved_bugs &&
-    bug.retrieved_bugs.length > 0
-      ? `
-        <div
-          class="see-more-toggle"
-          id="toggle-${escapeHtml(bug.id)}"
-          onclick="toggleHistory('${escapeHtml(bug.id)}')"
-        >
-          ▾ See more — similar bug in our dataset
-        </div>
-
-        <div
-          class="historical-bugs"
-          id="history-${escapeHtml(bug.id)}"
-          style="display:none;"
-        >
-
-          ${
-            bug.retrieved_bugs
-              .map(r => `
-                <div class="history-item">
-
-                  <div class="history-top">
-
-                    <span class="history-source">
-                      ${escapeHtml(r.dataset_source)}
-                    </span>
-
-                    <span class="history-sim">
-                      ${Number(r.similarity || 0)}% similar
-                    </span>
-
-                  </div>
-
-                  ${
-                    r.bug_type
-                      ? `
-                        <div class="history-type">
-                          ${escapeHtml(r.bug_type)}
-                        </div>
-                      `
-                      : ""
-                  }
-
-                  ${
-                    r.bug_description
-                      ? `
-                        <div class="history-desc">
-                          ${escapeHtml(r.bug_description)}
-                        </div>
-                      `
-                      : ""
-                  }
-
-                  ${
-                    r.solution
-                      ? `
-                        <div class="history-solution">
-                          <b>How it was fixed:</b>
-                          ${escapeHtml(r.solution)}
-                        </div>
-                      `
-                      : ""
-                  }
-
-                </div>
-              `)
-              .join("")
-          }
-
-        </div>
-      `
-      : "";
-
-  return `
-    <div class="bug-card ${tClass}">
-
-      <div class="bug-head">
-
-        <div class="bug-title">
-
-          <span>
-            ${typeIcon(bug.bug_type)}
-          </span>
-
-          <span class="bug-number">
-            Bug ${bug.number}
-          </span>
-
-          <span>
-            ${escapeHtml(bug.error)}
-          </span>
-
-        </div>
-
-        <div class="badge-row">
-
-          <span class="badge ${tClass}">
-            ${escapeHtml(bug.bug_type || "Other")}
-          </span>
-
-          <span class="badge ${cClass}">
-            ${Number(bug.confidence || 0)}%
-          </span>
-
-        </div>
-
-      </div>
-
-      <div class="bug-body">
-
-        <div>
-
-          <div class="field-label">
-            Location
-          </div>
-
-          <div class="location-line">
-            ${escapeHtml(bug.file)}
-
-            ${
-              lineText
-                ? "&nbsp;—&nbsp;" +
-                  escapeHtml(lineText)
-                : ""
-            }
-          </div>
-
-        </div>
-
-        <div>
-
-          <div class="field-label">
-            Cause
-          </div>
-
-          <div class="cause-text">
-            ${escapeHtml(bug.cause)}
-          </div>
-
-        </div>
-
-        ${
-          bug.why_occurs
-            ? `
-              <div>
-
-                <div class="field-label">
-                  Why it occurs
-                </div>
-
-                <div class="explanation-text">
-                  ${escapeHtml(bug.why_occurs)}
-                </div>
-
-              </div>
-            `
-            : ""
-        }
-
-        ${
-          bug.current_code
-            ? `
-              <div>
-
-                <div class="field-label">
-                  Error Code
-                </div>
-
-                ${renderCodeBlock(
-                  bug.current_code,
-                  "removed"
-                )}
-
-              </div>
-            `
-            : ""
-        }
-
-        <div>
-
-          <div class="field-label">
-            Solution
-          </div>
-
-          ${renderSolutionBlock(bug)}
-
-        </div>
-
-        ${retrievedSection}
-
-      </div>
-
-    </div>
-  `;
-
+    await sleep(2000);
+  }
 }
 
 
-function errorLevelClass(level) {
+/* =========================================================
+   DISPLAY COMPLETED RESULT
+========================================================= */
 
-  if (level === "Less Errors") {
-    return "less";
-  }
+function renderCompletedScan(data) {
+  const bannerHolder =
+    document.getElementById("status-banner-holder");
 
-  if (level === "Medium Errors") {
-    return "medium";
-  }
+  const resultsHolder =
+    document.getElementById("results-holder");
 
-  return "more";
-
-}
-
-
-function renderSummary(summary) {
-
-  const holder =
+  const summaryHolder =
     document.getElementById("summary-holder");
 
-  if (
-    summary.files_scanned === 0 &&
-    summary.bugs_found === 0 &&
-    summary.scan_status === "Completed"
-  ) {
-    holder.innerHTML = "";
+
+  /* Safety check */
+
+  if (!data || !data.summary) {
+    bannerHolder.innerHTML = `
+      <div class="status-banner error">
+        Invalid scan result returned by server.
+      </div>
+    `;
+
     return;
   }
 
-  holder.innerHTML = `
-    <div class="summary-grid">
 
-      <div class="summary-cell">
-
-        <div class="num">
-          ${Number(summary.files_scanned || 0)}
-        </div>
-
-        <div class="label">
-          Files scanned
-        </div>
-
-      </div>
-
-      <div class="summary-cell">
-
-        <div class="num">
-          ${Number(summary.bugs_found || 0)}
-        </div>
-
-        <div class="label">
-          Possible bugs
-        </div>
-
-      </div>
-
-      <div class="summary-cell">
-
-        <div class="num ${confidenceClass(summary.confidence)}">
-          ${Number(summary.confidence || 0)}%
-        </div>
-
-        <div class="label">
-          Confidence
-        </div>
-
-      </div>
-
-      <div class="summary-cell">
-
-        <div class="error-level-pill ${errorLevelClass(summary.error_level)}">
-          ${escapeHtml(summary.error_level || "Less Errors")}
-        </div>
-
-        <div
-          class="label"
-          style="margin-top:8px;"
-        >
-          Error level
-        </div>
-
-      </div>
-
-    </div>
-  `;
-
-}
-
-
-function renderResult(data) {
-
-  const summary =
-    data.summary || {};
+  const summary = data.summary;
 
   const bugs =
     Array.isArray(data.bugs)
       ? data.bugs
       : [];
 
-  showBanner(
-    "ok",
-    `Scan Status: Completed — ${summary.repo || "Repository"}`
-  );
+
+  /* Backend scan error */
+
+  if (
+    summary.scan_status &&
+    summary.scan_status !== "Completed"
+  ) {
+    bannerHolder.innerHTML = `
+      <div class="status-banner error">
+        ${escapeHtml(summary.scan_status)}
+      </div>
+    `;
+
+    return;
+  }
+
+
+  /* Successful scan */
+
+  bannerHolder.innerHTML = `
+    <div class="status-banner ok">
+      Scan Status: Completed — ${escapeHtml(summary.repo || "")}
+    </div>
+  `;
+
+
+  /* Optional AI notice */
 
   if (summary.ai_notice) {
-
-    const holder =
-      document.getElementById("status-banner-holder");
-
-    holder.innerHTML += `
+    bannerHolder.innerHTML += `
       <div class="status-banner warn">
         ⚠ ${escapeHtml(summary.ai_notice)}
       </div>
     `;
-
   }
+
+
+  /* Summary */
 
   renderSummary(summary);
 
-  const resultsHolder =
-    document.getElementById("results-holder");
+
+  /* No bugs */
 
   if (bugs.length === 0) {
-
     resultsHolder.innerHTML = `
       <div class="empty-state">
         No candidate issues found in the scanned files.
@@ -1861,104 +1292,22 @@ function renderResult(data) {
     return;
   }
 
+
+  /* Bug cards */
+
   resultsHolder.innerHTML =
     bugs.map(renderBugCard).join("");
-
 }
 
 
-async function getScanStatus(scanId) {
-
-  const response =
-    await fetch(
-      `${API_BASE}/api/scan/${encodeURIComponent(scanId)}`,
-      {
-        method: "GET",
-        cache: "no-store"
-      }
-    );
-
-  if (!response.ok) {
-
-    let detail = "";
-
-    try {
-      detail = await response.text();
-    } catch (e) {}
-
-    throw new Error(
-      `Status request failed (HTTP ${response.status}). ${
-        detail.slice(0, 300)
-      }`
-    );
-
-  }
-
-  return await response.json();
-
-}
-
-
-async function pollScan(scanId) {
-
-  while (true) {
-
-    const data =
-      await getScanStatus(scanId);
-
-    updateProgress(data);
-
-    const status =
-      String(data.status || "").toLowerCase();
-
-    if (
-      status === "completed" ||
-      status === "complete" ||
-      status === "success"
-    ) {
-
-      stopProgress("Analysis completed.");
-
-      if (data.result) {
-        renderResult(data.result);
-      } else {
-        throw new Error(
-          "Scan completed but no result was returned."
-        );
-      }
-
-      return;
-
-    }
-
-    if (
-      status === "failed" ||
-      status === "error"
-    ) {
-
-      stopProgress("");
-
-      throw new Error(
-        data.error ||
-        data.message ||
-        "The scan failed."
-      );
-
-    }
-
-    await new Promise(
-      resolve => setTimeout(resolve, 2000)
-    );
-
-  }
-
-}
-
+/* =========================================================
+   START SCAN
+========================================================= */
 
 async function scanRepo() {
-
   const url =
-    document.getElementById("repo-url")
+    document
+      .getElementById("repo-url")
       .value
       .trim();
 
@@ -1974,49 +1323,54 @@ async function scanRepo() {
   const summaryHolder =
     document.getElementById("summary-holder");
 
-  clearInterval(pollingTimer);
+
+  /* Clear previous scan */
 
   bannerHolder.innerHTML = "";
-
   resultsHolder.innerHTML = "";
-
   summaryHolder.innerHTML = "";
 
-  if (!url) {
 
-    showBanner(
-      "error",
-      "Enter a GitHub repository URL first."
-    );
+  /* Validate input */
+
+  if (!url) {
+    bannerHolder.innerHTML = `
+      <div class="status-banner error">
+        Enter a GitHub repository URL first.
+      </div>
+    `;
 
     return;
-
   }
+
 
   btn.disabled = true;
 
   startProgress();
 
+
   try {
+    /* =============================================
+       START BACKGROUND SCAN
+    ============================================= */
 
-    const response =
-      await fetch(
-        `${API_BASE}/api/scan`,
-        {
-          method: "POST",
+    const response = await fetch(
+      `${API_BASE}/api/scan`,
+      {
+        method: "POST",
 
-          headers: {
-            "Content-Type": "application/json"
-          },
+        headers: {
+          "Content-Type": "application/json"
+        },
 
-          body: JSON.stringify({
-            repo_url: url
-          })
-        }
-      );
+        body: JSON.stringify({
+          repo_url: url
+        })
+      }
+    );
+
 
     if (!response.ok) {
-
       let detail = "";
 
       try {
@@ -2024,88 +1378,106 @@ async function scanRepo() {
       } catch (e) {}
 
       throw new Error(
-        `Server error (HTTP ${response.status}). ${
-          detail.slice(0, 300)
-        }`
+        `Server error (HTTP ${response.status}). ${detail}`
       );
-
     }
 
-    const data =
-      await response.json();
 
-    /*
-      New backend returns:
+    const data = await response.json();
 
-      {
-        scan_id: "...",
-        status: "queued",
-        message: "...",
-        progress: 0
-      }
+    console.log("Start scan response:", data);
 
-      Older backend may return the complete result
-      directly. We support both.
-    */
+
+    /* =============================================
+       COMPATIBILITY WITH OLD BACKEND
+    =============================================
+
+       Old backend:
+       {
+           summary: {...},
+           bugs: [...]
+       }
+
+       New backend:
+       {
+           scan_id: "...",
+           status: "queued",
+           progress: 0
+       }
+
+    ============================================= */
+
 
     if (
       data.summary &&
       Array.isArray(data.bugs)
     ) {
-
       stopProgress("Analysis completed.");
 
-      renderResult(data);
+      renderCompletedScan(data);
 
       return;
-
     }
 
-    const scanId =
-      data.scan_id;
+
+    /* =============================================
+       NEW BACKGROUND SCAN
+    ============================================= */
+
+    const scanId = data.scan_id;
+
 
     if (!scanId) {
-
       throw new Error(
-        "The server did not return a scan ID."
+        "Backend did not return a scan ID."
       );
-
     }
+
 
     updateProgress(data);
 
+
+    /* Start polling */
+
     await pollScan(scanId);
-
-  } catch (error) {
-
-    stopProgress("");
-
-    showBanner(
-      "error",
-      error && error.message
-        ? error.message
-        : String(error)
-    );
-
-  } finally {
-
-    btn.disabled = false;
 
   }
 
+  catch (error) {
+    console.error(error);
+
+    stopProgress("");
+
+    bannerHolder.innerHTML = `
+      <div class="status-banner error">
+        Request failed:
+        ${escapeHtml(
+          error && error.message
+            ? error.message
+            : String(error)
+        )}
+      </div>
+    `;
+  }
+
+  finally {
+    btn.disabled = false;
+  }
 }
 
+
+/* =========================================================
+   ENTER KEY
+========================================================= */
 
 document
   .getElementById("repo-url")
   .addEventListener(
     "keydown",
     event => {
-
       if (event.key === "Enter") {
         scanRepo();
       }
-
     }
   );
 
