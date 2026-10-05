@@ -1,1318 +1,830 @@
 """
-LLM client for Git Bug Detection.
+Wraps the call to the LLM (Google Gemini). Give it:
+  - a raw candidate finding from a detector (detectors/python_detector.py)
+  - the retrieved similar historical bugs from the RAG step
+and it returns a fully-formed structured bug report as a dict, matching
+models.BugReport (minus the fields the caller already knows, like id/file).
 
-Responsibilities
-----------------
-1. Analyze detector findings with Gemini.
-2. Analyze complete source files when requested.
-3. Use multiple Gemini API keys.
-4. Rotate between configured keys.
-5. Return structured JSON.
-6. Provide safe fallback reports when Gemini is unavailable.
+Uses Gemini's REST API directly via `requests` (already a dependency) -
+no extra SDK to install or version-pin.
 
-Environment variables
----------------------
-GEMINI_API_KEY_1
-GEMINI_API_KEY_2
-GEMINI_API_KEY_3
-GEMINI_API_KEY_4
-GEMINI_API_KEY_5
-
-The older GEMINI_API_KEY variable is also supported.
+If no GEMINI_API_KEY is set, falls back to a transparent rule-based
+formatter so the app still runs end-to-end for a demo - it clearly does
+NOT pretend to be the LLM's reasoning, it just formats what the detector
+already found.
 """
-
 import json
 import math
 import os
 import re
-import threading
-import time
 
 import requests
 
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-# ============================================================
-# GEMINI CONFIGURATION
-# ============================================================
-
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-2.0-flash",
-)
-
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/"
-    f"v1beta/models/{GEMINI_MODEL}:generateContent"
-)
+# See the comment in analyze_finding() where this is used - together these two
+# bound the worst-case time one finding's LLM call can take to
+# MAX_KEYS_TO_TRY_PER_CALL * GEMINI_REQUEST_TIMEOUT_SECONDS, regardless of how
+# many keys end up configured.
+MAX_KEYS_TO_TRY_PER_CALL = 4
+GEMINI_REQUEST_TIMEOUT_SECONDS = 7
 
 
-# Five API keys are supported.
-MAX_CONFIGURED_KEYS = 5
-
-# Maximum time for one HTTP request.
-GEMINI_REQUEST_TIMEOUT_SECONDS = 15
-
-# Maximum output size for finding analysis.
-MAX_OUTPUT_TOKENS_FINDING = 1800
-
-# Maximum output size for direct file analysis.
-MAX_OUTPUT_TOKENS_FILE = 3000
-
-
-# ============================================================
-# KEY ROTATION
-# ============================================================
-
-_KEY_LOCK = threading.Lock()
-
-_NEXT_KEY_INDEX = 0
-
-
-def _get_api_keys():
+def _parse_rate_limit_info(resp):
     """
-    Load configured Gemini API keys.
-
-    Preferred:
-        GEMINI_API_KEY_1
-        GEMINI_API_KEY_2
-        ...
-        GEMINI_API_KEY_5
-
-    Older:
-        GEMINI_API_KEY
+    Reads Google's 429 error body to figure out how long to wait and whether
+    this is a short per-minute limit or the daily free-tier cap. Returns
+    (retry_seconds_or_None, is_daily_limit).
     """
-
-    keys = []
-
-    for index in range(
-        1,
-        MAX_CONFIGURED_KEYS + 1,
-    ):
-
-        value = os.getenv(
-            f"GEMINI_API_KEY_{index}"
-        )
-
-        if value and value.strip():
-
-            key = value.strip()
-
-            if key not in keys:
-                keys.append(key)
-
-    # Backward compatibility.
-    old_key = os.getenv(
-        "GEMINI_API_KEY"
-    )
-
-    if (
-        old_key
-        and old_key.strip()
-        and old_key.strip() not in keys
-    ):
-
-        keys.append(
-            old_key.strip()
-        )
-
-    return keys
-
-
-def _ordered_api_keys():
-    """
-    Return configured keys in rotating order.
-
-    Example:
-
-        first call:
-        key1, key2, key3, key4, key5
-
-        second call:
-        key2, key3, key4, key5, key1
-
-    This distributes requests instead of always starting
-    with the first key.
-    """
-
-    global _NEXT_KEY_INDEX
-
-    keys = _get_api_keys()
-
-    if not keys:
-        return []
-
-    with _KEY_LOCK:
-
-        start = (
-            _NEXT_KEY_INDEX
-            % len(keys)
-        )
-
-        _NEXT_KEY_INDEX = (
-            _NEXT_KEY_INDEX + 1
-        ) % len(keys)
-
-    return (
-        keys[start:]
-        + keys[:start]
-    )
-
-
-# ============================================================
-# RATE-LIMIT HELPERS
-# ============================================================
-
-def _parse_rate_limit_info(
-    response,
-):
-    """
-    Extract retry information from a Gemini
-    429 response when available.
-    """
-
     try:
-
-        data = response.json()
-
-    except (
-        ValueError,
-        json.JSONDecodeError,
-    ):
-
+        data = resp.json()
+    except (ValueError, json.JSONDecodeError):
         return None, False
 
-    error = data.get(
-        "error",
-        {},
-    )
-
-    details = error.get(
-        "details",
-        [],
-    )
-
+    error = data.get("error", {})
+    details = error.get("details", [])
     retry_seconds = None
     is_daily = False
 
-    for detail in details:
-
-        type_string = detail.get(
-            "@type",
-            "",
-        )
-
-        if type_string.endswith(
-            "RetryInfo"
-        ):
-
-            delay = detail.get(
-                "retryDelay",
-                "",
-            )
-
+    for d in details:
+        type_str = d.get("@type", "")
+        if type_str.endswith("RetryInfo"):
+            delay = d.get("retryDelay", "")
             try:
-
-                retry_seconds = float(
-                    str(delay).rstrip("s")
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-
+                retry_seconds = float(str(delay).rstrip("s"))
+            except ValueError:
                 pass
-
-        if type_string.endswith(
-            "QuotaFailure"
-        ):
-
-            for violation in detail.get(
-                "violations",
-                [],
-            ):
-
-                combined = (
-                    f"{violation.get('quotaId', '')} "
-                    f"{violation.get('quotaMetric', '')}"
-                )
-
-                if (
-                    "PerDay" in combined
-                    or "per_day" in combined
-                ):
-
+        if type_str.endswith("QuotaFailure"):
+            for v in d.get("violations", []):
+                combined = f"{v.get('quotaId', '')} {v.get('quotaMetric', '')}"
+                if "PerDay" in combined or "per_day" in combined:
                     is_daily = True
 
-    return (
-        retry_seconds,
-        is_daily,
-    )
+    return retry_seconds, is_daily
 
 
-def _build_rate_limit_message(
-    retry_seconds,
-    is_daily,
-):
+def _build_rate_limit_message(retry_seconds, is_daily):
+    """Turns the parsed rate-limit details into one plain-English sentence."""
     if is_daily:
-
         if retry_seconds:
-
-            minutes = max(
-                1,
-                math.ceil(
-                    retry_seconds / 60
-                ),
-            )
-
-            return (
-                "The Gemini daily usage limit "
-                "has been reached. Try again "
-                f"in about {minutes} minute(s)."
-            )
-
-        return (
-            "The Gemini daily usage limit "
-            "has been reached. Please try "
-            "again after the quota resets."
-        )
+            minutes = max(1, math.ceil(retry_seconds / 60))
+            return f"The free AI usage limit for today has been reached. Try again in about {minutes} minute(s), or after Google's daily reset (midnight Pacific Time, US)."
+        return "The free AI usage limit for today has been reached. It resets at midnight Pacific Time (US) - please try again after that."
 
     if retry_seconds:
-
         if retry_seconds < 60:
+            wait = int(retry_seconds) + 5  # small buffer
+            return f"The AI is temporarily busy. Try again in about {wait} seconds."
+        minutes = max(1, math.ceil(retry_seconds / 60))
+        return f"The AI is temporarily busy. Try again in about {minutes} minute(s)."
 
-            seconds = (
-                int(retry_seconds)
-                + 3
-            )
+    return "The AI usage limit has been reached for now. Please try again in a minute or two."
 
-            return (
-                "Gemini is temporarily "
-                f"rate-limited. Try again "
-                f"in about {seconds} seconds."
-            )
+SYSTEM_PROMPT = """You are an expert code reviewer helping explain bugs to developers. Your goal is to provide clear, 
+actionable solutions that can be immediately applied.
 
-        minutes = max(
-            1,
-            math.ceil(
-                retry_seconds / 60
-            ),
+For each reported issue, provide a response with:
+1. **cause**: Explain EXACTLY why this code is problematic in 2-3 sentences, no jargon.
+2. **solution_type**: Choose from "replace", "add", "remove", or "create_file" - pick the most direct fix.
+3. **replacement_code**: For "replace" solutions, provide the EXACT corrected code that can be directly substituted.
+   - Keep variable names and structure identical
+   - Only modify the problematic part
+   - Ensure it's production-ready and handles edge cases
+4. **solution**: ONE clear, complete, specific passage (2-4 sentences) that fully explains the fix -
+   what exactly to change or do, in concrete terms tied to this exact code (line numbers, variable
+   names, the exact characters involved), not generic advice that could apply to any bug of this
+   type. This is the ONLY place the person reads for "what do I do" - do not split this into a vague
+   intro plus a separate action elsewhere; say everything they need in this one passage. If the fix
+   is a code replacement, describe what changed and why, since the code itself is also shown separately.
+5. **explanation**: Provide a brief technical explanation of why the fix works.
+6. **confidence**: An integer from 0 to 100 for THIS SPECIFIC finding, reflecting how confident you are that
+   (a) this is genuinely a real, correctly-diagnosed problem given the code and context shown, and
+   (b) the fix you're proposing actually resolves it correctly and completely.
+   Use the full range honestly - a solid, unambiguous fix for a clear-cut issue deserves 90-100.
+   A fix you're reasonably sure about but that depends on context you can't fully see deserves 60-85.
+   Anything you're genuinely unsure about, where the retrieved historical evidence is thin or the fix
+   is a best guess, deserves 30-55. Do not default to a single "safe" number every time - vary it
+   honestly based on the actual evidence for this specific finding.
+
+CRITICAL RULES:
+- If solution_type is "replace", replacement_code MUST NEVER be null or empty. Always provide working code.
+- If you cannot provide a concrete fix, use solution_type "add" or set insufficient_evidence to true.
+- Do not paraphrase or restructure unrelated code.
+- Provide solutions that are immediately applicable to the codebase.
+- Consider edge cases and error handling in your fixes.
+
+Reply with ONLY a JSON object, no markdown fences or extra text:
+{
+  "error": string,
+  "bug_type": one of ["Runtime Error","Logic Error","Syntax Error","Type Error","Dependency Error","Security Issue","Performance Issue","API Error","Unnecessary Code","Other"],
+  "cause": string,
+  "why_occurs": string,
+  "solution_type": one of ["replace","add","remove","create_file"],
+  "solution": string,
+  "replacement_code": string or null,
+  "add_location": string or null,
+  "new_file_path": string or null,
+  "explanation": string,
+  "confidence": integer from 0 to 100,
+  "insufficient_evidence": boolean
+}"""
+
+
+def _build_user_message(finding: dict, retrieved: list) -> str:
+    """Build the Gemini prompt with local RAG and historical GitHub evidence."""
+    dataset_items = []
+    github_items = []
+
+    for r in retrieved or []:
+        record = r.get("record", {}) or {}
+        similarity = float(r.get("similarity", 0) or 0)
+
+        source_text = str(
+            record.get("dataset_source")
+            or record.get("source")
+            or record.get("source_type")
+            or ""
+        ).lower()
+        artifact_type = str(
+            record.get("artifact_type")
+            or record.get("type")
+            or ""
+        ).lower()
+
+        is_github_artifact = (
+            "github" in source_text
+            or "issue" in source_text
+            or "pull request" in source_text
+            or "pull_request" in source_text
+            or artifact_type in {"issue", "pull_request", "pr"}
+            or "github" in artifact_type
         )
 
-        return (
-            "Gemini is temporarily "
-            f"rate-limited. Try again "
-            f"in about {minutes} minute(s)."
+        if is_github_artifact:
+            github_items.append((record, similarity))
+        else:
+            dataset_items.append((record, similarity))
+
+    dataset_block = "\n\n".join(
+        f"- Dataset: {r.get('dataset_source', 'Unknown')}\n"
+        f"  Bug type: {r.get('bug_type', 'Unknown')}\n"
+        f"  Description: {r.get('bug_description', 'N/A')}\n"
+        f"  Previous solution: {r.get('solution', 'N/A')}\n"
+        f"  Similarity: {round(similarity * 100, 1)}%"
+        for r, similarity in dataset_items
+    ) or "(no similar bugs found in the local knowledge base)"
+
+    github_parts = []
+    for r, similarity in github_items:
+        artifact_type = r.get("artifact_type") or r.get("type") or "GitHub artifact"
+        title = r.get("title") or "Untitled"
+        body = str(r.get("body") or "(no description)")[:5000]
+        state = r.get("state") or "unknown"
+        url = r.get("url") or r.get("html_url") or "N/A"
+        comments = str(r.get("comments") or "")[:4000]
+        patch = str(r.get("patch") or "")[:6000]
+
+        labels = r.get("labels") or []
+        if isinstance(labels, list):
+            label_names = []
+            for label in labels:
+                if isinstance(label, dict) and label.get("name"):
+                    label_names.append(str(label["name"]))
+                elif label:
+                    label_names.append(str(label))
+            labels_text = ", ".join(label_names) or "None"
+        else:
+            labels_text = str(labels)
+
+        text = (
+            f"### {str(artifact_type).upper()}\n"
+            f"Title: {title}\n"
+            f"State: {state}\n"
+            f"Labels: {labels_text}\n"
+            f"URL: {url}\n"
+            f"Similarity: {round(similarity * 100, 1)}%\n"
+            f"Description:\n{body}\n"
         )
-
-    return (
-        "Gemini is temporarily "
-        "rate-limited. Please try again."
-    )
-
-
-# ============================================================
-# JSON CLEANING
-# ============================================================
-
-def _clean_json_text(
-    raw_text,
-):
-    """
-    Remove common markdown wrappers around JSON.
-    """
-
-    if not raw_text:
-        return ""
-
-    cleaned = raw_text.strip()
-
-    if cleaned.startswith(
-        "```json"
-    ):
-
-        cleaned = cleaned[
-            len("```json"):
-        ].strip()
-
-    elif cleaned.startswith(
-        "```"
-    ):
-
-        cleaned = cleaned[
-            len("```"):
-        ].strip()
-
-    if cleaned.endswith(
-        "```"
-    ):
-
-        cleaned = cleaned[
-            :-3
-        ].strip()
-
-    return cleaned
-
-
-def _parse_json(
-    raw_text,
-):
-    cleaned = _clean_json_text(
-        raw_text
-    )
-
-    try:
-
-        return json.loads(
-            cleaned
-        )
-
-    except (
-        ValueError,
-        json.JSONDecodeError,
-    ):
-
-        return None
-
-
-# ============================================================
-# GEMINI REQUEST
-# ============================================================
-
-def _request_gemini(
-    payload,
-):
-    """
-    Try the configured Gemini keys until one succeeds.
-
-    Returns:
-
-        {
-            "ok": True,
-            "data": ...,
-            "key_number": ...
-        }
-
-    or:
-
-        {
-            "ok": False,
-            "rate_limited": bool,
-            "message": ...
-        }
-    """
-
-    keys = _ordered_api_keys()
-
-    if not keys:
-
-        return {
-            "ok": False,
-            "rate_limited": False,
-            "message": (
-                "No Gemini API keys configured."
-            ),
-        }
-
-    last_error = None
-    last_429 = None
-
-    for position, api_key in enumerate(
-        keys,
-        start=1,
-    ):
-
-        try:
-
-            response = requests.post(
-                GEMINI_URL,
-                params={
-                    "key": api_key,
-                },
-                json=payload,
-                timeout=(
-                    GEMINI_REQUEST_TIMEOUT_SECONDS
-                ),
-            )
-
-            if response.status_code == 200:
-
-                try:
-
-                    return {
-                        "ok": True,
-                        "data": response.json(),
-                        "key_number": position,
-                    }
-
-                except (
-                    ValueError,
-                    json.JSONDecodeError,
-                ):
-
-                    last_error = (
-                        "Gemini returned invalid JSON."
-                    )
-
-                    continue
-
-            if response.status_code == 429:
-
-                last_429 = response
-
-                last_error = (
-                    f"Key {position} "
-                    "was rate-limited."
-                )
-
-                # Move immediately to the next key.
-                continue
-
-            if response.status_code in (
-                500,
-                502,
-                503,
-                504,
-            ):
-
-                last_error = (
-                    f"Key {position} "
-                    f"returned HTTP "
-                    f"{response.status_code}."
-                )
-
-                continue
-
-            last_error = (
-                f"Key {position} "
-                f"returned HTTP "
-                f"{response.status_code}: "
-                f"{response.text[:200]}"
-            )
-
-        except requests.Timeout:
-
-            last_error = (
-                f"Key {position} "
-                "timed out."
-            )
-
-            continue
-
-        except requests.RequestException as exc:
-
-            last_error = (
-                f"Key {position} "
-                f"request failed: {exc}"
-            )
-
-            continue
-
-        except Exception as exc:
-
-            last_error = (
-                f"Key {position} "
-                f"unexpected error: {exc}"
-            )
-
-            continue
-
-    if last_429 is not None:
-
-        retry_seconds, is_daily = (
-            _parse_rate_limit_info(
-                last_429
-            )
-        )
-
-        return {
-            "ok": False,
-            "rate_limited": True,
-            "message": _build_rate_limit_message(
-                retry_seconds,
-                is_daily,
-            ),
-        }
-
-    return {
-        "ok": False,
-        "rate_limited": False,
-        "message": (
-            last_error
-            or "All Gemini API keys failed."
-        ),
-    }
-
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
-
-SYSTEM_PROMPT = """
-You are an expert software debugging assistant.
-
-Your job is to analyze the supplied code and determine whether
-the reported issue is a genuine software problem.
-
-Do not invent bugs.
-
-For every genuine issue, provide:
-
-1. cause
-   Explain exactly why the code is problematic.
-
-2. solution_type
-   One of:
-   - replace
-   - add
-   - remove
-   - create_file
-
-3. replacement_code
-   If solution_type is replace, provide the complete corrected
-   code that can directly replace the supplied problematic code.
-
-4. solution
-   Give a concrete, specific explanation of exactly what the
-   developer should change.
-
-5. explanation
-   Explain why the proposed correction works.
-
-6. confidence
-   Integer from 0 to 100.
-   This must represent confidence in BOTH:
-   - the diagnosis
-   - the proposed correction
-
-7. insufficient_evidence
-   true if the supplied context is not sufficient to make a
-   reliable conclusion.
-
-Important rules:
-
-- Do not modify unrelated code.
-- Do not invent missing variables or APIs.
-- Preserve existing variable names where possible.
-- A replacement solution MUST contain replacement_code.
-- Do not give a generic solution when the supplied code allows
-  a specific solution.
-- Historical examples are evidence, not proof that the current
-  bug is identical.
-- If historical evidence conflicts with the supplied code,
-  prioritize the supplied code.
-- Return JSON only.
+        if comments:
+            text += f"Comments / Discussion:\n{comments}\n"
+        if patch:
+            text += f"Previous Patch / Fix:\n{patch}\n"
+        if r.get("merged") is not None:
+            text += f"Merged: {r.get('merged')}\n"
+        if r.get("merged_at"):
+            text += f"Merged At: {r.get('merged_at')}\n"
+        github_parts.append(text)
+
+    github_block = "\n\n".join(github_parts) or "(no relevant historical GitHub Issues or Pull Requests found)"
+
+    return f"""**Candidate Issue from Static Analysis:**
+
+**File:** {finding.get('file')}
+**Function:** {finding.get('function') or 'N/A'}
+**Lines:** {finding.get('line_start')}-{finding.get('line_end')}
+**Rule:** {finding.get('rule')}
+**Initial Assessment:** {finding.get('error')} ({finding.get('bug_type')})
+**Detector's Note:** {finding.get('cause')}
+
+**Current Code:**
+```
+{finding.get('current_code')}
+```
+
+**Historical Context - Local Knowledge Base:**
+{dataset_block}
+
+**Historical GitHub Evidence:**
+The following Issues and Pull Requests were retrieved from the repository because they are similar to the current candidate.
+
+{github_block}
+
+Use historical GitHub artifacts as supporting evidence. Do not blindly copy an old patch; prioritize the current code when it differs.
+
+**Your Task:**
+Analyze this candidate and provide the smallest reliable code replacement that fixes the reported bug. Use relevant historical evidence to improve the diagnosis and fix. If the exact fix cannot be determined safely from the current code and available evidence, set insufficient_evidence=true.
 """
 
 
-# ============================================================
-# FINDING PROMPT
-# ============================================================
-
-def _build_user_message(
-    finding,
-    retrieved,
-):
-    historical_parts = []
-
-    for item in (
-        retrieved or []
-    ):
-
-        record = item.get(
-            "record",
-            {},
-        )
-
-        historical_parts.append(
-            "\n".join(
-                [
-                    f"Dataset: {record.get('dataset_source', 'Unknown')}",
-                    f"Bug type: {record.get('bug_type', 'Unknown')}",
-                    f"Description: {record.get('bug_description', '')}",
-                    f"Historical solution: {record.get('solution', '')}",
-                    (
-                        "Similarity: "
-                        f"{round(item.get('similarity', 0) * 100)}%"
-                    ),
-                ]
-            )
-        )
-
-    historical_context = (
-        "\n\n".join(
-            historical_parts
-        )
-        if historical_parts
-        else
-        "(No similar historical bugs were retrieved.)"
-    )
-
-    return f"""
-Analyze the following detected issue.
-
-FILE:
-{finding.get('file')}
-
-FUNCTION:
-{finding.get('function') or 'N/A'}
-
-LINES:
-{finding.get('line_start')} - {finding.get('line_end')}
-
-BUG TYPE:
-{finding.get('bug_type')}
-
-DETECTOR:
-{finding.get('rule')}
-
-DETECTOR MESSAGE:
-{finding.get('error')}
-
-DETECTOR CAUSE:
-{finding.get('cause')}
-
-CURRENT CODE:
---------------------
-{finding.get('current_code', '')}
---------------------
-
-HISTORICAL RAG CONTEXT:
-=======================
-{historical_context}
-=======================
-
-Determine whether the detected problem is genuine.
-
-If it is genuine:
-- explain the exact cause
-- provide a concrete solution
-- provide corrected code when appropriate
-- use historical context when it is relevant
-- do not blindly copy a historical solution
-
-If the detector appears to be wrong or there is insufficient
-context, lower confidence and set insufficient_evidence to true.
-
-Return ONLY the required JSON object.
-"""
-
-
-# ============================================================
-# FALLBACK CONFIDENCE
-# ============================================================
-
+# How confident the FALLBACK path (no live LLM call) can honestly be in
+# its own suggested fix, per rule. This varies deliberately - a rule with
+# an exact, verified string-substitution fix (like eq_none: "== None" -> "is None")
+# deserves a much higher number than one with only generic advice and no
+# computed replacement (like empty_catch_block, which just says "add a
+# console.error"). This is about confidence in the FIX, not confidence
+# that the underlying finding is real - every finding these detectors
+# produce is already a 100%-certain fact (a real syntax error, or
+# provably unreachable code), independent of this fallback quality score.
 FALLBACK_CONFIDENCE_BY_RULE = {
-    "eq_none": 90,
-    "loose_equality": 90,
-    "leftover_console_statement": 90,
-    "leftover_debugger_statement": 90,
-    "unreachable_code": 95,
+    "possibly_unused_function": 60,
     "bare_except": 85,
-    "var_declaration": 85,
-    "leftover_debug_print": 85,
-    "unterminated_string": 75,
-    "unterminated_template_literal": 75,
-    "unterminated_comment": 75,
+    "mutable_default_arg": 55,
+    "eq_none": 90,
+    "possible_division_by_zero": 50,
     "syntax_error": 70,
     "unclosed_bracket": 65,
     "mismatched_bracket": 65,
     "unexpected_closing_bracket": 65,
-    "possibly_unused_function": 60,
-    "mutable_default_arg": 55,
-    "possible_division_by_zero": 50,
+    "unterminated_string": 75,
+    "unterminated_template_literal": 75,
+    "unterminated_comment": 75,
+    "loose_equality": 90,
+    "var_declaration": 85,
     "empty_catch_block": 55,
+    "leftover_console_statement": 90,
+    "leftover_debugger_statement": 90,
+    "leftover_debug_print": 85,
+    "unreachable_code": 95,  # deleting provably-dead code is always a safe, correct fix
 }
-
 DEFAULT_FALLBACK_CONFIDENCE = 40
 
+# Pulls the exact character(s) the detector already identified out of its
+# "error" string, so the fallback solution can name them specifically
+# ("add the missing '}'") instead of falling back to generic advice
+# ("check every bracket near this line") when the detector already knows
+# precisely which bracket and which problem this is.
+UNCLOSED_CHAR_RE = re.compile(r"Unclosed '(.)'")
+MISMATCHED_CHARS_RE = re.compile(r"found '(.)', expected '(.)'")
+UNEXPECTED_CHAR_RE = re.compile(r"Unexpected '(.)'")
+BRACKET_CLOSER = {"(": ")", "[": "]", "{": "}"}
 
-# ============================================================
-# FALLBACK HELPERS
-# ============================================================
+# Matches a single-line-signature mutable default like "bucket=[]", "cfg={}",
+# or "seen=set()" - covers the common case the fallback path can fix safely
+# without a real parser (multi-line signatures are left alone, see below).
+MUTABLE_DEFAULT_RE = re.compile(r"(\w+)\s*=\s*(\[\]|\{\}|set\(\))")
 
-BRACKET_CLOSER = {
-    "(": ")",
-    "[": "]",
-    "{": "}",
+# Matches an empty catch block, with or without a captured error variable,
+# e.g. "catch (err) {}", "catch (Exception e) {}", or "catch {}".
+EMPTY_CATCH_WITH_PARAM_RE = re.compile(r"catch\s*\(([^)]*)\)\s*\{\s*\}")
+EMPTY_CATCH_NO_PARAM_RE = re.compile(r"catch\s*\{\s*\}")
+
+CATCH_LOG_STATEMENT_BY_EXTENSION = {
+    ".js": "console.error({var});", ".jsx": "console.error({var});",
+    ".ts": "console.error({var});", ".tsx": "console.error({var});",
+    ".java": "{var}.printStackTrace();",
+    ".cs": "Console.WriteLine({var});",
+    ".cpp": "std::cerr << {var}.what() << std::endl;",
+    ".php": "error_log({var}->getMessage());",
 }
 
-UNCLOSED_RE = re.compile(
-    r"Unclosed '(.+?)'"
-)
 
-MISMATCHED_RE = re.compile(
-    r"found '(.+?)', expected '(.+?)'"
-)
-
-UNEXPECTED_RE = re.compile(
-    r"Unexpected '(.+?)'"
-)
-
-
-def _fix_mutable_default(
-    code,
-):
+def _fix_mutable_default_arg(current_code: str):
     """
-    Try a simple deterministic fix for:
-        def f(x=[]):
+    Mechanically rewrites a one-line function signature with a mutable
+    default argument into the safe None-default pattern, e.g.:
+        def add_item(item, bucket=[]):        ->  def add_item(item, bucket=None):
+            bucket.append(item)                        if bucket is None:
+                                                            bucket = []
+                                                        bucket.append(item)
+    Returns None (never a half-applied guess) when the default can't be
+    confidently located, so the caller can fall back to plain-text advice
+    instead of claiming code is shown when it isn't.
     """
-
-    if not code:
-        return None
-
-    match = re.search(
-        r"(\w+)\s*=\s*(\[\]|\{\}|set\(\))",
-        code,
-    )
-
-    if not match:
-        return None
-
-    name = match.group(1)
-    original = match.group(2)
-
-    replacement = (
-        "[]" if original == "[]"
-        else "{}" if original == "{}"
-        else "set()"
-    )
-
-    updated = (
-        code[:match.start()]
-        + f"{name}=None"
-        + code[match.end():]
-    )
-
-    lines = updated.splitlines()
-
+    lines = current_code.splitlines()
     if not lines:
         return None
 
-    indentation = "    "
+    match = MUTABLE_DEFAULT_RE.search(lines[0])
+    if not match:
+        return None
 
-    if len(lines) > 1:
+    param_name, literal = match.group(1), match.group(2)
+    default_value = {"[]": "[]", "{}": "{}", "set()": "set()"}[literal]
+    new_signature = lines[0][:match.start()] + f"{param_name}=None" + lines[0][match.end():]
 
-        stripped = (
-            lines[1].lstrip()
-        )
+    body_lines = lines[1:]
+    indent = "    "
+    if body_lines:
+        stripped = body_lines[0].lstrip()
+        indent = body_lines[0][:len(body_lines[0]) - len(stripped)] or indent
 
-        indentation = (
-            lines[1][
-                :len(lines[1])
-                - len(stripped)
-            ]
-            or "    "
-        )
-
-    guard = [
-        f"{indentation}if {name} is None:",
-        f"{indentation}    {name} = {replacement}",
-    ]
-
-    return "\n".join(
-        [lines[0]]
-        + guard
-        + lines[1:]
-    )
+    guard = [f"{indent}if {param_name} is None:", f"{indent}    {param_name} = {default_value}"]
+    return "\n".join([new_signature] + guard + body_lines)
 
 
-# ============================================================
-# FALLBACK REPORT
-# ============================================================
-
-def _fallback_report(
-    finding,
-):
+def _fix_empty_catch(current_code: str, file_path: str):
     """
-    Deterministic fallback used when Gemini cannot be reached.
-
-    This is NOT presented as LLM reasoning.
+    Mechanically rewrites a one-line empty catch block into one that logs
+    the error, using a log statement appropriate to the file's language
+    (inferred from its extension) and re-using whatever variable name the
+    catch clause already captured. Returns None if no empty catch pattern
+    is found, rather than guessing.
     """
+    ext = os.path.splitext(file_path or "")[1]
+    log_template = CATCH_LOG_STATEMENT_BY_EXTENSION.get(ext)
+    if not log_template:
+        return None
 
-    rule = finding.get(
-        "rule",
-        "",
-    )
+    match = EMPTY_CATCH_WITH_PARAM_RE.search(current_code)
+    if match:
+        param_str = match.group(1).strip()
+        var_match = re.search(r"(\$?\w+)\s*$", param_str)
+        var_name = var_match.group(1) if var_match else "e"
+        log_stmt = log_template.format(var=var_name)
+        return current_code[:match.start()] + f"catch ({param_str}) {{ {log_stmt} }}" + current_code[match.end():]
 
-    code = finding.get(
-        "current_code",
-        "",
-    ) or ""
+    match = EMPTY_CATCH_NO_PARAM_RE.search(current_code)
+    if match:
+        var_name = "err" if ext in (".js", ".jsx", ".ts", ".tsx") else "e"
+        log_stmt = log_template.format(var=var_name)
+        return current_code[:match.start()] + f"catch ({var_name}) {{ {log_stmt} }}" + current_code[match.end():]
 
-    error = finding.get(
-        "error",
-        "",
-    ) or ""
+    return None
 
-    cause = finding.get(
-        "cause",
-        "",
-    ) or ""
 
-    solution_type = "add"
+def _fallback_report(finding: dict) -> dict:
+    """Used when no LLM reasoning is available - either no API key is configured, or the
+    live LLM call failed/timed out. Kept in plain, non-technical English since this is
+    shown directly to the end user - technical failure details are logged to the server
+    console instead (see analyze_finding), never shown in the UI.
+
+    Every rule every detector can produce gets a real, specific template here - no rule
+    should ever fall through to a generic "review and fix it" message. Each one sets a
+    single `solution` string that stands completely on its own (what's wrong here,
+    specifically, and exactly what to do about it) rather than the old split between a
+    generic intro sentence and a separate action sentence - for the three bracket rules
+    in particular, that generic intro used to be the same wording no matter which
+    specific bracket or which specific problem the detector had already identified, even
+    though that exact detail (which character, unclosed vs mismatched vs unexpected) was
+    sitting right there in the detector's own `error` string. This pulls it out and names
+    it directly instead of leaving the person to re-derive it from the code themselves.
+    """
+    rule = finding.get("rule", "")
+    bug_type = finding.get("bug_type", "Other")
+    current_code = finding.get("current_code", "") or ""
+    error_text = finding.get("error", "") or ""
+    cause_from_detector = finding.get("cause", "")
+
+    # Defaults - overridden below per rule. solution_type "replace" needs
+    # replacement_code; "remove" and "add" generally don't need it filled in
+    # for a deterministic fallback since there's nothing left to guess.
+    solution_type = "replace"
     solution = ""
     replacement_code = None
     add_location = None
-
-    # --------------------------------------------------------
-    # UNUSED FUNCTION
-    # --------------------------------------------------------
+    cause = cause_from_detector
 
     if rule == "possibly_unused_function":
-
         solution_type = "remove"
-
-        solution = (
-            "Remove this function if it is not intentionally "
-            "used from another module. The detector could not "
-            "find a call to it in the analyzed file."
-        )
-
-    # --------------------------------------------------------
-    # BARE EXCEPT
-    # --------------------------------------------------------
+        solution = "Delete this function. It isn't called anywhere else in this file, so removing it has no effect on behavior - if it turns out to be used from another file this detector can't see, undo the deletion instead of guessing."
 
     elif rule == "bare_except":
-
         solution_type = "replace"
-
-        replacement_code = code.replace(
-            "except:",
-            "except Exception as e:",
-            1,
-        )
-
-        solution = (
-            "Replace the bare except with "
-            "'except Exception as e:'. A bare except also "
-            "catches system-level exceptions such as "
-            "KeyboardInterrupt and SystemExit."
-        )
-
-    # --------------------------------------------------------
-    # MUTABLE DEFAULT
-    # --------------------------------------------------------
+        replacement_code = current_code.replace("except:", "except Exception as e:", 1)
+        solution = "Replace the bare 'except:' with 'except Exception as e:', as shown below. A bare except also catches things like KeyboardInterrupt and SystemExit, which should almost never be silently swallowed - naming Exception avoids that while still catching ordinary errors."
 
     elif rule == "mutable_default_arg":
-
-        replacement_code = (
-            _fix_mutable_default(
-                code
-            )
-        )
-
+        replacement_code = _fix_mutable_default_arg(current_code)
         if replacement_code:
-
             solution_type = "replace"
-
-            solution = (
-                "Use None as the default and create a new "
-                "list, dictionary, or set inside the function. "
-                "The current mutable default object can be "
-                "shared between multiple function calls."
-            )
-
+            solution = "Replace this signature with the version below: change the default to None, then create a fresh list/dict/set inside the function body on first use. The current version reuses the SAME object across every call, so items added in one call silently show up in the next."
         else:
-
+            # Couldn't mechanically locate the mutable default in the captured
+            # snippet (e.g. a multi-line signature) - never claim code is
+            # "shown below" and then show nothing.
             solution_type = "add"
-
-            solution = (
-                "Change the mutable default to None and "
-                "initialize a new list, dictionary, or set "
-                "inside the function before using it."
-            )
-
-    # --------------------------------------------------------
-    # NONE COMPARISON
-    # --------------------------------------------------------
+            solution = "Change the default value to None, then add 'if <param> is None: <param> = []' (or {} / set(), matching whatever the original default was) as the first line inside the function body. This function's mutable default is currently shared across every call to it, which usually isn't intended."
 
     elif rule == "eq_none":
-
         solution_type = "replace"
-
-        replacement_code = (
-            code
-            .replace(
-                "== None",
-                "is None",
-            )
-            .replace(
-                "!= None",
-                "is not None",
-            )
-        )
-
-        solution = (
-            "Use 'is None' or 'is not None' instead of "
-            "equality operators when checking against None."
-        )
-
-    # --------------------------------------------------------
-    # DIVISION BY ZERO
-    # --------------------------------------------------------
+        replacement_code = current_code.replace("== None", "is None").replace("!= None", "is not None")
+        solution = "Replace '==' / '!=' with 'is' / 'is not' when comparing to None, as shown below. 'is' checks identity directly and can't be fooled by a custom __eq__ method, which is why it's the correct way to check for None in Python."
 
     elif rule == "possible_division_by_zero":
-
         solution_type = "add"
-
-        add_location = (
-            "Add the validation immediately before "
-            "the division."
-        )
-
-        solution = (
-            "Check that the denominator is not zero before "
-            "performing the division. Decide whether the "
-            "program should return a default value, skip the "
-            "operation, or raise a meaningful error."
-        )
-
-    # --------------------------------------------------------
-    # SYNTAX ERROR
-    # --------------------------------------------------------
+        add_location = "Add this check on the line right before the division."
+        replacement_code = "if denominator != 0:  # replace 'denominator' with your actual variable name"
+        solution = "Add a check that the denominator isn't zero before this line runs (see the line to add below), and decide what should happen when it is - skip the calculation, return a default value, or raise a clear error instead of letting the program crash with a ZeroDivisionError."
 
     elif rule == "syntax_error":
-
         solution_type = "replace"
-
-        solution = (
-            "Correct the syntax problem reported by the "
-            "parser. The exact parser message is: "
-            f"{cause}"
-        )
-
-    # --------------------------------------------------------
-    # UNCLOSED BRACKET
-    # --------------------------------------------------------
+        cause = f"Python's own parser could not read this code. The exact reason it gave was: \"{cause_from_detector}\"."
+        solution = f"Edit this line to fix the specific problem Python's parser reported: {cause_from_detector}. The file won't run at all until this is fixed, since Python can't even finish reading it - after editing, re-run the file (or 'python -m py_compile <file>') to confirm it now parses cleanly."
 
     elif rule == "unclosed_bracket":
-
         solution_type = "replace"
-
-        match = UNCLOSED_RE.search(
-            error
-        )
-
-        opener = (
-            match.group(1)
-            if match
-            else "{"
-        )
-
-        closer = BRACKET_CLOSER.get(
-            opener,
-            "}",
-        )
-
+        m = UNCLOSED_CHAR_RE.search(error_text)
+        opener = m.group(1) if m else "{"
+        closer = BRACKET_CLOSER.get(opener, "}")
         solution = (
-            f"Add the missing '{closer}' corresponding "
-            f"to the opening '{opener}'. Check the surrounding "
-            "block or expression to ensure the brackets are "
-            "properly balanced."
+            f"A '{opener}' was opened here but is never closed anywhere in the rest of the file. "
+            f"Add the missing '{closer}' at the point where this block, function call, or expression "
+            f"is meant to end - if you're not sure exactly where, work outward from this line counting "
+            f"'{opener}' and '{closer}' until you find the spot where one is missing."
         )
-
-    # --------------------------------------------------------
-    # MISMATCHED BRACKET
-    # --------------------------------------------------------
 
     elif rule == "mismatched_bracket":
-
         solution_type = "replace"
-
-        match = MISMATCHED_RE.search(
-            error
+        m = MISMATCHED_CHARS_RE.search(error_text)
+        found, expected = (m.group(1), m.group(2)) if m else ("?", "?")
+        solution = (
+            f"This should be a closing '{expected}' to match the bracket opened earlier, but '{found}' "
+            f"appears instead. Either replace it with '{expected}', or - if '{found}' is actually correct "
+            f"here - check whether an earlier bracket in this block was closed at the wrong spot, since "
+            f"that would make this one line up with the wrong opener."
         )
-
-        if match:
-
-            found = match.group(1)
-            expected = match.group(2)
-
-            solution = (
-                f"The code contains '{found}' where "
-                f"'{expected}' is expected. Correct the "
-                "closing bracket or check an earlier opening "
-                "bracket that may have been closed incorrectly."
-            )
-
-        else:
-
-            solution = (
-                "Correct the mismatched opening and closing "
-                "brackets around this code."
-            )
-
-    # --------------------------------------------------------
-    # UNEXPECTED BRACKET
-    # --------------------------------------------------------
 
     elif rule == "unexpected_closing_bracket":
-
-        solution_type = "remove"
-
-        match = UNEXPECTED_RE.search(
-            error
-        )
-
-        character = (
-            match.group(1)
-            if match
-            else "bracket"
-        )
-
+        solution_type = "replace"
+        m = UNEXPECTED_CHAR_RE.search(error_text)
+        closer = m.group(1) if m else "}"
         solution = (
-            f"Remove the unexpected '{character}' if it "
-            "does not belong to the surrounding expression. "
-            "Otherwise add the corresponding opening bracket "
-            "at the correct location."
+            f"This '{closer}' has no matching opening bracket anywhere before it in the file. Either "
+            f"delete this extra '{closer}', or - if it's meant to close something real - add the missing "
+            f"opening bracket earlier in the code where that block, call, or expression actually starts."
         )
-
-    # --------------------------------------------------------
-    # UNTERMINATED STRING
-    # --------------------------------------------------------
 
     elif rule == "unterminated_string":
-
         solution_type = "replace"
-
-        solution = (
-            "Add the missing closing quote so that the string "
-            "is properly terminated."
-        )
-
-    # --------------------------------------------------------
-    # TEMPLATE LITERAL
-    # --------------------------------------------------------
+        solution = "Add the missing closing quote at the end of this string - it needs to match whichever quote character (' or \") opened it. A string can't span multiple lines unless it's a template literal (backticks) or a triple-quoted string, so a missing quote here usually means the string was meant to end on this same line."
 
     elif rule == "unterminated_template_literal":
-
         solution_type = "replace"
-
-        solution = (
-            "Add the missing closing backtick to terminate "
-            "the template literal."
-        )
-
-    # --------------------------------------------------------
-    # COMMENT
-    # --------------------------------------------------------
+        solution = "Add the missing closing backtick (`) to complete this template string. Every backtick that opens a template literal needs exactly one matching backtick to close it - count the backticks on this line and nearby lines to find where one was left out."
 
     elif rule == "unterminated_comment":
-
         solution_type = "replace"
-
-        solution = (
-            "Add the missing closing */ so that the block "
-            "comment terminates correctly."
-        )
-
-    # --------------------------------------------------------
-    # JAVASCRIPT LOOSE EQUALITY
-    # --------------------------------------------------------
+        solution = "Add the missing */ to close this comment block. Until it's closed, every line after it in the file is silently treated as part of the comment, which can hide real code from the compiler without any warning - so check that nothing important got swallowed once this is fixed."
 
     elif rule == "loose_equality":
-
         solution_type = "replace"
-
-        if "!=" in code:
-
-            replacement_code = code.replace(
-                "!=",
-                "!==",
-                1,
-            )
-
-            solution = (
-                "Replace != with !== so the comparison "
-                "checks both type and value."
-            )
-
+        if "!=" in current_code:
+            replacement_code = current_code.replace("!=", "!==")
+            solution = "Change '!=' to '!==', as shown below. '!=' compares values after converting them to a common type first, which can make surprisingly different values look equal (e.g. 0 != \"0\" is false) - '!==' compares type and value together with no conversion."
         else:
-
-            replacement_code = code.replace(
-                "==",
-                "===",
-                1,
-            )
-
-            solution = (
-                "Replace == with === so the comparison "
-                "checks both type and value."
-            )
-
-    # --------------------------------------------------------
-    # VAR
-    # --------------------------------------------------------
+            replacement_code = current_code.replace("==", "===")
+            solution = "Change '==' to '===', as shown below. '==' compares values after converting them to a common type first, which can make surprisingly different values look equal (e.g. 0 == \"0\" is true) - '===' compares type and value together with no conversion."
 
     elif rule == "var_declaration":
-
         solution_type = "replace"
-
-        replacement_code = code.replace(
-            "var ",
-            "let ",
-            1,
-        )
-
-        solution = (
-            "Replace var with let, or const if the value "
-            "is never reassigned, to give the variable "
-            "block scope."
-        )
-
-    # --------------------------------------------------------
-    # EMPTY CATCH
-    # --------------------------------------------------------
+        replacement_code = current_code.replace("var ", "let ", 1)
+        solution = "Change 'var' to 'let' (or 'const' if this value is never reassigned), as shown below. 'var' is function-scoped and hoisted, which can let a variable leak out of the block it looks like it belongs to - 'let'/'const' are block-scoped and avoid that entire class of bug."
 
     elif rule == "empty_catch_block":
-
-        solution_type = "add"
-
-        solution = (
-            "Add appropriate error handling or logging "
-            "inside this catch block. Silently ignoring "
-            "an exception makes failures difficult to "
-            "diagnose."
-        )
-
-    # --------------------------------------------------------
-    # DEBUGGING STATEMENT
-    # --------------------------------------------------------
+        replacement_code = _fix_empty_catch(current_code, finding.get("file", ""))
+        if replacement_code:
+            solution_type = "replace"
+            solution = "Replace this with the version below, which logs the caught error instead of silently discarding it. Right now, if this code ever throws, the failure disappears with no log, no fallback, and no way to know it happened."
+        else:
+            solution_type = "add"
+            solution = "Add at least a log statement (e.g. console.error(err), or the equivalent for this language) inside the catch block. Right now this catch block does nothing, so if the wrapped code ever throws, the failure is silently discarded with no trace of it happening."
 
     elif rule == "leftover_console_statement":
-
         solution_type = "remove"
-
-        solution = (
-            "Remove this debugging console statement unless "
-            "it is intentionally required as application "
-            "output."
-        )
+        solution = "Delete this console.log/debug statement before shipping. It's harmless in production but usually isn't meant to ship, and can leak internal data into the browser console - if it's intentional logging rather than a debugging leftover, it's fine to leave as-is."
 
     elif rule == "leftover_debugger_statement":
-
         solution_type = "remove"
-
-        solution = (
-            "Remove the debugger statement before deploying "
-            "the application."
-        )
+        solution = "Delete this 'debugger' statement before shipping. It pauses execution in any browser with developer tools open, which is almost always leftover from debugging rather than something meant to run in production."
 
     elif rule == "leftover_debug_print":
-
         solution_type = "remove"
-
-        solution = (
-            "Remove the debugging print statement unless "
-            "it is intentionally part of the application's "
-            "normal output."
-        )
-
-    # --------------------------------------------------------
-    # UNREACHABLE CODE
-    # --------------------------------------------------------
+        solution = "Delete this print statement before shipping, unless it's intentional program output (e.g. a CLI tool's actual result) rather than a debugging leftover - if you're not sure which it is, check whether removing it would change what the program is supposed to display to a real user."
 
     elif rule == "unreachable_code":
-
         solution_type = "remove"
-
-        solution = (
-            "Remove the unreachable code because execution "
-            "cannot reach this section under the detected "
-            "control flow."
-        )
-
-    # --------------------------------------------------------
-    # UNKNOWN
-    # --------------------------------------------------------
+        solution = "Delete this code. It sits right after a return, throw, or a branch that always exits, so it can never actually execute - removing it has no effect on the program's behavior, since it never ran in the first place."
 
     else:
-
-        solution_type = "add"
-
-        solution = (
-            "The detector identified a possible issue, but "
-            "there is not enough information to generate a "
-            "safe automatic replacement. Review the reported "
-            "cause and verify the surrounding code."
-        )
-
-    confidence = (
-        FALLBACK_CONFIDENCE_BY_RULE.get(
-            rule,
-            DEFAULT_FALLBACK_CONFIDENCE,
-        )
-    )
+        # Should not normally be reached - every known rule is handled above -
+        # but keep a safe, honest fallback for any future/unknown rule.
+        solution_type = "replace"
+        solution = "We couldn't prepare an automatic fix for this one - review the code below and apply the fix yourself, using the cause above as a starting point."
 
     return {
-        "error": (
-            error
-            or "Possible issue"
-        ),
-
-        "bug_type": finding.get(
-            "bug_type",
-            "Other",
-        ),
-
-        "cause": (
-            cause
-            or "The detector identified a possible "
-               "problem in this code."
-        ),
-
+        "error": finding.get("error", "Possible issue"),
+        "bug_type": bug_type,
+        "cause": cause or "Something in this code looks like it could cause a problem.",
         "why_occurs": "",
-
         "solution_type": solution_type,
-
         "solution": solution,
-
         "replacement_code": replacement_code,
-
         "add_location": add_location,
-
         "new_file_path": None,
-
         "explanation": "",
-
-        "confidence": confidence,
-
+        "confidence": FALLBACK_CONFIDENCE_BY_RULE.get(rule, DEFAULT_FALLBACK_CONFIDENCE),
         "insufficient_evidence": True,
     }
 
 
-# ============================================================
-# ANALYZE DETECTOR FINDING
-# ============================================================
 
-def analyze_finding(
-    finding: dict,
-    retrieved: list,
-):
+def analyze_file(file_path: str, source: str) -> list:
     """
-    Analyze one detector finding with Gemini.
+    Analyze a readable text file directly with Gemini when there is no
+    specialized detector for its extension.
 
-    RAG results are included as historical context.
+    This is intentionally separate from analyze_finding(): analyze_finding()
+    receives one detector finding plus RAG context, while this function asks
+    Gemini to inspect the whole file and return candidate findings that can
+    then enter the normal RAG + report pipeline in main.py.
+
+    Returns an empty list when no API key is available, the file is empty, the
+    model call fails, or Gemini returns invalid JSON. This keeps the normal
+    detector/fallback pipeline safe instead of inventing a finding.
     """
+    if not source or not source.strip():
+        return []
 
-    api_keys = _get_api_keys()
+    api_keys = []
+
+    # Reuse the same multi-key configuration as analyze_finding().
+    for i in range(1, 11):
+        key = os.getenv(f"GEMINI_API_KEY_{i}")
+        if key and key.strip():
+            api_keys.append(key.strip())
+
+    old_key = os.getenv("GEMINI_API_KEY")
+    if old_key and old_key.strip() and old_key.strip() not in api_keys:
+        api_keys.append(old_key.strip())
 
     if not api_keys:
+        return []
 
-        return _fallback_report(
-            finding
-        )
+    api_keys = api_keys[:MAX_KEYS_TO_TRY_PER_CALL]
+
+    file_prompt = f"""You are reviewing a source/configuration/text file for real software bugs.
+
+File: {file_path}
+
+Analyze the complete file below. Report ONLY issues that are reasonably supported
+by the code/text itself. Do not invent bugs just because a style preference is
+not followed. If there are no clear issues, return an empty JSON array.
+
+For every real or strongly supported issue, return an object with exactly these
+fields:
+- error: short description of the bug
+- bug_type: one of Runtime Error, Logic Error, Syntax Error, Type Error,
+  Dependency Error, Security Issue, Performance Issue, API Error,
+  Unnecessary Code, Other
+- cause: why the issue occurs
+- line_start: 1-based starting line number
+- line_end: 1-based ending line number
+- current_code: the smallest relevant code/text snippet
+- function: function/class/component name if applicable, otherwise null
+
+Rules:
+- Use 1-based line numbers.
+- Only report issues you can point to in the supplied file.
+- Do not report vague possibilities without evidence.
+- Do not include markdown fences or explanations outside the JSON array.
+
+Return ONLY a JSON array.
+
+FILE CONTENT:
+--------------------
+{source}
+--------------------
+"""
 
     payload = {
         "system_instruction": {
-            "parts": [
-                {
-                    "text": SYSTEM_PROMPT
-                }
-            ]
+            "parts": [{"text": "You are a precise software bug detector. Return valid JSON only."}]
         },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": file_prompt}],
+            }
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.1,
+            "maxOutputTokens": 2500,
+            "topP": 0.9,
+            "topK": 40,
+        },
+    }
 
+    last_error = None
+
+    for key_number, api_key in enumerate(api_keys, start=1):
+        try:
+            resp = requests.post(
+                GEMINI_URL,
+                params={"key": api_key},
+                json=payload,
+                timeout=GEMINI_REQUEST_TIMEOUT_SECONDS,
+            )
+
+            if resp.status_code != 200:
+                last_error = (
+                    f"Gemini file-analysis key {key_number} returned "
+                    f"HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+                continue
+
+            data = resp.json()
+            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            cleaned = (
+                raw_text.strip()
+                .removeprefix("```json")
+                .removeprefix("```")
+                .removesuffix("```")
+                .strip()
+            )
+
+            result = json.loads(cleaned)
+            if not isinstance(result, list):
+                print("[llm_client] Gemini file analysis did not return a JSON array.")
+                return []
+
+            findings = []
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+
+                error = str(item.get("error") or "").strip()
+                if not error:
+                    continue
+
+                bug_type = str(item.get("bug_type") or "Other").strip()
+                allowed_types = {
+                    "Runtime Error", "Logic Error", "Syntax Error", "Type Error",
+                    "Dependency Error", "Security Issue", "Performance Issue",
+                    "API Error", "Unnecessary Code", "Other",
+                }
+                if bug_type not in allowed_types:
+                    bug_type = "Other"
+
+                line_start = item.get("line_start")
+                line_end = item.get("line_end")
+                try:
+                    line_start = int(line_start) if line_start is not None else None
+                    line_end = int(line_end) if line_end is not None else line_start
+                except (TypeError, ValueError):
+                    line_start = None
+                    line_end = None
+
+                findings.append({
+                    "error": error,
+                    "bug_type": bug_type,
+                    "cause": str(item.get("cause") or "").strip(),
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "current_code": str(item.get("current_code") or "").strip(),
+                    "function": item.get("function"),
+                    "rule": "llm_file_analysis",
+                    "file": file_path,
+                })
+
+            return findings
+
+        except Exception as e:
+            last_error = f"Gemini file analysis key {key_number} failed: {e}"
+
+    if last_error:
+        print(f"[llm_client] File analysis failed: {last_error}")
+    return []
+
+def get_fallback_report(finding: dict) -> dict:
+    """
+    Public entry point to the same real, rule-specific advice used when
+    the LLM is unavailable - lets a caller intentionally skip the API call
+    (e.g. once a per-scan call budget is used up) while still returning a
+    genuine, specific answer instead of dropping the finding entirely.
+    """
+    return _fallback_report(finding)
+
+
+
+def _ensure_replacement_code(result: dict, finding: dict) -> dict:
+    """Ensure a replace solution has concrete corrected code whenever it can be
+    derived safely from detector output or a deterministic local rule."""
+    if not isinstance(result, dict):
+        return _ensure_replacement_code(_fallback_report(finding), finding)
+
+    solution_type = result.get("solution_type")
+    replacement = result.get("replacement_code")
+    if isinstance(replacement, str) and replacement.strip():
+        result["replacement_code"] = replacement.strip("\n")
+        return result
+
+    detector_replacement = finding.get("replacement_code")
+    if isinstance(detector_replacement, str) and detector_replacement.strip():
+        result["solution_type"] = "replace"
+        result["replacement_code"] = detector_replacement.strip("\n")
+        return result
+
+    current = str(finding.get("current_code") or "")
+    rule = str(finding.get("rule") or "")
+    error_text = str(finding.get("error") or "")
+
+    if solution_type == "replace" and current.strip():
+        replacement = None
+
+        if rule == "unclosed_bracket":
+            m = UNCLOSED_CHAR_RE.search(error_text)
+            opener = m.group(1) if m else ""
+            closer = BRACKET_CLOSER.get(opener)
+            if closer and opener in "([":
+                replacement = current.rstrip() + closer
+
+        elif rule == "mismatched_bracket":
+            m = MISMATCHED_CHARS_RE.search(error_text)
+            if m:
+                found, expected = m.group(1), m.group(2)
+                if found in current:
+                    replacement = current.replace(found, expected, 1)
+
+        elif rule == "unexpected_closing_bracket":
+            m = UNEXPECTED_CHAR_RE.search(error_text)
+            closer = m.group(1) if m else ""
+            if closer and closer in current:
+                replacement = current.replace(closer, "", 1)
+
+        elif rule == "unterminated_string":
+            quote = "'" if current.count("'") % 2 == 1 else '"'
+            replacement = current + quote
+
+        elif rule == "unterminated_template_literal":
+            replacement = current + "`"
+
+        elif rule == "unterminated_comment":
+            replacement = current + " */"
+
+        if replacement and replacement.strip() != current.strip():
+            result["replacement_code"] = replacement
+            return result
+
+        # Never claim a replacement exists when it does not. Convert the
+        # response to an add-style explanation instead of rendering an empty
+        # corrected-code box.
+        result["solution_type"] = "add"
+        result["replacement_code"] = None
+        result["insufficient_evidence"] = True
+
+    return result
+
+def analyze_finding(finding: dict, retrieved: list) -> dict:
+    api_keys = []
+
+    # Read multiple Gemini API keys from environment variables.
+    for i in range(1, 11):
+        key = os.getenv(f"GEMINI_API_KEY_{i}")
+        if key and key.strip():
+            api_keys.append(key.strip())
+
+    # Keep support for the old single-key variable.
+    old_key = os.getenv("GEMINI_API_KEY")
+    if old_key and old_key.strip() and old_key.strip() not in api_keys:
+        api_keys.append(old_key.strip())
+
+    if not api_keys:
+        return _ensure_replacement_code(_fallback_report(finding), finding)
+
+    # Bounds the worst case for one finding to MAX_KEYS_TO_TRY_PER_CALL * the
+    # per-attempt timeout below, no matter how many keys end up configured -
+    # a scan with many findings calls this once per finding, so an unbounded
+    # key list here directly multiplies into minutes of wall-clock time on a
+    # bad run (several keys rate-limited or slow to respond) even before
+    # accounting for how many findings there are.
+    api_keys = api_keys[:MAX_KEYS_TO_TRY_PER_CALL]
+
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
         "contents": [
             {
                 "role": "user",
@@ -1320,588 +832,100 @@ def analyze_finding(
                     {
                         "text": _build_user_message(
                             finding,
-                            retrieved,
+                            retrieved
                         )
                     }
                 ],
             }
         ],
-
         "generationConfig": {
-            "response_mime_type": (
-                "application/json"
-            ),
-
-            "temperature": 0.1,
-
-            "maxOutputTokens": (
-                MAX_OUTPUT_TOKENS_FINDING
-            ),
-
+            "response_mime_type": "application/json",
+            "temperature": 0.1,  # Lower for more consistent/reliable outputs
+            "maxOutputTokens": 1500,  # Increased for better solutions
             "topP": 0.9,
-
             "topK": 40,
         },
     }
 
-    response = _request_gemini(
-        payload
-    )
-
-    if not response.get(
-        "ok"
-    ):
-
-        fallback = _fallback_report(
-            finding
-        )
-
-        if response.get(
-            "rate_limited"
-        ):
-
-            fallback[
-                "rate_limited"
-            ] = True
-
-            fallback[
-                "rate_limit_message"
-            ] = response.get(
-                "message"
-            )
-
-        print(
-            "[llm_client] "
-            f"Gemini finding analysis failed: "
-            f"{response.get('message')}"
-        )
-
-        return fallback
-
-    try:
-
-        data = response[
-            "data"
-        ]
-
-        raw_text = (
-            data[
-                "candidates"
-            ][0][
-                "content"
-            ][
-                "parts"
-            ][0][
-                "text"
-            ]
-        )
-
-    except (
-        KeyError,
-        IndexError,
-        TypeError,
-    ):
-
-        print(
-            "[llm_client] Gemini response "
-            "did not contain expected content."
-        )
-
-        return _fallback_report(
-            finding
-        )
-
-    result = _parse_json(
-        raw_text
-    )
-
-    if not isinstance(
-        result,
-        dict,
-    ):
-
-        print(
-            "[llm_client] Gemini returned "
-            "invalid finding JSON."
-        )
-
-        return _fallback_report(
-            finding
-        )
-
-    # --------------------------------------------------------
-    # NORMALIZE RESULT
-    # --------------------------------------------------------
-
-    allowed_bug_types = {
-        "Runtime Error",
-        "Logic Error",
-        "Syntax Error",
-        "Type Error",
-        "Dependency Error",
-        "Security Issue",
-        "Performance Issue",
-        "API Error",
-        "Unnecessary Code",
-        "Other",
-    }
-
-    bug_type = str(
-        result.get(
-            "bug_type",
-            finding.get(
-                "bug_type",
-                "Other",
-            ),
-        )
-    )
-
-    if bug_type not in allowed_bug_types:
-
-        bug_type = "Other"
-
-    result["bug_type"] = bug_type
-
-    solution_type = result.get(
-        "solution_type",
-        "add",
-    )
-
-    if solution_type not in {
-        "replace",
-        "add",
-        "remove",
-        "create_file",
-    }:
-
-        solution_type = "add"
-
-    result[
-        "solution_type"
-    ] = solution_type
-
-    # --------------------------------------------------------
-    # VALIDATE SOLUTION
-    # --------------------------------------------------------
-
-    solution = str(
-        result.get(
-            "solution",
-            "",
-        )
-        or ""
-    ).strip()
-
-    if not solution:
-
-        print(
-            "[llm_client] Gemini returned "
-            "an empty solution."
-        )
-
-        return _fallback_report(
-            finding
-        )
-
-    result[
-        "solution"
-    ] = solution
-
-    if solution_type == "replace":
-
-        replacement = str(
-            result.get(
-                "replacement_code",
-                "",
-            )
-            or ""
-        )
-
-        if not replacement.strip():
-
-            print(
-                "[llm_client] Gemini returned "
-                "a replace solution without "
-                "replacement code."
-            )
-
-            return _fallback_report(
-                finding
-            )
-
-        result[
-            "replacement_code"
-        ] = replacement
-
-    else:
-
-        if result.get(
-            "replacement_code"
-        ) is None:
-
-            result[
-                "replacement_code"
-            ] = None
-
-    # --------------------------------------------------------
-    # CONFIDENCE
-    # --------------------------------------------------------
-
-    confidence = result.get(
-        "confidence",
-        70,
-    )
-
-    try:
-
-        confidence = int(
-            float(confidence)
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        confidence = 70
-
-    confidence = max(
-        0,
-        min(
-            100,
-            confidence,
-        ),
-    )
-
-    result[
-        "confidence"
-    ] = confidence
-
-    result[
-        "insufficient_evidence"
-    ] = bool(
-        result.get(
-            "insufficient_evidence",
-            False,
-        )
-    )
-
-    return result
-
-
-# ============================================================
-# DIRECT FILE ANALYSIS
-# ============================================================
-
-def analyze_file(
-    file_path: str,
-    source: str,
-):
-    """
-    Ask Gemini to inspect a complete readable source file.
-
-    This is used for files without a specialized local detector.
-
-    Very large files should eventually be chunked by the repository
-    worker before calling this function. The function itself is
-    intentionally focused on one analysis unit.
-    """
-
-    if not source or not source.strip():
-
-        return []
-
-    prompt = f"""
-You are analyzing a source-code file for genuine software bugs.
-
-FILE:
-{file_path}
-
-Analyze the supplied code carefully.
-
-Find only bugs that are reasonably supported by the code itself.
-
-Look for:
-- syntax problems
-- runtime errors
-- logic errors
-- incorrect API usage
-- type problems
-- security problems
-- dependency problems
-- performance problems
-- incorrect error handling
-- unreachable code
-- clearly unnecessary code that can cause a problem
-
-Do NOT report:
-- simple style preferences
-- formatting preferences
-- vague possibilities
-- issues that cannot be supported by the supplied code
-
-For every genuine issue return:
-
-{{
-  "error": "short bug description",
-  "bug_type": "Runtime Error",
-  "cause": "exact reason",
-  "line_start": 1,
-  "line_end": 1,
-  "current_code": "smallest relevant code",
-  "function": "function/class name or null"
-}}
-
-Allowed bug_type values:
-
-Runtime Error
-Logic Error
-Syntax Error
-Type Error
-Dependency Error
-Security Issue
-Performance Issue
-API Error
-Unnecessary Code
-Other
-
-Use 1-based line numbers.
-
-Return ONLY a JSON array.
-
-FILE CONTENT:
-==================================================
-{source}
-==================================================
-"""
-
-    payload = {
-        "system_instruction": {
-            "parts": [
-                {
-                    "text": (
-                        "You are a precise software "
-                        "bug detector. Return JSON only."
-                    )
-                }
-            ]
-        },
-
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ],
-            }
-        ],
-
-        "generationConfig": {
-            "response_mime_type": (
-                "application/json"
-            ),
-
-            "temperature": 0.1,
-
-            "maxOutputTokens": (
-                MAX_OUTPUT_TOKENS_FILE
-            ),
-
-            "topP": 0.9,
-
-            "topK": 40,
-        },
-    }
-
-    response = _request_gemini(
-        payload
-    )
-
-    if not response.get(
-        "ok"
-    ):
-
-        print(
-            "[llm_client] "
-            f"Direct file analysis failed: "
-            f"{response.get('message')}"
-        )
-
-        return []
-
-    try:
-
-        raw_text = (
-            response[
-                "data"
-            ][
-                "candidates"
-            ][0][
-                "content"
-            ][
-                "parts"
-            ][0][
-                "text"
-            ]
-        )
-
-    except (
-        KeyError,
-        IndexError,
-        TypeError,
-    ):
-
-        return []
-
-    parsed = _parse_json(
-        raw_text
-    )
-
-    if not isinstance(
-        parsed,
-        list,
-    ):
-
-        return []
-
-    findings = []
-
-    allowed_bug_types = {
-        "Runtime Error",
-        "Logic Error",
-        "Syntax Error",
-        "Type Error",
-        "Dependency Error",
-        "Security Issue",
-        "Performance Issue",
-        "API Error",
-        "Unnecessary Code",
-        "Other",
-    }
-
-    for item in parsed:
-
-        if not isinstance(
-            item,
-            dict,
-        ):
-            continue
-
-        error = str(
-            item.get(
-                "error",
-                "",
-            )
-            or ""
-        ).strip()
-
-        if not error:
-            continue
-
-        bug_type = str(
-            item.get(
-                "bug_type",
-                "Other",
-            )
-            or "Other"
-        ).strip()
-
-        if bug_type not in allowed_bug_types:
-
-            bug_type = "Other"
-
-        line_start = item.get(
-            "line_start"
-        )
-
-        line_end = item.get(
-            "line_end"
-        )
-
+    last_error = None
+    last_429_response = None
+
+    # Try each Gemini API key until one succeeds.
+    for key_number, api_key in enumerate(api_keys, start=1):
         try:
-
-            line_start = (
-                int(line_start)
-                if line_start is not None
-                else None
+            resp = requests.post(
+                GEMINI_URL,
+                params={"key": api_key},
+                json=payload,
+                timeout=GEMINI_REQUEST_TIMEOUT_SECONDS,
             )
 
-        except (
-            TypeError,
-            ValueError,
-        ):
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
 
-            line_start = None
-
-        try:
-
-            line_end = (
-                int(line_end)
-                if line_end is not None
-                else line_start
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
-            line_end = line_start
-
-        findings.append(
-            {
-                "error": error,
-
-                "bug_type": bug_type,
-
-                "cause": str(
-                    item.get(
-                        "cause",
-                        "",
+                try:
+                    cleaned = (
+                        raw_text
+                        .strip()
+                        .removeprefix("```json")
+                        .removeprefix("```")
+                        .removesuffix("```")
+                        .strip()
                     )
-                    or ""
-                ).strip(),
 
-                "line_start": line_start,
+                    result = json.loads(cleaned)
 
-                "line_end": line_end,
+                    # Validate that replacement_code is not empty for "replace" solutions
+                    if result.get("solution_type") == "replace" and not result.get("replacement_code"):
+                        print(f"[llm_client] Gemini returned empty replacement_code for replace solution. Using fallback.")
+                        return _ensure_replacement_code(_fallback_report(finding), finding)
 
-                "current_code": str(
-                    item.get(
-                        "current_code",
-                        "",
-                    )
-                    or ""
-                ).strip(),
+                    # A missing/empty solution would mean the one thing the person
+                    # actually opens this report to read is blank - never let that
+                    # reach the frontend silently.
+                    if not (result.get("solution") or "").strip():
+                        print(f"[llm_client] Gemini returned an empty solution field. Using fallback.")
+                        return _ensure_replacement_code(_fallback_report(finding), finding)
 
-                "function": item.get(
-                    "function"
-                ),
+                    # Gemini occasionally omits confidence despite the instruction, or
+                    # returns something outside 0-100 - never let a missing/bad number
+                    # here break the scan-wide average computed in main.py.
+                    confidence = result.get("confidence")
+                    if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
+                        result["confidence"] = 70
+                    else:
+                        result["confidence"] = int(confidence)
 
-                "rule": (
-                    "llm_file_analysis"
-                ),
+                    return result
 
-                "file": file_path,
-            }
-        )
+                except (json.JSONDecodeError, ValueError) as e:
+                    print(f"[llm_client] Gemini returned non-JSON response: {raw_text[:300]}")
+                    print(f"[llm_client] JSON parse error: {e}")
+                    return _ensure_replacement_code(_fallback_report(finding), finding)
 
-    return findings
+            if resp.status_code == 429:
+                last_429_response = resp
 
+            # Key failed - try the next key. Log the technical detail server-side
+            # only - the person using the app should never see raw HTTP/API errors.
+            last_error = f"Gemini key {key_number} returned HTTP {resp.status_code}: {resp.text[:200]}"
 
-# ============================================================
-# PUBLIC FALLBACK
-# ============================================================
+        except Exception as e:
+            last_error = f"Gemini key {key_number} failed: {e}"
 
-def get_fallback_report(
-    finding: dict,
-):
-    """
-    Public fallback function used by main.py.
-    """
+    # All keys failed. Print the real reason to the server logs (visible in Render's
+    # Logs tab) so it can still be debugged, but keep the user-facing result simple.
+    print(f"[llm_client] All Gemini API keys failed. Last error: {last_error}")
 
-    return _fallback_report(
-        finding
-    )
+    fallback = _ensure_replacement_code(_fallback_report(finding), finding)
+
+    # If every key failed specifically because of a rate limit, tell the person
+    # clearly (and when they can try again) instead of the generic "fix it
+    # yourself" message - this is shown once at the top of the scan results.
+    if last_429_response is not None:
+        retry_seconds, is_daily = _parse_rate_limit_info(last_429_response)
+        fallback["rate_limited"] = True
+        fallback["rate_limit_message"] = _build_rate_limit_message(retry_seconds, is_daily)
+
+    return fallback
