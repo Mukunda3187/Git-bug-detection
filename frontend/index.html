@@ -1,0 +1,2008 @@
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+  <meta charset="UTF-8" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>RAG Bug Scanner — AI Static Analysis</title>
+
+  <link rel="icon" type="image/png" href="icon1.png">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght\@400;500;600;700;800&family=JetBrains+Mono:wght\@400;500;600&display=swap" rel="stylesheet">
+
+  <style>
+
+    :root {
+
+      --bg: #07090e;
+
+      --panel: rgba(16, 21, 31, 0.7);
+
+      --panel-solid: #0e131d;
+
+      --panel-raised: rgba(23, 30, 44, 0.85);
+
+      --border: rgba(255, 255, 255, 0.08);
+
+      --border-focus: rgba(167, 139, 250, 0.5);
+
+      --text: #f1f5f9;
+
+      --text-muted: #94a3b8;
+
+      --text-dim: #64748b;
+
+
+
+      --accent: #8b5cf6;
+
+      --accent-glow: rgba(139, 92, 246, 0.35);
+
+      --accent-light: #c4b5fd;
+
+
+
+      --added: #10b981;
+
+      --added-bg: rgba(16, 185, 129, 0.08);
+
+      --added-border: rgba(16, 185, 129, 0.25);
+
+
+
+      --removed: #f43f5e;
+
+      --removed-bg: rgba(244, 63, 94, 0.08);
+
+      --removed-border: rgba(244, 63, 94, 0.25);
+
+
+
+      --warn: #f59e0b;
+
+      --warn-bg: rgba(245, 158, 11, 0.08);
+
+      --warn-border: rgba(245, 158, 11, 0.25);
+
+
+
+      --radius: 12px;
+
+      --radius-sm: 8px;
+
+      --radius-pill: 9999px;
+
+    }
+
+
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+
+
+    body {
+
+      background: var(--bg);
+
+      color: var(--text);
+
+      font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+
+      line-height: 1.6;
+
+      min-height: 100vh;
+
+      position: relative;
+
+      overflow-x: hidden;
+
+    }
+
+
+
+    body::before {
+
+      content: "";
+
+      position: fixed;
+
+      inset: 0;
+
+      background-image:
+
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(139, 92, 246, 0.18), transparent 70%),
+
+        radial-gradient(circle at 80% 80%, rgba(59, 130, 246, 0.08), transparent 50%),
+
+        linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+
+        linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+
+      background-size: 100% 100%, 100% 100%, 36px 36px, 36px 36px;
+
+      pointer-events: none;
+
+      z-index: 0;
+
+    }
+
+
+
+    .shell {
+
+      position: relative;
+
+      z-index: 1;
+
+      max-width: 1060px;
+
+      margin: 0 auto;
+
+      padding: 60px 24px 120px;
+
+    }
+
+
+
+    header.top {
+
+      text-align: center;
+
+      margin-bottom: 44px;
+
+      display: flex;
+
+      flex-direction: column;
+
+      align-items: center;
+
+    }
+
+
+
+    .eyebrow-badge {
+
+      display: inline-flex;
+
+      align-items: center;
+
+      gap: 8px;
+
+      background: rgba(139, 92, 246, 0.1);
+
+      border: 1px solid rgba(139, 92, 246, 0.3);
+
+      padding: 6px 14px;
+
+      border-radius: var(--radius-pill);
+
+      font-size: 13px;
+
+      font-weight: 600;
+
+      color: var(--accent-light);
+
+      letter-spacing: 0.04em;
+
+      text-transform: uppercase;
+
+      margin-bottom: 18px;
+
+      backdrop-filter: blur(8px);
+
+    }
+
+
+
+    .eyebrow-badge .pulse-dot {
+
+      width: 7px;
+
+      height: 7px;
+
+      background: var(--accent-light);
+
+      border-radius: 50%;
+
+      box-shadow: 0 0 8px var(--accent);
+
+      animation: pulse 2s infinite ease-in-out;
+
+    }
+
+
+
+    @keyframes pulse {
+
+      0%, 100% { opacity: 0.4; transform: scale(0.9); }
+
+      50% { opacity: 1; transform: scale(1.15); }
+
+    }
+
+
+
+    header.top h1 {
+
+      font-size: clamp(32px, 5vw, 48px);
+
+      font-weight: 800;
+
+      letter-spacing: -0.03em;
+
+      line-height: 1.15;
+
+      margin-bottom: 16px;
+
+      background: linear-gradient(180deg, #ffffff 30%, #94a3b8 100%);
+      background-clip: text;
+      -webkit-background-clip: text;
+
+      -webkit-text-fill-color: transparent;
+
+    }
+
+
+
+    header.top p {
+
+      color: var(--text-muted);
+
+      font-size: 18px;
+
+      max-width: 640px;
+
+      line-height: 1.6;
+
+    }
+
+
+
+    .scan-card {
+
+      background: var(--panel);
+
+      backdrop-filter: blur(16px);
+
+      border: 1px solid var(--border);
+
+      border-radius: 16px;
+
+      padding: 10px;
+
+      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05);
+
+      transition: border-color 0.2s, box-shadow 0.2s;
+
+      margin-bottom: 14px;
+
+    }
+
+
+
+    .scan-card:focus-within {
+
+      border-color: var(--border-focus);
+
+      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.5), 0 0 20px var(--accent-glow);
+
+    }
+
+
+
+    .scan-box {
+
+      display: flex;
+
+      align-items: center;
+
+      gap: 10px;
+
+    }
+
+
+
+    .input-icon-wrap {
+
+      position: relative;
+
+      flex: 1;
+
+      display: flex;
+
+      align-items: center;
+
+    }
+
+
+
+    .input-icon-wrap svg {
+
+      position: absolute;
+
+      left: 16px;
+
+      width: 18px;
+
+      height: 18px;
+
+      color: var(--text-dim);
+
+      pointer-events: none;
+
+    }
+
+
+
+    input[type="text"] {
+
+      width: 100%;
+
+      background: transparent;
+
+      border: none;
+
+      color: var(--text);
+
+      padding: 14px 16px 14px 46px;
+
+      font-family: 'JetBrains Mono', monospace;
+
+      font-size: 16px;
+
+    }
+
+
+
+    input[type="text"]:focus { outline: none; }
+
+    input[type="text"]::placeholder { color: var(--text-dim); }
+
+
+
+    button.scan-btn {
+
+      display: inline-flex;
+
+      align-items: center;
+
+      gap: 8px;
+
+      background: linear-gradient(135deg, #9333ea, #7c3aed);
+
+      color: #ffffff;
+
+      border: none;
+
+      font-weight: 600;
+
+      padding: 14px 26px;
+
+      border-radius: var(--radius);
+
+      font-family: inherit;
+
+      font-size: 15px;
+
+      cursor: pointer;
+
+      box-shadow: 0 4px 16px var(--accent-glow);
+
+      transition: all 0.2s ease;
+
+      white-space: nowrap;
+
+    }
+
+
+
+    button.scan-btn:hover:not(:disabled) {
+
+      transform: translateY(-1px);
+
+      box-shadow: 0 6px 22px rgba(147, 51, 234, 0.5);
+
+    }
+
+    button.scan-btn:active:not(:disabled) { transform: translateY(0); }
+
+    button.scan-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+
+
+    .quick-samples {
+
+      display: flex;
+
+      align-items: center;
+
+      gap: 8px;
+
+      flex-wrap: wrap;
+
+      margin-top: 14px;
+
+      padding: 0 6px;
+
+      font-size: 14px;
+
+      color: var(--text-dim);
+
+    }
+
+
+
+    .sample-pill {
+
+      background: rgba(255, 255, 255, 0.04);
+
+      border: 1px solid var(--border);
+
+      color: var(--text-muted);
+
+      padding: 3px 10px;
+
+      border-radius: var(--radius-pill);
+
+      cursor: pointer;
+
+      font-family: 'JetBrains Mono', monospace;
+
+      transition: all 0.15s ease;
+
+    }
+
+    .sample-pill:hover {
+
+      background: rgba(255, 255, 255, 0.08);
+
+      color: var(--text);
+
+      border-color: rgba(255, 255, 255, 0.2);
+
+    }
+
+
+
+    .hint {
+
+      text-align: center;
+
+      font-size: 14px;
+
+      color: var(--text-dim);
+
+      margin-top: 10px;
+
+    }
+
+
+
+    #status-line {
+
+      margin: 22px 0 10px;
+
+      min-height: 24px;
+
+      display: flex;
+
+      justify-content: center;
+
+    }
+
+
+
+    .scanning-indicator {
+
+      display: inline-flex;
+
+      align-items: center;
+
+      gap: 10px;
+
+      padding: 8px 18px;
+
+      background: rgba(139, 92, 246, 0.08);
+
+      border: 1px solid rgba(139, 92, 246, 0.25);
+
+      border-radius: var(--radius-pill);
+
+      font-size: 14px;
+
+      color: var(--accent-light);
+
+      font-family: 'JetBrains Mono', monospace;
+
+    }
+
+
+
+    .radar-spinner {
+
+      width: 14px;
+
+      height: 14px;
+
+      border: 2px solid rgba(167, 139, 250, 0.2);
+
+      border-top-color: var(--accent-light);
+
+      border-radius: 50%;
+
+      animation: spin 0.8s linear infinite;
+
+      flex: 0 0 auto;
+
+    }
+
+    .progress-wrap {
+
+      width: min(580px, 100%);
+
+      margin: 10px auto 0;
+
+    }
+
+    .progress-track {
+
+      width: 100%;
+
+      height: 7px;
+
+      background: rgba(148, 163, 184, 0.12);
+
+      border-radius: 999px;
+
+      overflow: hidden;
+
+      border: 1px solid rgba(255, 255, 255, 0.04);
+
+    }
+
+    .progress-fill {
+
+      height: 100%;
+
+      width: 0%;
+
+      border-radius: inherit;
+
+      background: linear-gradient(90deg, #9333ea, #a855f7);
+
+      box-shadow: 0 0 12px rgba(147, 51, 234, 0.45);
+
+      transition: width 0.35s ease;
+
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+
+
+    .status-banner {
+
+      padding: 14px 18px;
+
+      border-radius: var(--radius);
+
+      font-size: 14px;
+
+      margin-top: 12px;
+
+      display: flex;
+
+      align-items: center;
+
+      gap: 10px;
+
+      border: 1px solid transparent;
+
+      animation: fadeIn 0.25s ease;
+
+    }
+
+    .status-banner.error { border-color: var(--removed-border); color: #fda4af; background: var(--removed-bg); }
+
+    .status-banner.ok { border-color: var(--added-border); color: #6ee7b7; background: var(--added-bg); }
+
+    .status-banner.warn { border-color: var(--warn-border); color: #fde68a; background: var(--warn-bg); }
+
+
+
+    .summary-grid {
+
+      display: grid;
+
+      grid-template-columns: repeat(4, 1fr);
+
+      gap: 12px;
+
+      margin: 32px 0;
+
+      animation: fadeIn 0.3s ease;
+
+    }
+
+
+
+    .summary-cell {
+
+      background: var(--panel);
+
+      backdrop-filter: blur(12px);
+
+      border: 1px solid var(--border);
+
+      border-radius: var(--radius);
+
+      padding: 18px 14px;
+
+      text-align: center;
+
+      transition: transform 0.2s, border-color 0.2s;
+
+    }
+
+    .summary-cell:hover { transform: translateY(-2px); border-color: rgba(255, 255, 255, 0.15); }
+
+
+
+    .summary-cell .num {
+
+      font-size: 32px;
+
+      font-weight: 800;
+
+      letter-spacing: -0.03em;
+
+      line-height: 1.1;
+
+      color: var(--text);
+
+    }
+
+
+
+    .summary-cell .label {
+
+      font-size: 12px;
+
+      color: var(--text-dim);
+
+      margin-top: 6px;
+
+      text-transform: uppercase;
+
+      letter-spacing: 0.08em;
+
+      font-weight: 600;
+
+    }
+
+
+
+    .num.confidence-high { color: var(--added); text-shadow: 0 0 16px rgba(16, 185, 129, 0.3); }
+
+    .num.confidence-medium { color: var(--warn); text-shadow: 0 0 16px rgba(245, 158, 11, 0.3); }
+
+    .num.confidence-low { color: var(--removed); text-shadow: 0 0 16px rgba(244, 63, 94, 0.4); }
+
+
+
+    .error-level-pill {
+
+      display: inline-block;
+
+      font-size: 13px;
+
+      font-weight: 600;
+
+      padding: 4px 12px;
+
+      border-radius: var(--radius-pill);
+
+      border: 1px solid var(--border);
+
+    }
+
+    .error-level-pill.less { color: var(--added); border-color: var(--added-border); background: var(--added-bg); }
+
+    .error-level-pill.medium { color: var(--warn); border-color: var(--warn-border); background: var(--warn-bg); }
+
+    .error-level-pill.more { color: var(--removed); border-color: var(--removed-border); background: var(--removed-bg); }
+
+
+
+    .bug-card {
+
+      border: 1px solid var(--border);
+
+      border-top: 3px solid var(--accent);
+
+      border-radius: var(--radius);
+
+      background: var(--panel-solid);
+
+      margin-bottom: 22px;
+
+      overflow: hidden;
+
+      box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.5);
+
+      transition: border-color 0.2s;
+
+      animation: fadeIn 0.35s ease;
+
+    }
+
+    .bug-card:hover { border-color: rgba(255, 255, 255, 0.16); }
+
+    .bug-card.type-syntax { border-top-color: var(--removed); }
+
+    .bug-card.type-unnecessary { border-top-color: var(--warn); }
+
+    .bug-card.type-runtime { border-top-color: var(--accent); }
+
+
+
+    .badge.type-syntax {
+
+      color: #fda4af;
+
+      border-color: var(--removed-border);
+
+      background: var(--removed-bg);
+
+    }
+
+
+
+    .badge.type-unnecessary {
+
+      color: #fde68a;
+
+      border-color: var(--warn-border);
+
+      background: var(--warn-bg);
+
+    }
+
+
+
+    .badge.type-runtime {
+
+      color: var(--accent-light);
+
+      border-color: rgba(139, 92, 246, 0.35);
+
+      background: rgba(139, 92, 246, 0.10);
+
+    }
+
+
+
+    .bug-head {
+
+      padding: 16px 20px;
+
+      display: flex;
+
+      align-items: center;
+
+      justify-content: space-between;
+
+      flex-wrap: wrap;
+
+      gap: 12px;
+
+      background: var(--panel-raised);
+
+      border-bottom: 1px solid var(--border);
+
+    }
+
+
+
+    .bug-title {
+
+      font-weight: 700;
+
+      font-size: 17px;
+
+      letter-spacing: -0.01em;
+
+      display: flex;
+
+      align-items: center;
+
+      gap: 10px;
+
+    }
+
+    .bug-title .bug-number { color: var(--text-dim); font-weight: 600; }
+
+
+
+    .badge-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+
+
+    .badge {
+
+      font-size: 12px;
+
+      font-weight: 600;
+
+      padding: 4px 10px;
+
+      border-radius: var(--radius-pill);
+
+      border: 1px solid var(--border);
+
+      background: rgba(255, 255, 255, 0.04);
+
+      color: var(--text-muted);
+
+      letter-spacing: 0.02em;
+
+      white-space: nowrap;
+
+    }
+
+    .badge.type-syntax { color: #fda4af; border-color: var(--removed-border); background: var(--removed-bg); }
+
+    .badge.confidence-high { color: #a7f3d0; border-color: var(--added-border); background: var(--added-bg); }
+
+    .badge.confidence-medium { color: #fde68a; border-color: var(--warn-border); background: var(--warn-bg); }
+
+    .badge.confidence-low { color: #fda4af; border-color: var(--removed-border); background: var(--removed-bg); }
+
+
+
+    .bug-body { padding: 22px; display: flex; flex-direction: column; gap: 14px; }
+
+
+
+    .field-label {
+
+      font-size: 12px;
+
+      text-transform: uppercase;
+
+      letter-spacing: 0.08em;
+
+      font-weight: 700;
+
+      color: var(--text-dim);
+
+      margin-bottom: 4px;
+
+    }
+
+
+
+    .location-line {
+
+      font-family: 'JetBrains Mono', monospace;
+
+      font-size: 15px;
+
+      color: var(--text);
+
+      background: rgba(255, 255, 255, 0.02);
+
+      border: 1px solid var(--border);
+
+      padding: 8px 12px;
+
+      border-radius: var(--radius-sm);
+
+    }
+
+
+
+    .cause-text, .explanation-text { font-size: 15px; color: var(--text-muted); line-height: 1.6; }
+
+
+
+    .solution-code-label {
+
+      font-size: 12px;
+
+      text-transform: uppercase;
+
+      letter-spacing: 0.08em;
+
+      font-weight: 700;
+
+      color: var(--added);
+
+      margin-bottom: 6px;
+
+    }
+
+
+
+    .solution-note {
+
+      margin-top: 10px;
+
+      padding: 10px 12px;
+
+      border-left: 2px solid var(--accent);
+
+      background: rgba(139, 92, 246, 0.06);
+
+      color: var(--text-muted);
+
+      font-size: 14px;
+
+      line-height: 1.55;
+
+      white-space: pre-line;
+
+    }
+
+
+
+    .solution-action {
+
+      margin-top: 8px;
+
+      color: var(--text-muted);
+
+      font-size: 13px;
+
+    }
+
+
+
+    .solution-file {
+
+      margin-bottom: 8px;
+
+      color: var(--accent-light);
+
+    }
+
+
+
+    pre.code-block {
+
+      margin: 0;
+
+      padding: 14px 16px;
+
+      border-radius: var(--radius-sm);
+
+      font-size: 14px;
+
+      font-family: 'JetBrains Mono', monospace;
+
+      overflow-x: auto;
+
+      white-space: pre-wrap;
+
+      word-break: break-word;
+
+      line-height: 1.5;
+
+    }
+
+    pre.code-block.removed { background: var(--removed-bg); border: 1px solid var(--removed-border); color: #ffe4e6; }
+
+    pre.code-block.added { background: var(--added-bg); border: 1px solid var(--added-border); color: #d1fae5; }
+
+    .code-toolbar { display: flex; justify-content: flex-end; margin-bottom: 6px; }
+
+    .code-copy-btn { border: 1px solid var(--border); background: var(--panel-raised); color: var(--text); border-radius: 7px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
+
+    .code-copy-btn:hover { border-color: var(--border-focus); color: var(--accent-light); }
+
+    .code-wrap { min-width: 0; }
+
+    pre.code-block.collapsed { max-height: 8.5em; overflow: hidden; }
+
+    .code-toggle { margin-top: 7px; border: 0; background: transparent; color: var(--accent-light); cursor: pointer; font-size: 13px; }
+
+
+
+    .simple-note {
+
+      padding: 12px 14px;
+
+      border-radius: var(--radius-sm);
+
+      background: var(--warn-bg);
+
+      border: 1px solid var(--warn-border);
+
+      color: #fde68a;
+
+      font-size: 13px;
+
+      font-style: italic;
+
+    }
+
+
+
+    .see-more-toggle {
+
+      font-size: 13px;
+
+      color: var(--accent-light);
+
+      cursor: pointer;
+
+      user-select: none;
+
+      width: fit-content;
+
+    }
+
+    .see-more-toggle:hover { text-decoration: underline; }
+
+
+
+    .historical-bugs { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+
+
+
+    .history-item {
+
+      border: 1px solid var(--border);
+
+      background: rgba(255, 255, 255, 0.02);
+
+      border-radius: var(--radius-sm);
+
+      padding: 12px 14px;
+
+      font-size: 13px;
+
+    }
+
+    .history-top {
+
+      display: flex;
+
+      justify-content: space-between;
+
+      align-items: center;
+
+      gap: 12px;
+
+      margin-bottom: 4px;
+
+    }
+
+    .history-source { color: var(--accent-light); font-weight: 700; }
+
+    .history-sim {
+
+      font-family: 'JetBrains Mono', monospace;
+
+      color: var(--accent-light);
+
+      font-weight: 600;
+
+      white-space: nowrap;
+
+      background: rgba(139, 92, 246, 0.1);
+
+      padding: 2px 8px;
+
+      border-radius: var(--radius-pill);
+
+      border: 1px solid rgba(139, 92, 246, 0.3);
+
+    }
+
+    .history-type { color: var(--text-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+
+    .history-desc { color: var(--text-muted); margin-bottom: 6px; }
+
+    .history-solution { color: var(--text-muted); }
+
+    .history-solution b { color: var(--text); }
+
+
+
+    .empty-state {
+
+      text-align: center;
+
+      padding: 80px 20px;
+
+      color: var(--text-dim);
+
+      font-size: 15px;
+
+      background: var(--panel);
+
+      border: 1px dashed var(--border);
+
+      border-radius: var(--radius);
+
+      margin-top: 24px;
+
+    }
+
+
+
+    footer {
+
+      text-align: center;
+
+      color: var(--text-dim);
+
+      font-size: 13px;
+
+      margin-top: 70px;
+
+      border-top: 1px solid var(--border);
+
+      padding-top: 24px;
+
+      line-height: 1.7;
+
+    }
+
+    footer strong { color: var(--text-muted); }
+
+    footer .pipeline-note { margin-top: 10px; opacity: 0.7; }
+
+
+
+    @keyframes fadeIn {
+
+      from { opacity: 0; transform: translateY(6px); }
+
+      to { opacity: 1; transform: translateY(0); }
+
+    }
+
+
+
+    @media (max-width: 768px) {
+
+      .summary-grid { grid-template-columns: repeat(2, 1fr); }
+
+      .scan-box { flex-direction: column; align-items: stretch; }
+
+      .input-icon-wrap { width: 100%; }
+
+      button.scan-btn { justify-content: center; width: 100%; }
+
+    }
+
+  </style>
+
+</head>
+
+<body>
+
+
+
+<div class="shell">
+
+  <header class="top">
+
+    <div class="eyebrow-badge">
+
+      <span class="pulse-dot"></span>
+
+      RAG + LLM Static Analysis
+
+    </div>
+
+    <h1>GitHub Bug Detection &amp; Recovery</h1>
+
+    <p>Scan your GitHub repository to find bugs, understand their cause, and get the right fix.</p>
+
+  </header>
+
+
+
+  <div class="scan-card">
+
+    <div class="scan-box">
+
+      <div class="input-icon-wrap">
+
+        <svg fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg>
+
+        <input type="text" id="repo-url" placeholder="https://github.com/owner/repository" />
+
+      </div>
+
+      <button class="scan-btn" id="scan-btn" onclick="scanRepo()">
+
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+
+        Scan repo
+
+      </button>
+
+    </div>
+
+  </div>
+
+
+
+  <div class="quick-samples">
+
+    <span>Quick try:</span>
+
+    <span class="sample-pill" onclick="setSample('https://github.com/pallets/flask')">pallets/flask</span>
+
+    <span class="sample-pill" onclick="setSample('https://github.com/langchain-ai/langchain.git')">langchain</span>
+
+    <span class="sample-pill" onclick="setSample('https://github.com/fastapi/fastapi')">fastapi/fastapi</span>
+
+    <span class="sample-pill" onclick="setSample('https://github.com/Mukunda3187/test.git')">Syntax_Error</span>
+
+    <span class="sample-pill" onclick="setSample('https://github.com/Mukunda3187/QuickChat.git')">test2</span>
+
+  </div>
+
+  <div class="hint">Works on any public GitHub repo. Private repos need auth this build doesn't set up.</div>
+
+
+
+  <div id="status-line"></div>
+
+  <div id="status-banner-holder"></div>
+
+
+
+  <div id="summary-holder"></div>
+
+  <div id="results-holder"></div>
+
+
+
+  <footer>
+
+    <strong>⚠ Check before editing code.</strong> Every finding here comes from static analysis plus an LLM guess — it can be wrong, incomplete, or miss context only you have. Review each suggested fix yourself before applying it.
+
+  </footer>
+
+</div>
+
+
+
+<script>
+
+const API_BASE = ""; // same origin - FastAPI serves this file too
+
+
+
+let progressPollTimer = null;
+let activeScanId = null;
+
+function setSample(url) {
+  document.getElementById("repo-url").value = url;
+}
+
+function startProgress() {
+  const line = document.getElementById("status-line");
+  if (!line) return;
+
+  line.innerHTML = `
+    <div style="width:100%; text-align:center;">
+      <div class="scanning-indicator" style="width:max-content; max-width:100%; margin:0 auto; justify-content:center;">
+        <div class="radar-spinner"></div>
+        <span id="scan-status-text">Validating repository...</span>
+      </div>
+
+      <div class="progress-wrap">
+        <div class="progress-track" aria-label="Scan progress">
+          <div id="scan-progress-bar" class="progress-fill" style="width:0%;"></div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function updateProgress(data) {
+  const text = document.getElementById("scan-status-text");
+  const bar = document.getElementById("scan-progress-bar");
+
+  if (!text || !bar) return;
+
+  const phaseRaw = String(data.phase || "").trim();
+  const phase = phaseRaw.toLowerCase();
+  const filesProcessed = Math.max(0, Number(data.files_processed || 0));
+  const filesTotal = Math.max(0, Number(data.files_total || 0));
+  const findingsProcessed = Math.max(0, Number(data.findings_processed || 0));
+  const findingsTotal = Math.max(0, Number(data.findings_total || 0));
+  const currentFile = String(data.current_file || "").trim();
+
+  let message = "Validating repository...";
+  let progress = Number(data.progress || 0);
+
+  // As soon as the backend knows the total source-file count, show the
+  // real X/Y file counter instead of hiding it behind a generic stage.
+  const isFileScanningPhase =
+    phase.includes("scanning files") ||
+    (filesTotal > 0 && filesProcessed < filesTotal &&
+     (phase.includes("finding source files") ||
+      phase.includes("repository validated") ||
+      phase.includes("repository downloaded") ||
+      phase.includes("retrieving historical")));
+
+  if (isFileScanningPhase && filesTotal > 0) {
+    message = `Scanning files ${filesProcessed}/${filesTotal}`;
+    if (currentFile) {
+      message += ` — ${currentFile}`;
+    }
+    progress = (filesProcessed / filesTotal) * 70;
+  } else if (phase.includes("validating repository")) {
+    message = "Validating repository...";
+  } else if (phase.includes("repository validated")) {
+    message = "Repository validated";
+  } else if (phase.includes("repository downloaded")) {
+    message = "Downloading repository...";
+  } else if (phase.includes("retrieving historical")) {
+    message = "Retrieving historical GitHub issues and PRs...";
+  } else if (phase.includes("finding source files")) {
+    message = "Finding source files...";
+  } else if (phase.includes("scanning files")) {
+    message = `Scanning files ${filesProcessed}/${filesTotal || "?"}`;
+    if (currentFile) {
+      message += ` — ${currentFile}`;
+    }
+    progress = filesTotal > 0
+      ? (filesProcessed / filesTotal) * 70
+      : progress;
+  } else if (phase.includes("preparing rag") || phase.includes("preparing rag and llm")) {
+    message = "Preparing RAG and LLM analysis...";
+    progress = Math.max(progress, 70);
+  } else if (phase.includes("analyzing findings")) {
+    message = `Analyzing finding ${findingsProcessed}/${findingsTotal || "?"}`;
+    if (currentFile) {
+      message += ` — ${currentFile}`;
+    }
+    if (findingsTotal > 0) {
+      progress = 70 + (findingsProcessed / findingsTotal) * 25;
+    }
+  } else if (phase.includes("building final bug report")) {
+    message = "Building final bug report...";
+    progress = Math.max(progress, 97);
+  } else if (phase.includes("finalizing scan")) {
+    message = "Finalizing scan...";
+    progress = Math.max(progress, 99);
+  } else if (phaseRaw) {
+    message = `${phaseRaw}...`;
+  }
+
+  progress = Math.max(0, Math.min(100, progress));
+  text.textContent = message;
+  bar.style.width = `${progress}%`;
+}
+function stopProgress(finalText) {
+  if (progressPollTimer) {
+    clearTimeout(progressPollTimer);
+    progressPollTimer = null;
+  }
+  const line = document.getElementById("status-line");
+  line.innerHTML = finalText
+    ? `<span style="color: var(--text-dim); font-size: 14px;">${escapeHtml(finalText)}</span>`
+    : "";
+}
+
+async function pollScan(scanId, holders) {
+  try {
+    const resp = await fetch(`${API_BASE}/api/scan/${encodeURIComponent(scanId)}`, {
+      method: "GET",
+      cache: "no-store",
+    });
+
+    if (!resp.ok) {
+      let detail = "";
+      try { detail = await resp.text(); } catch (e) {}
+      throw new Error(`Progress request failed (HTTP ${resp.status}). ${detail.slice(0, 200)}`);
+    }
+
+    const data = await resp.json();
+    updateProgress(data);
+
+    if (data.status === "completed") {
+      stopProgress("Analysis completed.");
+      return data.result;
+    }
+
+    if (data.status === "failed") {
+      throw new Error(data.error || "Scan failed.");
+    }
+
+    await new Promise(resolve => {
+      progressPollTimer = setTimeout(resolve, 700);
+    });
+
+    return pollScan(scanId, holders);
+  } catch (err) {
+    stopProgress("");
+    throw err;
+  }
+}
+
+function escapeHtml(str) {
+
+  if (str === null || str === undefined) return "";
+
+  return String(str)
+
+    .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
+}
+
+
+
+function renderCodeBlock(code, cssClass, options = {}) {
+
+  if (!code) return "";
+
+  const lines = code.split("\n");
+
+  const body = lines.map(l => escapeHtml(l) || " ").join("\n");
+
+  const collapsible = lines.length > 5;
+
+  const copyButton = options.copy
+
+    ? `<div class="code-toolbar"><button type="button" class="code-copy-btn" onclick="copyCodeFromBlock(this)">Copy</button></div>`
+
+    : "";
+
+  const preClass = `code-block ${cssClass}${collapsible ? " collapsed" : ""}`;
+
+  const toggle = collapsible
+
+    ? `<button type="button" class="code-toggle" onclick="toggleCodeBlock(this)">See more</button>`
+
+    : "";
+
+  return `<div class="code-wrap">${copyButton}<pre class="${preClass}">${body}</pre>${toggle}</div>`;
+
+}
+
+
+
+function toggleCodeBlock(button) {
+
+  const pre = button.previousElementSibling;
+
+  if (!pre) return;
+
+  const collapsed = pre.classList.toggle("collapsed");
+
+  button.textContent = collapsed ? "See more" : "See less";
+
+}
+
+
+
+async function copyCodeFromBlock(button) {
+
+  const wrapper = button.closest(".code-wrap");
+
+  const pre = wrapper ? wrapper.querySelector("pre.code-block") : null;
+
+  if (!pre) return;
+
+  const originalText = button.textContent;
+
+  try {
+
+    await navigator.clipboard.writeText(pre.textContent);
+
+    button.textContent = "Copied!";
+
+  } catch (error) {
+
+    const textarea = document.createElement("textarea");
+
+    textarea.value = pre.textContent;
+
+    document.body.appendChild(textarea);
+
+    textarea.select();
+
+    try {
+
+      document.execCommand("copy");
+
+      button.textContent = "Copied!";
+
+    } catch (copyError) {
+
+      button.textContent = "Copy failed";
+
+    }
+
+    textarea.remove();
+
+  }
+
+  setTimeout(() => { button.textContent = originalText; }, 1500);
+
+}
+
+
+
+function renderSolutionBlock(bug) {
+
+  const solutionText = bug.solution
+
+    ? `<div class="solution-note">${escapeHtml(bug.solution)}</div>`
+
+    : "";
+
+
+
+  const code = bug.replacement_code
+
+    ? renderCodeBlock(bug.replacement_code, "added", { copy: true })
+
+    : "";
+
+
+
+  if (bug.solution_type === "add") {
+
+    return `
+
+      ${code}
+
+      ${bug.add_location ? `<div class="solution-action">${escapeHtml(bug.add_location)}</div>` : ""}
+
+      ${solutionText}
+
+    `;
+
+  }
+
+
+
+  if (bug.solution_type === "remove") {
+
+    return `
+
+      ${code ? `<div class="solution-code-label">Remove this code</div>${code}` : ""}
+
+      ${solutionText}
+
+    `;
+
+  }
+
+
+
+  if (bug.solution_type === "create_file") {
+
+    return `
+
+      ${bug.new_file_path ? `<div class="location-line solution-file">${escapeHtml(bug.new_file_path)}</div>` : ""}
+
+      ${code}
+
+      ${solutionText}
+
+    `;
+
+  }
+
+
+
+  // Default: replace the detected buggy code with the corrected code.
+
+  return `
+
+    ${code ? `<div class="solution-code-label">Replace with this code</div>${code}` : ""}
+
+    ${solutionText}
+
+  `;
+
+}
+
+
+
+function toggleHistory(id) {
+
+  const panel = document.getElementById("history-" + id);
+
+  const toggle = document.getElementById("toggle-" + id);
+
+  if (!panel) return;
+
+  const isHidden = panel.style.display === "none" || !panel.style.display;
+
+  panel.style.display = isHidden ? "block" : "none";
+
+  if (toggle) toggle.textContent = isHidden ? "▴ See less" : "▾ See more — historical data";
+
+}
+
+
+
+// Bug type controls the visual category:
+
+// Syntax Error = red, Unnecessary/Dead/Unused/Redundant Code = yellow,
+
+// Runtime Error = purple. Other bug types keep the neutral theme color.
+
+function typeClass(bugType) {
+
+  const t = (bugType || "").toLowerCase();
+
+
+
+  if (t.includes("syntax")) return "type-syntax";
+
+
+
+  if (
+
+    t.includes("unnecessary") ||
+
+    t.includes("dead code") ||
+
+    t.includes("unused code") ||
+
+    t.includes("redundant")
+
+  ) {
+
+    return "type-unnecessary";
+
+  }
+
+
+
+  if (t.includes("runtime")) return "type-runtime";
+
+
+
+  return "";
+
+}
+
+
+
+function typeIcon(bugType) {
+
+  const t = (bugType || "").toLowerCase();
+
+
+
+  if (t.includes("syntax")) return "🔴";
+
+
+
+  if (
+
+    t.includes("unnecessary") ||
+
+    t.includes("dead code") ||
+
+    t.includes("unused code") ||
+
+    t.includes("redundant")
+
+  ) {
+
+    return "🟡";
+
+  }
+
+
+
+  if (t.includes("runtime")) return "🟣";
+
+
+
+  return "🟠";
+
+}
+
+
+
+function confidenceClass(confidence) {
+
+  if (confidence >= 80) return "confidence-high";
+
+  if (confidence >= 50) return "confidence-medium";
+
+  return "confidence-low";
+
+}
+
+
+
+function renderBugCard(bug) {
+
+  const lineText = bug.line_note
+
+    ? bug.line_note
+
+    : (bug.line_start ? `Line${bug.line_end && bug.line_end !== bug.line_start ? "s" : ""} ${bug.line_start}${bug.line_end && bug.line_end !== bug.line_start ? "-" + bug.line_end : ""}` : "");
+
+
+
+  const cClass = confidenceClass(bug.confidence);
+
+  const tClass = typeClass(bug.bug_type);
+
+
+
+  const retrievedSection = `
+  <div class="see-more-toggle" id="toggle-${bug.id}" onclick="toggleHistory('${bug.id}')">▾ See more — historical data</div>
+  <div class="historical-bugs" id="history-${bug.id}" style="display:none;">
+    ${
+      bug.retrieved_bugs && bug.retrieved_bugs.length > 0
+        ? bug.retrieved_bugs.map(r => `
+          <div class="history-item">
+            <div class="history-top">
+              <span class="history-source">${escapeHtml(r.dataset_source || "Historical GitHub Data")}</span>
+              <span class="history-sim">${r.similarity}% similar</span>
+            </div>
+            ${r.bug_type ? `<div class="history-type">${escapeHtml(r.bug_type)}</div>` : ""}
+            ${r.bug_description ? `<div class="history-desc">${escapeHtml(r.bug_description)}</div>` : ""}
+            ${r.solution ? `<div class="history-solution"><b>How it was fixed:</b> ${escapeHtml(r.solution)}</div>` : ""}
+          </div>
+        `).join("")
+        : `<div class="history-item"><div class="history-desc">No similar historical bug data was found for this finding.</div></div>`
+    }
+  </div>
+`;
+
+
+
+  return `
+
+    <div class="bug-card ${tClass}">
+
+      <div class="bug-head">
+
+        <div class="bug-title">
+
+          <span>${typeIcon(bug.bug_type)}</span>
+
+          <span class="bug-number">Bug ${bug.number}</span>
+
+          <span>${escapeHtml(bug.error)}</span>
+
+        </div>
+
+        <div class="badge-row">
+
+          <span class="badge ${tClass}">${escapeHtml(bug.bug_type)}</span>
+
+        </div>
+
+      </div>
+
+      <div class="bug-body">
+
+        <div>
+
+          <div class="field-label">Location</div>
+
+          <div class="location-line">${escapeHtml(bug.file)} ${lineText ? "&nbsp;—&nbsp; " + escapeHtml(lineText) : ""}</div>
+
+        </div>
+
+
+
+        <div>
+
+          <div class="field-label">Cause</div>
+
+          <div class="cause-text">${escapeHtml(bug.cause)}</div>
+
+        </div>
+
+
+
+        ${bug.current_code ? `
+
+          <div>
+
+            <div class="field-label">Error Code</div>
+
+            ${renderCodeBlock(bug.current_code, "removed")}
+
+          </div>
+
+        ` : ""}
+
+
+
+        <div>
+
+          <div class="field-label">Solution</div>
+
+          ${renderSolutionBlock(bug)}
+
+        </div>
+
+        ${retrievedSection}
+
+      </div>
+
+    </div>
+
+  `;
+
+}
+
+
+
+function errorLevelClass(level) {
+
+  if (level === "Less Errors") return "less";
+
+  if (level === "Medium Errors") return "medium";
+
+  return "more";
+
+}
+
+
+
+function renderSummary(summary) {
+
+  const holder = document.getElementById("summary-holder");
+
+  if (summary.files_scanned === 0 && summary.bugs_found === 0 && summary.scan_status === "Completed") {
+
+    holder.innerHTML = "";
+
+    return;
+
+  }
+
+  holder.innerHTML = `
+
+    <div class="summary-grid">
+
+      <div class="summary-cell">
+
+        <div class="num">${summary.files_scanned}</div>
+
+        <div class="label">Files scanned</div>
+
+      </div>
+
+      <div class="summary-cell">
+
+        <div class="num">${summary.bugs_found}</div>
+
+        <div class="label">Possible bugs</div>
+
+      </div>
+
+      <div class="summary-cell">
+
+        <div class="num ${confidenceClass(summary.confidence)}">${summary.confidence}%</div>
+
+        <div class="label">Confidence</div>
+
+      </div>
+
+      <div class="summary-cell">
+
+        <div class="error-level-pill ${errorLevelClass(summary.error_level)}">${escapeHtml(summary.error_level)}</div>
+
+        <div class="label" style="margin-top:8px;">Error level</div>
+
+      </div>
+
+    </div>
+
+  `;
+
+}
+
+
+
+async function scanRepo() {
+  const url = document.getElementById("repo-url").value.trim();
+  const btn = document.getElementById("scan-btn");
+  const bannerHolder = document.getElementById("status-banner-holder");
+  const resultsHolder = document.getElementById("results-holder");
+  const summaryHolder = document.getElementById("summary-holder");
+
+  bannerHolder.innerHTML = "";
+  resultsHolder.innerHTML = "";
+  summaryHolder.innerHTML = "";
+  stopProgress("");
+  activeScanId = null;
+
+  if (!url) {
+    bannerHolder.innerHTML = `<div class="status-banner error">Enter a GitHub repository URL first.</div>`;
+    return;
+  }
+
+  btn.disabled = true;
+  startProgress();
+
+  try {
+    // The backend starts the scan immediately and returns a scan_id.
+    const resp = await fetch(`${API_BASE}/api/scan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo_url: url }),
+    });
+
+    if (!resp.ok) {
+      let detail = "";
+      try { detail = await resp.text(); } catch (e) {}
+      bannerHolder.innerHTML = `<div class="status-banner error">Server error (HTTP ${resp.status}). ${escapeHtml(detail.slice(0, 300))}</div>`;
+      return;
+    }
+
+    const startData = await resp.json();
+    activeScanId = startData.scan_id;
+
+    if (!activeScanId) {
+      throw new Error("Server did not return a scan ID.");
+    }
+
+    // pollScan() returns the final scan result itself (data.result from the backend).
+    // Do not read startData.summary here because POST /api/scan only returns scan_id/status.
+    const result = await pollScan(activeScanId);
+
+    if (!result || !result.summary) {
+      throw new Error("Scan completed without a valid result.");
+    }
+
+    if (result.summary.scan_status !== "Completed") {
+      bannerHolder.innerHTML = `<div class="status-banner error">${escapeHtml(result.summary.scan_status || "Scan did not complete successfully.")}</div>`;
+      return;
+    }
+
+    bannerHolder.innerHTML = `<div class="status-banner ok">Scan Status: Completed — ${escapeHtml(result.summary.repo)}</div>`;
+
+    renderSummary(result.summary);
+
+    if (!Array.isArray(result.bugs) || result.bugs.length === 0) {
+      resultsHolder.innerHTML = `<div class="empty-state">No candidate issues found in the scanned files. That doesn't guarantee bug-free code — it means this build's detectors found nothing to flag.</div>`;
+    } else {
+      resultsHolder.innerHTML = result.bugs.map(renderBugCard).join("");
+    }
+
+  } catch (err) {
+    stopProgress("");
+    bannerHolder.innerHTML = `<div class="status-banner error">Request failed: ${escapeHtml(String(err))}</div>`;
+  } finally {
+    activeScanId = null;
+    btn.disabled = false;
+  }
+}
+
+
+document.getElementById("repo-url").addEventListener("keydown", (e) => {
+
+  if (e.key === "Enter") scanRepo();
+
+});
+
+</script>
+
+</body>
+
+</html>
